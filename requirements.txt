@@ -1,0 +1,3 @@
+textual
+garminconnect>=0.3.8,<0.4
+python-fitparse
