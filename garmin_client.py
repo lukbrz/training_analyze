@@ -11,7 +11,13 @@ from garminconnect import (
     GarminConnectTooManyRequestsError,
 )
 
+from models import ZoneTime
 from storage import SESSION_DIR
+
+_ZONE_NUMBER_KEYS = ("zoneNumber", "zone_number", "zoneId", "zone")
+_LOW_BOUNDARY_KEYS = ("zoneLowBoundary", "lowBoundary", "zoneMin", "minValue", "min")
+_HIGH_BOUNDARY_KEYS = ("zoneHighBoundary", "highBoundary", "zoneMax", "maxValue", "max")
+_SECONDS_KEYS = ("secsInZone", "secondsInZone", "timeInZone", "seconds")
 
 
 class MfaRequired(Exception):
@@ -82,6 +88,51 @@ def download_fit(garmin: Garmin, activity_id: str) -> bytes:
         return archive.read(fit_names[0])
 
 
+def _first(d: dict, keys: tuple[str, ...]):
+    for key in keys:
+        if key in d and d[key] is not None:
+            return d[key]
+    return None
+
+
+def _parse_zone_response(raw) -> list[ZoneTime]:
+    """Normalize Garmin's hrTimeInZones/powerTimeInZones response into
+    ZoneTime entries. The exact response shape is undocumented, so this
+    tries several plausible key names and skips anything it can't read."""
+    if isinstance(raw, dict):
+        entries = next((v for v in raw.values() if isinstance(v, list)), [])
+    elif isinstance(raw, list):
+        entries = raw
+    else:
+        entries = []
+
+    zones = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        zone_number = _first(entry, _ZONE_NUMBER_KEYS)
+        seconds = _first(entry, _SECONDS_KEYS)
+        if zone_number is None or seconds is None:
+            continue
+        zones.append(
+            ZoneTime(
+                zone_number=int(zone_number),
+                low_boundary=_first(entry, _LOW_BOUNDARY_KEYS),
+                high_boundary=_first(entry, _HIGH_BOUNDARY_KEYS),
+                seconds=float(seconds),
+            )
+        )
+    return zones
+
+
+def get_hr_zones(garmin: Garmin, activity_id: str) -> list[ZoneTime]:
+    return _parse_zone_response(garmin.get_activity_hr_in_timezones(activity_id))
+
+
+def get_power_zones(garmin: Garmin, activity_id: str) -> list[ZoneTime]:
+    return _parse_zone_response(garmin.get_activity_power_in_timezones(activity_id))
+
+
 __all__ = [
     "MfaRequired",
     "try_cached_login",
@@ -89,6 +140,8 @@ __all__ = [
     "complete_mfa",
     "list_activities",
     "download_fit",
+    "get_hr_zones",
+    "get_power_zones",
     "GarminConnectAuthenticationError",
     "GarminConnectConnectionError",
     "GarminConnectInvalidFileFormatError",

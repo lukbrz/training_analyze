@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime
 
 PACE_SPORTS = {"running", "walking", "hiking"}
 
@@ -13,7 +14,7 @@ class ActivitySummary:
     distance_m: float
     avg_speed_mps: float | None = None
     avg_hr: int | None = None
-    max_hr: int | None = None
+    avg_power: float | None = None
     total_ascent_m: float | None = None
 
 
@@ -25,7 +26,25 @@ class Lap:
     distance_m: float
     avg_speed_mps: float | None = None
     avg_hr: int | None = None
-    max_hr: int | None = None
+    avg_power: float | None = None
+    is_interval: bool = False
+
+
+@dataclass
+class RecordPoint:
+    timestamp_utc: datetime
+    distance_m: float | None
+    heart_rate: int | None = None
+    power: float | None = None
+    speed_mps: float | None = None
+
+
+@dataclass
+class ZoneTime:
+    zone_number: int
+    low_boundary: float | None
+    high_boundary: float | None
+    seconds: float
 
 
 def format_duration(seconds: float) -> str:
@@ -41,6 +60,14 @@ def format_distance(meters: float) -> str:
     return f"{meters / 1000:.2f} km"
 
 
+def format_distance_m(meters: float) -> str:
+    return f"{meters:.0f} m"
+
+
+def format_lap_distance(sport: str, meters: float) -> str:
+    return format_distance_m(meters) if sport in PACE_SPORTS else format_distance(meters)
+
+
 def format_speed_or_pace(sport: str, avg_speed_mps: float | None) -> str:
     if not avg_speed_mps:
         return "–"
@@ -53,3 +80,7 @@ def format_speed_or_pace(sport: str, avg_speed_mps: float | None) -> str:
 
 def format_hr(hr: int | None) -> str:
     return str(hr) if hr else "–"
+
+
+def format_power(watts: float | None) -> str:
+    return f"{watts:.0f} W" if watts else "–"
