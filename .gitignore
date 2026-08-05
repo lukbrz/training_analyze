@@ -2,3 +2,4 @@
 __pycache__/
 .garmin_session/
 data/
+data.bak_before_reprocess

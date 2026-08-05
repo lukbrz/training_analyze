@@ -176,3 +176,45 @@ def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta)
     if bucket:
         laps.append(_bucket_to_lap(bucket, len(laps) + 1, offset))
     return laps
+
+
+def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) -> list[RecordPoint]:
+    """The subset of a full activity's record stream falling inside one lap's time window."""
+    if not lap.start_time_local:
+        return []
+    utc_start = datetime.fromisoformat(lap.start_time_local) - offset
+    utc_end = utc_start + timedelta(seconds=lap.duration_s)
+    return [r for r in records if utc_start <= r.timestamp_utc <= utc_end]
+
+
+def lap_x_values(lap_records: list[RecordPoint], lap: Lap, mode: str) -> list[float]:
+    """X-axis values for one lap's records, aligned to a common origin per `mode`:
+    "time" (seconds since the lap's first record), "distance" (meters since its
+    first record's cumulative distance), or "percent" (time elapsed as a % of
+    the lap's total duration)."""
+    if not lap_records:
+        return []
+    if mode == "time":
+        t0 = lap_records[0].timestamp_utc
+        return [(r.timestamp_utc - t0).total_seconds() for r in lap_records]
+    if mode == "distance":
+        d0 = lap_records[0].distance_m or 0.0
+        return [(r.distance_m or d0) - d0 for r in lap_records]
+    if mode == "percent":
+        t0 = lap_records[0].timestamp_utc
+        total = lap.duration_s or 1.0
+        return [(r.timestamp_utc - t0).total_seconds() / total * 100 for r in lap_records]
+    raise ValueError(f"unknown x-axis mode: {mode}")
+
+
+def metric_series(
+    lap_records: list[RecordPoint], x_values: list[float], attr: str
+) -> tuple[list[float], list[float]]:
+    """(x, y) pairs for one metric attribute, dropping points where it's None."""
+    xs, ys = [], []
+    for x, rec in zip(x_values, lap_records):
+        y = getattr(rec, attr)
+        if y is not None:
+            xs.append(x)
+            ys.append(y)
+    return xs, ys

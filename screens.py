@@ -4,10 +4,11 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import HorizontalGroup
+from textual.containers import HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
+from textual_plotext import PlotextPlot
 
 import fit_parser
 import garmin_client
@@ -19,6 +20,7 @@ from models import (
     format_distance,
     format_duration,
     format_hr,
+    format_lap_distance,
     format_power,
     format_speed_or_pace,
 )
@@ -146,7 +148,7 @@ class LoginScreen(Screen):
 
 
 class MainScreen(Screen):
-    BINDINGS = [Binding("s", "sync", "Sync")]
+    BINDINGS = [Binding("s", "sync", "Sync"), Binding("r", "reprocess", "Reprocess")]
 
     def __init__(self, client) -> None:
         super().__init__()
@@ -156,7 +158,10 @@ class MainScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="status")
-        yield Button("Sync (s)", id="sync_button", variant="primary")
+        yield HorizontalGroup(
+            Button("Sync (s)", id="sync_button", variant="primary"),
+            Button("Reprocess (r)", id="reprocess_button"),
+        )
         yield DataTable(id="activities_table")
         yield Footer()
 
@@ -190,6 +195,8 @@ class MainScreen(Screen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "sync_button":
             self.action_sync()
+        elif event.button.id == "reprocess_button":
+            self.action_reprocess()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
@@ -197,8 +204,16 @@ class MainScreen(Screen):
             self.app.push_screen(LapsScreen(activity, self.client))
 
     def action_sync(self) -> None:
-        self.query_one("#sync_button", Button).disabled = True
+        self._set_buttons_disabled(True)
         self._sync()
+
+    def action_reprocess(self) -> None:
+        self._set_buttons_disabled(True)
+        self._reprocess()
+
+    def _set_buttons_disabled(self, disabled: bool) -> None:
+        self.query_one("#sync_button", Button).disabled = disabled
+        self.query_one("#reprocess_button", Button).disabled = disabled
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
@@ -268,9 +283,48 @@ class MainScreen(Screen):
 
     def _sync_done(self, message: str) -> None:
         self._set_status(message)
-        self.query_one("#sync_button", Button).disabled = False
+        self._set_buttons_disabled(False)
         self._refresh_table()
         self.notify(message)
+
+    @work(thread=True)
+    def _reprocess(self) -> None:
+        last_synced_date, activities = storage.load_index()
+        by_id = {a.activity_id: a for a in activities}
+
+        reprocessed = 0
+        skipped = 0
+        for i, activity in enumerate(activities, start=1):
+            self.app.call_from_thread(
+                self._set_status, f"Reprocessing {activity.name} ({i}/{len(activities)})..."
+            )
+            if not storage.has_fit(activity.activity_id):
+                skipped += 1
+                continue
+
+            fit_bytes = storage.fit_path(activity.activity_id).read_bytes()
+            try:
+                new_summary, new_laps = fit_parser.parse(
+                    fit_bytes, activity.activity_id, activity.name, activity.start_time_local
+                )
+            except ValueError:
+                skipped += 1
+                continue
+
+            old_marks = {lap.lap_index: lap.is_interval for lap in storage.load_laps(activity.activity_id)}
+            for lap in new_laps:
+                if old_marks.get(lap.lap_index):
+                    lap.is_interval = True
+
+            by_id[activity.activity_id] = new_summary
+            storage.save_laps(activity.activity_id, new_laps)
+            storage.save_index(last_synced_date, list(by_id.values()))
+            reprocessed += 1
+
+        message = f"Reprocessed {reprocessed} activities"
+        if skipped:
+            message += f", {skipped} skipped (no local FIT file)"
+        self.app.call_from_thread(self._sync_done, message)
 
 
 class LapsScreen(Screen):
@@ -278,6 +332,7 @@ class LapsScreen(Screen):
         Binding("escape", "back", "Back", priority=True),
         Binding("m", "toggle_interval", "Mark interval"),
         Binding("z", "zones", "Zones"),
+        Binding("c", "compare", "Compare intervals"),
     ]
 
     LAP_COLUMNS = ("#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Int")
@@ -333,7 +388,7 @@ class LapsScreen(Screen):
                 str(lap.lap_index),
                 lap.start_time_local[11:19] if lap.start_time_local else "–",
                 Text(format_duration(lap.duration_s), justify="right"),
-                format_distance(lap.distance_m),
+                format_lap_distance(self.activity.sport, lap.distance_m),
                 format_speed_or_pace(self.activity.sport, lap.avg_speed_mps),
                 format_hr(lap.avg_hr),
                 format_power(lap.avg_power),
@@ -429,7 +484,7 @@ class LapsScreen(Screen):
         )
 
         static.update(
-            f"Intervals: {len(marked)}  |  Distance: {format_distance(total_distance)}  |  "
+            f"Intervals: {len(marked)}  |  Distance: {format_lap_distance(self.activity.sport, total_distance)}  |  "
             f"Duration: {format_duration(total_duration)}  |  "
             f"Avg: {format_speed_or_pace(self.activity.sport, avg_speed)}  |  "
             f"Avg HR: {format_hr(avg_hr)}  |  Avg Power: {format_power(avg_power)}"
@@ -437,6 +492,15 @@ class LapsScreen(Screen):
 
     def action_zones(self) -> None:
         self.app.push_screen(ZonesScreen(self.activity, self.client))
+
+    def action_compare(self) -> None:
+        marked = [lap for lap in self.current_laps if lap.is_interval]
+        if len(marked) < 2:
+            self.notify("Mark at least 2 intervals to compare", severity="warning")
+            return
+        if not self._ensure_records_loaded():
+            return
+        self.app.push_screen(CompareScreen(self.activity, marked, self._records, self._offset))
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -518,6 +582,94 @@ class ZonesScreen(Screen):
     def _show_error(self, message: str) -> None:
         self.query_one("#zones_status", Static).update(message)
         self.notify(message, severity="error")
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class CompareScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    X_MODE_BUTTONS = {
+        "x_mode_time_button": "time",
+        "x_mode_distance_button": "distance",
+        "x_mode_percent_button": "percent",
+    }
+    X_AXIS_LABELS = {
+        "time": "Elapsed seconds",
+        "distance": "Elapsed meters",
+        "percent": "% of interval",
+    }
+
+    def __init__(
+        self,
+        activity: ActivitySummary,
+        marked_laps: list[Lap],
+        records: list[fit_parser.RecordPoint],
+        offset: timedelta,
+    ) -> None:
+        super().__init__()
+        self.activity = activity
+        self.marked_laps = marked_laps
+        self.records = records
+        self.utc_offset = offset
+        self.x_mode = "time"
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(
+            f"Comparing {len(self.marked_laps)} intervals — {self.activity.name}", id="compare_status"
+        )
+        yield HorizontalGroup(
+            Button("Time", id="x_mode_time_button", variant="primary"),
+            Button("Distance", id="x_mode_distance_button"),
+            Button("%", id="x_mode_percent_button"),
+            id="x_mode_bar",
+        )
+        yield Vertical(
+            PlotextPlot(id="power_plot"),
+            PlotextPlot(id="hr_plot"),
+            PlotextPlot(id="speed_plot"),
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._redraw()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        mode = self.X_MODE_BUTTONS.get(event.button.id)
+        if mode is None:
+            return
+        self.x_mode = mode
+        for button_id in self.X_MODE_BUTTONS:
+            self.query_one(f"#{button_id}", Button).variant = (
+                "primary" if button_id == event.button.id else "default"
+            )
+        self._redraw()
+
+    def _redraw(self) -> None:
+        self._draw_metric("power_plot", "power", "Power (W)")
+        self._draw_metric("hr_plot", "heart_rate", "Heart Rate (bpm)")
+        self._draw_metric("speed_plot", "speed_mps", "Speed (km/h)", scale=3.6)
+
+    def _draw_metric(self, widget_id: str, attr: str, title: str, scale: float = 1.0) -> None:
+        plot = self.query_one(f"#{widget_id}", PlotextPlot)
+        plt = plot.plt
+        plt.clear_data()
+        has_data = False
+        for lap in self.marked_laps:
+            lap_records = fit_parser.lap_record_slice(self.records, lap, self.utc_offset)
+            x_values = fit_parser.lap_x_values(lap_records, lap, self.x_mode)
+            xs, ys = fit_parser.metric_series(lap_records, x_values, attr)
+            if not xs:
+                continue
+            if scale != 1.0:
+                ys = [y * scale for y in ys]
+            plt.plot(xs, ys, label=f"Lap {lap.lap_index}")
+            has_data = True
+        plt.title(title if has_data else f"{title} — no data")
+        plt.xlabel(self.X_AXIS_LABELS[self.x_mode])
+        plot.refresh()
 
     def action_back(self) -> None:
         self.app.pop_screen()
