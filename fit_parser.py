@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 import fitparse
 
 import routes
+import storage
 from models import ActivitySummary, Lap, RecordPoint
 
 INTERVAL_INTENSITIES = {"interval", "active"}
@@ -121,6 +122,16 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
     return records
 
 
+def load_records(activity_id: str, fit_bytes: bytes) -> list[RecordPoint]:
+    """The best available record stream for an activity: a persisted merged stream (see
+    dedupe.py — combining a duplicate-device recording of the same session) if one
+    exists, else freshly parsed from its own raw FIT bytes."""
+    merged = storage.load_merged_records(activity_id)
+    if merged is not None:
+        return merged
+    return parse_records(fit_bytes)
+
+
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
@@ -184,39 +195,46 @@ def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta)
     return laps
 
 
+ANCHOR_SMOOTHING_POINTS = 5
+
+
 def detect_physical_laps(
     records: list[RecordPoint],
     offset: timedelta,
-    close_radius_m: float = 30.0,
+    close_radius_m: float = 50.0,
     min_lap_distance_m: float = 200.0,
 ) -> list[Lap] | None:
     """Detect repeated physical loops (e.g. laps around a park) from GPS position alone,
     independent of the device's own lap markers.
 
-    The activity's first GPS-fixed record is the anchor. A lap boundary is marked each time
-    the track comes back within `close_radius_m` of the anchor, provided at least
-    `min_lap_distance_m` has been covered since the last boundary (only the first point of
-    each such "visit" counts, so lingering near the start/finish doesn't create duplicate
-    boundaries). Returns None if fewer than 2 segments result — e.g. an out-and-back or
-    point-to-point course only ever nears its start once, at the very end.
+    The activity's anchor is the average position of its first few GPS fixes (smoothing out
+    the fix-acquisition jitter common right after a GPS watch starts recording). A lap
+    boundary is marked each time the track comes back within `close_radius_m` of the anchor,
+    provided at least `min_lap_distance_m` has been covered since the last boundary (only the
+    first point of each such "visit" counts, so lingering near the start/finish doesn't create
+    duplicate boundaries). Returns None if fewer than 2 segments result — e.g. an out-and-back
+    or point-to-point course only ever nears its start once, at the very end.
 
-    Known limitations: a poor GPS fix on the anchor record skews every subsequent check;
-    loops shorter than `min_lap_distance_m` won't be detected; a course that happens to pass
-    near the start mid-loop (not a real lap) can produce a false split. Acceptable for a
-    personal tool, not worth extra heuristics.
+    `close_radius_m` defaults generously (50m) because consumer GPS accuracy commonly runs
+    20-50m under tree cover or in urban canyons — too tight a radius misses real loops
+    entirely. Known limitations: loops shorter than `min_lap_distance_m` won't be detected;
+    a course that happens to pass near the start mid-loop (not a real lap) can produce a
+    false split. Acceptable for a personal tool, not worth extra heuristics.
     """
     fixed = [r for r in records if r.lat is not None and r.lon is not None]
     if len(fixed) < 20:
         return None
 
-    anchor = fixed[0]
+    anchor_sample = fixed[:ANCHOR_SMOOTHING_POINTS]
+    anchor_lat = sum(r.lat for r in anchor_sample) / len(anchor_sample)
+    anchor_lon = sum(r.lon for r in anchor_sample) / len(anchor_sample)
     boundaries = [0]
-    last_boundary_distance = anchor.distance_m or 0.0
+    last_boundary_distance = fixed[0].distance_m or 0.0
     inside_radius = False
     for i, rec in enumerate(records):
         if rec.lat is None or rec.lon is None:
             continue
-        dist_to_anchor = routes.haversine_m(anchor.lat, anchor.lon, rec.lat, rec.lon)
+        dist_to_anchor = routes.haversine_m(anchor_lat, anchor_lon, rec.lat, rec.lon)
         if dist_to_anchor <= close_radius_m:
             if not inside_radius:
                 inside_radius = True
@@ -233,6 +251,18 @@ def detect_physical_laps(
     segments = []
     for start, end in zip(boundaries, boundaries[1:] + [len(records)]):
         segments.append(records[start:end])
+
+    # Every segment except the last is guaranteed >= min_lap_distance_m by construction
+    # (a boundary only gets added once that much has been covered). The last segment runs
+    # to the end of the recording with no such guarantee — without this, a run that simply
+    # *finishes* near where it started (extremely common) would masquerade as an extra lap.
+    # Fold a too-short tail into the previous segment instead.
+    if len(segments) >= 2:
+        tail_distance = (segments[-1][-1].distance_m or 0.0) - (segments[-1][0].distance_m or 0.0)
+        if tail_distance < min_lap_distance_m:
+            segments[-2] = segments[-2] + segments[-1]
+            segments.pop()
+
     if len(segments) < 2:
         return None
 

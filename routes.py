@@ -3,8 +3,10 @@ import math
 from models import RecordPoint, Route, RouteSignature
 
 RESAMPLE_POINTS = 20
-MATCH_DISTANCE_THRESHOLD_M = 75.0
-DISTANCE_TOLERANCE = 0.2
+# Generous defaults: consumer GPS accuracy commonly runs 20-50m under tree cover or in
+# urban canyons, and two runs of "the same" route rarely trace pixel-identical paths.
+MATCH_DISTANCE_THRESHOLD_M = 100.0
+DISTANCE_TOLERANCE = 0.25
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

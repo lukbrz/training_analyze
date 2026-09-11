@@ -11,8 +11,10 @@ from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 from textual_plotext import PlotextPlot
 
+import dedupe
 import fit_parser
 import garmin_client
+import geocode
 import routes
 import storage
 from models import (
@@ -49,19 +51,80 @@ def _activity_row(activity: ActivitySummary, route_name: str) -> tuple:
     )
 
 
-def _assign_route(fit_bytes: bytes, sport: str, routes_list: list[Route]) -> str | None:
+def _assign_route(activity_id: str, fit_bytes: bytes, sport: str, routes_list: list[Route]) -> str | None:
     """Compute an activity's route_id, matching against `routes_list` (mutated in place —
     a newly created route is appended and persisted immediately, so a later activity in the
     same sync/reprocess run can match it). Returns None if there isn't enough GPS data."""
-    records = fit_parser.parse_records(fit_bytes)
+    records = fit_parser.load_records(activity_id, fit_bytes)
     signature = routes.build_signature(records)
     if signature is None:
         return None
     route, is_new = routes.match_or_create(signature, sport, routes_list, lambda: uuid.uuid4().hex)
     if is_new:
+        lat, lon = signature.points[0]
+        route.place = geocode.reverse_geocode(lat, lon)
         routes_list.append(route)
         storage.save_routes(routes_list)
     return route.route_id
+
+
+def _merge_duplicates(activities: list[ActivitySummary]) -> tuple[list[ActivitySummary], int]:
+    """Detect activities that are the same physical session recorded by two devices and
+    fold each into its primary (see dedupe.py) — filling in HR/power/GPS coverage the
+    primary's own device missed, and dropping the secondary from the visible list.
+
+    Fully idempotent and safe to run on every sync/reprocess: a secondary's raw .fit is
+    never deleted, only excluded from the index via the merge ledger, so re-running this
+    just recomputes the same result from scratch rather than accumulating state.
+    """
+    ledger = storage.load_merge_ledger()
+    visible = [a for a in activities if a.activity_id not in ledger]
+
+    newly_merged = 0
+    for a, b in dedupe.find_duplicate_pairs(visible):
+        primary, secondary = dedupe.choose_primary(a, b)
+        if secondary.activity_id in ledger:
+            continue
+        ledger[secondary.activity_id] = primary.activity_id
+        newly_merged += 1
+    if newly_merged:
+        storage.save_merge_ledger(ledger)
+
+    by_id = {a.activity_id: a for a in activities}
+    secondaries_by_primary: dict[str, list[str]] = {}
+    for secondary_id, primary_id in ledger.items():
+        secondaries_by_primary.setdefault(primary_id, []).append(secondary_id)
+
+    for primary_id, secondary_ids in secondaries_by_primary.items():
+        primary = by_id.get(primary_id)
+        if primary is None:
+            continue
+
+        streams = []
+        if storage.has_fit(primary_id):
+            streams.append(fit_parser.parse_records(storage.fit_path(primary_id).read_bytes()))
+
+        secondary_summaries = []
+        for secondary_id in secondary_ids:
+            if not storage.has_fit(secondary_id):
+                continue
+            secondary_fit_bytes = storage.fit_path(secondary_id).read_bytes()
+            streams.append(fit_parser.parse_records(secondary_fit_bytes))
+            # name/start_time_local only affect display fields we discard here — the
+            # summary-level HR/power/ascent/speed fields come straight from the FIT
+            # session message regardless.
+            secondary_summary, _ = fit_parser.parse(
+                secondary_fit_bytes, secondary_id, "", primary.start_time_local
+            )
+            secondary_summaries.append(secondary_summary)
+
+        if len(streams) >= 2:
+            storage.save_merged_records(primary_id, dedupe.merge_records(streams))
+        if secondary_summaries:
+            by_id[primary_id] = dedupe.merge_summary(primary, secondary_summaries)
+
+    merged_activities = [a for a in by_id.values() if a.activity_id not in ledger]
+    return merged_activities, newly_merged
 
 
 class LoginScreen(Screen):
@@ -260,7 +323,9 @@ class MainScreen(Screen):
     def _sync(self) -> None:
         last_synced_date, activities = storage.load_index()
         routes_list = storage.load_routes()
-        known_ids = {a.activity_id for a in activities}
+        # Also treat any activity already folded into another as "known" — otherwise a
+        # future sync would re-download and re-add it, undoing a prior merge.
+        known_ids = {a.activity_id for a in activities} | set(storage.load_merge_ledger())
         start_date = last_synced_date or (date.today() - timedelta(days=INITIAL_SYNC_DAYS)).isoformat()
         end_date = date.today().isoformat()
 
@@ -304,7 +369,7 @@ class MainScreen(Screen):
                 known_ids.add(activity_id)  # avoid retrying a permanently-missing FIT within this run
                 continue
 
-            summary.route_id = _assign_route(fit_bytes, summary.sport, routes_list)
+            summary.route_id = _assign_route(activity_id, fit_bytes, summary.sport, routes_list)
             storage.save_fit(activity_id, fit_bytes)
             storage.save_laps(activity_id, laps)
             activities.append(summary)
@@ -316,7 +381,12 @@ class MainScreen(Screen):
                 last_synced_date = activity_date
             storage.save_index(last_synced_date, activities)
 
+        activities, merged_count = _merge_duplicates(activities)
+        storage.save_index(last_synced_date, activities)
+
         message = f"Sync complete: {new_count} new activities"
+        if merged_count:
+            message += f", {merged_count} merged as duplicates"
         if skipped:
             message += f", {skipped} skipped (no usable FIT file)"
         self.app.call_from_thread(self._sync_done, message)
@@ -357,19 +427,32 @@ class MainScreen(Screen):
                 if old_marks.get(lap.lap_index):
                     lap.is_interval = True
 
-            new_summary.route_id = _assign_route(fit_bytes, new_summary.sport, routes_list)
+            new_summary.route_id = _assign_route(
+                activity.activity_id, fit_bytes, new_summary.sport, routes_list
+            )
             by_id[activity.activity_id] = new_summary
             storage.save_laps(activity.activity_id, new_laps)
             storage.save_index(last_synced_date, list(by_id.values()))
             reprocessed += 1
 
+        merged_activities, merged_count = _merge_duplicates(list(by_id.values()))
+        storage.save_index(last_synced_date, merged_activities)
+
         message = f"Reprocessed {reprocessed} activities"
+        if merged_count:
+            message += f", {merged_count} merged as duplicates"
         if skipped:
             message += f", {skipped} skipped (no local FIT file)"
         self.app.call_from_thread(self._sync_done, message)
 
 
 class LapsScreen(Screen):
+    CSS = """
+    #split_value_input {
+        width: 1fr;
+    }
+    """
+
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
         Binding("m", "toggle_interval", "Mark interval"),
@@ -422,6 +505,9 @@ class LapsScreen(Screen):
         self.viewing_device_laps = True
         self._rebuild_table()
         self._refresh_interval_summary()
+        # Without this, Textual auto-focuses the split-by-distance Input, and every
+        # single-letter binding (m/z/c/p) silently types into it instead of firing.
+        table.focus()
 
     def _rebuild_table(self) -> None:
         table = self.query_one(DataTable)
@@ -454,7 +540,7 @@ class LapsScreen(Screen):
             self.notify("FIT file not found for this activity", severity="error")
             return False
         fit_bytes = path.read_bytes()
-        self._records = fit_parser.parse_records(fit_bytes)
+        self._records = fit_parser.load_records(self.activity.activity_id, fit_bytes)
         self._offset = fit_parser.session_utc_offset(fit_bytes, self.activity.start_time_local)
         return True
 
@@ -734,16 +820,23 @@ class CompareScreen(Screen):
 
 
 class RoutesScreen(Screen):
+    CSS = """
+    #rename_input {
+        width: 1fr;
+    }
+    """
+
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
         Binding("e", "rename", "Rename route"),
     ]
 
-    ROUTE_COLUMNS = ("Name", "Sport", "Activities", "Total Distance")
+    ROUTE_COLUMNS = ("Name", "Sport", "Place", "Activities", "Distance")
 
     def __init__(self, client) -> None:
         super().__init__()
         self.client = client
+        self.all_routes: list[Route] = []
         self.routes_by_key: dict[str, Route] = {}
 
     def compose(self) -> ComposeResult:
@@ -762,30 +855,35 @@ class RoutesScreen(Screen):
         table.cursor_type = "row"
         table.add_columns(*self.ROUTE_COLUMNS)
         self._refresh_table()
+        # Without this, Textual auto-focuses the rename Input, and the "e" binding
+        # silently types into it instead of firing.
+        table.focus()
 
     def _refresh_table(self) -> None:
-        routes_list = storage.load_routes()
+        self.all_routes = storage.load_routes()
         _, activities = storage.load_index()
-        self.routes_by_key = {r.route_id: r for r in routes_list}
 
         counts: dict[str, int] = {}
-        distances: dict[str, float] = {}
         for activity in activities:
             if activity.route_id:
                 counts[activity.route_id] = counts.get(activity.route_id, 0) + 1
-                distances[activity.route_id] = distances.get(activity.route_id, 0.0) + activity.distance_m
+
+        # Routes with only one activity aren't a "route" worth tracking yet.
+        grouped = [r for r in self.all_routes if counts.get(r.route_id, 0) >= 2]
+        self.routes_by_key = {r.route_id: r for r in grouped}
 
         table = self.query_one(DataTable)
         table.clear()
-        for route in sorted(routes_list, key=lambda r: r.name):
+        for route in sorted(grouped, key=lambda r: (-counts[r.route_id], r.name)):
             table.add_row(
                 route.name,
                 route.sport,
-                str(counts.get(route.route_id, 0)),
-                format_distance(distances.get(route.route_id, 0.0)),
+                route.place or "–",
+                str(counts[route.route_id]),
+                format_distance(route.signature.distance_m),
                 key=route.route_id,
             )
-        self.query_one("#routes_status", Static).update(f"{len(routes_list)} routes")
+        self.query_one("#routes_status", Static).update(f"{len(grouped)} routes with 2+ activities")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "rename_button":
@@ -805,7 +903,7 @@ class RoutesScreen(Screen):
             self.notify("Enter a new name", severity="warning")
             return
         route.name = new_name
-        storage.save_routes(list(self.routes_by_key.values()))
+        storage.save_routes(self.all_routes)
         self.query_one("#rename_input", Input).value = ""
         self._refresh_table()
 

@@ -62,6 +62,7 @@ class Route:
     name: str
     sport: str
     signature: RouteSignature
+    place: str | None = None
 
 
 def format_duration(seconds: float) -> str:
