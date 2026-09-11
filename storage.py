@@ -2,7 +2,7 @@ import dataclasses
 import json
 from pathlib import Path
 
-from models import ActivitySummary, Lap, ZoneTime
+from models import ActivitySummary, Lap, Route, RouteSignature, ZoneTime
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
@@ -10,6 +10,7 @@ INDEX_PATH = DATA_DIR / "activities_index.json"
 LAPS_DIR = DATA_DIR / "laps"
 FIT_DIR = DATA_DIR / "fit"
 ZONES_DIR = DATA_DIR / "zones"
+ROUTES_PATH = DATA_DIR / "routes.json"
 SESSION_DIR = BASE_DIR / ".garmin_session"
 
 
@@ -69,6 +70,27 @@ def has_fit(activity_id: str, fit_dir: Path = FIT_DIR) -> bool:
 def save_fit(activity_id: str, fit_bytes: bytes, fit_dir: Path = FIT_DIR) -> None:
     fit_dir.mkdir(parents=True, exist_ok=True)
     fit_path(activity_id, fit_dir).write_bytes(fit_bytes)
+
+
+def load_routes(path: Path = ROUTES_PATH) -> list[Route]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    routes = []
+    for raw in data:
+        signature = RouteSignature(**_filtered(RouteSignature, raw["signature"]))
+        fields = _filtered(Route, raw)
+        fields["signature"] = signature
+        routes.append(Route(**fields))
+    return routes
+
+
+def save_routes(routes: list[Route], path: Path = ROUTES_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps([dataclasses.asdict(r) for r in routes], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def load_zones(

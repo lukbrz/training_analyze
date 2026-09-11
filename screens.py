@@ -1,3 +1,4 @@
+import uuid
 from datetime import date, timedelta
 
 from rich.text import Text
@@ -12,10 +13,12 @@ from textual_plotext import PlotextPlot
 
 import fit_parser
 import garmin_client
+import routes
 import storage
 from models import (
     ActivitySummary,
     Lap,
+    Route,
     ZoneTime,
     format_distance,
     format_duration,
@@ -26,6 +29,39 @@ from models import (
 )
 
 INITIAL_SYNC_DAYS = 365
+
+ACTIVITY_COLUMNS = (
+    "Date", "Activity", "Sport", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Route"
+)
+
+
+def _activity_row(activity: ActivitySummary, route_name: str) -> tuple:
+    return (
+        activity.start_time_local.replace("T", " ")[:16],
+        activity.name,
+        activity.sport,
+        Text(format_duration(activity.duration_s), justify="right"),
+        format_distance(activity.distance_m),
+        format_speed_or_pace(activity.sport, activity.avg_speed_mps),
+        format_hr(activity.avg_hr),
+        format_power(activity.avg_power),
+        route_name,
+    )
+
+
+def _assign_route(fit_bytes: bytes, sport: str, routes_list: list[Route]) -> str | None:
+    """Compute an activity's route_id, matching against `routes_list` (mutated in place —
+    a newly created route is appended and persisted immediately, so a later activity in the
+    same sync/reprocess run can match it). Returns None if there isn't enough GPS data."""
+    records = fit_parser.parse_records(fit_bytes)
+    signature = routes.build_signature(records)
+    if signature is None:
+        return None
+    route, is_new = routes.match_or_create(signature, sport, routes_list, lambda: uuid.uuid4().hex)
+    if is_new:
+        routes_list.append(route)
+        storage.save_routes(routes_list)
+    return route.route_id
 
 
 class LoginScreen(Screen):
@@ -148,7 +184,11 @@ class LoginScreen(Screen):
 
 
 class MainScreen(Screen):
-    BINDINGS = [Binding("s", "sync", "Sync"), Binding("r", "reprocess", "Reprocess")]
+    BINDINGS = [
+        Binding("s", "sync", "Sync"),
+        Binding("r", "reprocess", "Reprocess"),
+        Binding("o", "routes", "Routes"),
+    ]
 
     def __init__(self, client) -> None:
         super().__init__()
@@ -161,6 +201,7 @@ class MainScreen(Screen):
         yield HorizontalGroup(
             Button("Sync (s)", id="sync_button", variant="primary"),
             Button("Reprocess (r)", id="reprocess_button"),
+            Button("Routes (o)", id="routes_button"),
         )
         yield DataTable(id="activities_table")
         yield Footer()
@@ -168,27 +209,19 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.cursor_type = "row"
-        table.add_columns(
-            "Date", "Activity", "Sport", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power"
-        )
+        table.add_columns(*ACTIVITY_COLUMNS)
         self._refresh_table()
 
     def _refresh_table(self) -> None:
         _, activities = storage.load_index()
+        routes_by_id = {r.route_id: r for r in storage.load_routes()}
         self.activities_by_id = {a.activity_id: a for a in activities}
         table = self.query_one(DataTable)
         table.clear()
         for activity in sorted(activities, key=lambda a: a.start_time_local, reverse=True):
+            route = routes_by_id.get(activity.route_id)
             table.add_row(
-                activity.start_time_local.replace("T", " ")[:16],
-                activity.name,
-                activity.sport,
-                Text(format_duration(activity.duration_s), justify="right"),
-                format_distance(activity.distance_m),
-                format_speed_or_pace(activity.sport, activity.avg_speed_mps),
-                format_hr(activity.avg_hr),
-                format_power(activity.avg_power),
-                key=activity.activity_id,
+                *_activity_row(activity, route.name if route else "–"), key=activity.activity_id
             )
         self.query_one("#status", Static).update(f"{len(activities)} activities synced")
 
@@ -197,6 +230,8 @@ class MainScreen(Screen):
             self.action_sync()
         elif event.button.id == "reprocess_button":
             self.action_reprocess()
+        elif event.button.id == "routes_button":
+            self.action_routes()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
@@ -211,6 +246,9 @@ class MainScreen(Screen):
         self._set_buttons_disabled(True)
         self._reprocess()
 
+    def action_routes(self) -> None:
+        self.app.push_screen(RoutesScreen(self.client))
+
     def _set_buttons_disabled(self, disabled: bool) -> None:
         self.query_one("#sync_button", Button).disabled = disabled
         self.query_one("#reprocess_button", Button).disabled = disabled
@@ -221,6 +259,7 @@ class MainScreen(Screen):
     @work(thread=True)
     def _sync(self) -> None:
         last_synced_date, activities = storage.load_index()
+        routes_list = storage.load_routes()
         known_ids = {a.activity_id for a in activities}
         start_date = last_synced_date or (date.today() - timedelta(days=INITIAL_SYNC_DAYS)).isoformat()
         end_date = date.today().isoformat()
@@ -265,6 +304,7 @@ class MainScreen(Screen):
                 known_ids.add(activity_id)  # avoid retrying a permanently-missing FIT within this run
                 continue
 
+            summary.route_id = _assign_route(fit_bytes, summary.sport, routes_list)
             storage.save_fit(activity_id, fit_bytes)
             storage.save_laps(activity_id, laps)
             activities.append(summary)
@@ -290,6 +330,7 @@ class MainScreen(Screen):
     @work(thread=True)
     def _reprocess(self) -> None:
         last_synced_date, activities = storage.load_index()
+        routes_list = storage.load_routes()
         by_id = {a.activity_id: a for a in activities}
 
         reprocessed = 0
@@ -316,6 +357,7 @@ class MainScreen(Screen):
                 if old_marks.get(lap.lap_index):
                     lap.is_interval = True
 
+            new_summary.route_id = _assign_route(fit_bytes, new_summary.sport, routes_list)
             by_id[activity.activity_id] = new_summary
             storage.save_laps(activity.activity_id, new_laps)
             storage.save_index(last_synced_date, list(by_id.values()))
@@ -333,6 +375,7 @@ class LapsScreen(Screen):
         Binding("m", "toggle_interval", "Mark interval"),
         Binding("z", "zones", "Zones"),
         Binding("c", "compare", "Compare intervals"),
+        Binding("p", "physical_laps", "Physical laps"),
     ]
 
     LAP_COLUMNS = ("#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Int")
@@ -489,6 +532,21 @@ class LapsScreen(Screen):
             f"Avg: {format_speed_or_pace(self.activity.sport, avg_speed)}  |  "
             f"Avg HR: {format_hr(avg_hr)}  |  Avg Power: {format_power(avg_power)}"
         )
+
+    def action_physical_laps(self) -> None:
+        if not self._ensure_records_loaded():
+            return
+        if not self._records:
+            self.notify("No record data in this FIT file to analyze", severity="warning")
+            return
+        laps = fit_parser.detect_physical_laps(self._records, self._offset)
+        if not laps:
+            self.notify("No repeated course laps detected", severity="warning")
+            return
+        self.current_laps = laps
+        self.viewing_device_laps = False
+        self._rebuild_table()
+        self._refresh_interval_summary()
 
     def action_zones(self) -> None:
         self.app.push_screen(ZonesScreen(self.activity, self.client))
@@ -670,6 +728,128 @@ class CompareScreen(Screen):
         plt.title(title if has_data else f"{title} — no data")
         plt.xlabel(self.X_AXIS_LABELS[self.x_mode])
         plot.refresh()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class RoutesScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("e", "rename", "Rename route"),
+    ]
+
+    ROUTE_COLUMNS = ("Name", "Sport", "Activities", "Total Distance")
+
+    def __init__(self, client) -> None:
+        super().__init__()
+        self.client = client
+        self.routes_by_key: dict[str, Route] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Routes", id="routes_status")
+        yield HorizontalGroup(
+            Input(placeholder="New name", id="rename_input"),
+            Button("Rename", id="rename_button"),
+            id="rename_bar",
+        )
+        yield DataTable(id="routes_table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns(*self.ROUTE_COLUMNS)
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        routes_list = storage.load_routes()
+        _, activities = storage.load_index()
+        self.routes_by_key = {r.route_id: r for r in routes_list}
+
+        counts: dict[str, int] = {}
+        distances: dict[str, float] = {}
+        for activity in activities:
+            if activity.route_id:
+                counts[activity.route_id] = counts.get(activity.route_id, 0) + 1
+                distances[activity.route_id] = distances.get(activity.route_id, 0.0) + activity.distance_m
+
+        table = self.query_one(DataTable)
+        table.clear()
+        for route in sorted(routes_list, key=lambda r: r.name):
+            table.add_row(
+                route.name,
+                route.sport,
+                str(counts.get(route.route_id, 0)),
+                format_distance(distances.get(route.route_id, 0.0)),
+                key=route.route_id,
+            )
+        self.query_one("#routes_status", Static).update(f"{len(routes_list)} routes")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "rename_button":
+            self.action_rename()
+
+    def action_rename(self) -> None:
+        table = self.query_one(DataTable)
+        row = table.cursor_row
+        if row is None or row < 0 or row >= table.row_count:
+            return
+        route_id = table.coordinate_to_cell_key(Coordinate(row, 0)).row_key.value
+        route = self.routes_by_key.get(route_id)
+        if route is None:
+            return
+        new_name = self.query_one("#rename_input", Input).value.strip()
+        if not new_name:
+            self.notify("Enter a new name", severity="warning")
+            return
+        route.name = new_name
+        storage.save_routes(list(self.routes_by_key.values()))
+        self.query_one("#rename_input", Input).value = ""
+        self._refresh_table()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        route = self.routes_by_key.get(event.row_key.value)
+        if route is not None:
+            self.app.push_screen(RouteActivitiesScreen(route, self.client))
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class RouteActivitiesScreen(Screen):
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    def __init__(self, route: Route, client) -> None:
+        super().__init__()
+        self.route = route
+        self.client = client
+        self.activities_by_id: dict[str, ActivitySummary] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"Route: {self.route.name}", id="route_status")
+        yield DataTable(id="route_activities_table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns(*ACTIVITY_COLUMNS)
+        _, activities = storage.load_index()
+        matching = [a for a in activities if a.route_id == self.route.route_id]
+        self.activities_by_id = {a.activity_id: a for a in matching}
+        for activity in sorted(matching, key=lambda a: a.start_time_local, reverse=True):
+            table.add_row(*_activity_row(activity, self.route.name), key=activity.activity_id)
+        self.query_one("#route_status", Static).update(
+            f"Route: {self.route.name}  |  {len(matching)} activities"
+        )
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        activity = self.activities_by_id.get(event.row_key.value)
+        if activity is not None:
+            self.app.push_screen(LapsScreen(activity, self.client))
 
     def action_back(self) -> None:
         self.app.pop_screen()

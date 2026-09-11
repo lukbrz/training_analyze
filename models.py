@@ -16,6 +16,7 @@ class ActivitySummary:
     avg_hr: int | None = None
     avg_power: float | None = None
     total_ascent_m: float | None = None
+    route_id: str | None = None
 
 
 @dataclass
@@ -37,6 +38,8 @@ class RecordPoint:
     heart_rate: int | None = None
     power: float | None = None
     speed_mps: float | None = None
+    lat: float | None = None
+    lon: float | None = None
 
 
 @dataclass
@@ -45,6 +48,20 @@ class ZoneTime:
     low_boundary: float | None
     high_boundary: float | None
     seconds: float
+
+
+@dataclass
+class RouteSignature:
+    points: list[list[float]]  # resampled [lat, lon] pairs (lists, not tuples — JSON round-trip)
+    distance_m: float
+
+
+@dataclass
+class Route:
+    route_id: str
+    name: str
+    sport: str
+    signature: RouteSignature
 
 
 def format_duration(seconds: float) -> str:

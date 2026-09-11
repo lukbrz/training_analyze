@@ -2,9 +2,11 @@ from datetime import datetime, timedelta
 
 import fitparse
 
+import routes
 from models import ActivitySummary, Lap, RecordPoint
 
 INTERVAL_INTENSITIES = {"interval", "active"}
+SEMICIRCLE_TO_DEGREES = 180 / 2**31
 
 
 def _resolve_speed(msg, distance_m: float | None, duration_s: float | None) -> float | None:
@@ -103,6 +105,8 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
         speed = rec.get_value("speed")
         if speed is None:
             speed = rec.get_value("enhanced_speed")
+        lat_semicircles = rec.get_value("position_lat")
+        lon_semicircles = rec.get_value("position_long")
         records.append(
             RecordPoint(
                 timestamp_utc=timestamp.replace(tzinfo=None),
@@ -110,6 +114,8 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
                 heart_rate=rec.get_value("heart_rate"),
                 power=rec.get_value("power"),
                 speed_mps=speed,
+                lat=lat_semicircles * SEMICIRCLE_TO_DEGREES if lat_semicircles is not None else None,
+                lon=lon_semicircles * SEMICIRCLE_TO_DEGREES if lon_semicircles is not None else None,
             )
         )
     return records
@@ -176,6 +182,61 @@ def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta)
     if bucket:
         laps.append(_bucket_to_lap(bucket, len(laps) + 1, offset))
     return laps
+
+
+def detect_physical_laps(
+    records: list[RecordPoint],
+    offset: timedelta,
+    close_radius_m: float = 30.0,
+    min_lap_distance_m: float = 200.0,
+) -> list[Lap] | None:
+    """Detect repeated physical loops (e.g. laps around a park) from GPS position alone,
+    independent of the device's own lap markers.
+
+    The activity's first GPS-fixed record is the anchor. A lap boundary is marked each time
+    the track comes back within `close_radius_m` of the anchor, provided at least
+    `min_lap_distance_m` has been covered since the last boundary (only the first point of
+    each such "visit" counts, so lingering near the start/finish doesn't create duplicate
+    boundaries). Returns None if fewer than 2 segments result — e.g. an out-and-back or
+    point-to-point course only ever nears its start once, at the very end.
+
+    Known limitations: a poor GPS fix on the anchor record skews every subsequent check;
+    loops shorter than `min_lap_distance_m` won't be detected; a course that happens to pass
+    near the start mid-loop (not a real lap) can produce a false split. Acceptable for a
+    personal tool, not worth extra heuristics.
+    """
+    fixed = [r for r in records if r.lat is not None and r.lon is not None]
+    if len(fixed) < 20:
+        return None
+
+    anchor = fixed[0]
+    boundaries = [0]
+    last_boundary_distance = anchor.distance_m or 0.0
+    inside_radius = False
+    for i, rec in enumerate(records):
+        if rec.lat is None or rec.lon is None:
+            continue
+        dist_to_anchor = routes.haversine_m(anchor.lat, anchor.lon, rec.lat, rec.lon)
+        if dist_to_anchor <= close_radius_m:
+            if not inside_radius:
+                inside_radius = True
+                covered = (rec.distance_m or last_boundary_distance) - last_boundary_distance
+                if i != boundaries[-1] and covered >= min_lap_distance_m:
+                    boundaries.append(i)
+                    last_boundary_distance = rec.distance_m or last_boundary_distance
+        else:
+            inside_radius = False
+
+    if len(boundaries) < 2:
+        return None
+
+    segments = []
+    for start, end in zip(boundaries, boundaries[1:] + [len(records)]):
+        segments.append(records[start:end])
+    if len(segments) < 2:
+        return None
+
+    return [_bucket_to_lap(segment, i, offset) for i, segment in enumerate(segments, start=1)]
 
 
 def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) -> list[RecordPoint]:
