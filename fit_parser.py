@@ -62,29 +62,101 @@ def parse(
         total_ascent_m=session.get_value("total_ascent"),
     )
 
-    laps = []
-    for lap_index, lap_msg in enumerate(fitfile.get_messages("lap"), start=1):
+    raw_laps = []
+    for lap_msg in fitfile.get_messages("lap"):
         lap_utc_start = lap_msg.get_value("start_time")
         lap_local_start = (
             (lap_utc_start.replace(tzinfo=None) + offset).isoformat() if lap_utc_start else ""
         )
         lap_duration_s = lap_msg.get_value("total_elapsed_time") or 0.0
         lap_distance_m = lap_msg.get_value("total_distance") or 0.0
-        intensity = lap_msg.get_value("intensity")
-        laps.append(
-            Lap(
-                lap_index=lap_index,
-                start_time_local=lap_local_start,
-                duration_s=lap_duration_s,
-                distance_m=lap_distance_m,
-                avg_speed_mps=_resolve_speed(lap_msg, lap_distance_m, lap_duration_s),
-                avg_hr=lap_msg.get_value("avg_heart_rate"),
-                avg_power=lap_msg.get_value("avg_power"),
-                is_interval=intensity in INTERVAL_INTENSITIES,
-            )
+        raw_laps.append(
+            {
+                "start_time_local": lap_local_start,
+                "duration_s": lap_duration_s,
+                "distance_m": lap_distance_m,
+                "avg_speed_mps": _resolve_speed(lap_msg, lap_distance_m, lap_duration_s),
+                "avg_hr": lap_msg.get_value("avg_heart_rate"),
+                "avg_power": lap_msg.get_value("avg_power"),
+                "intensity": lap_msg.get_value("intensity"),
+            }
         )
 
+    raw_laps = _merge_autolap_splits(raw_laps)
+
+    laps = [
+        Lap(
+            lap_index=lap_index,
+            start_time_local=raw["start_time_local"],
+            duration_s=raw["duration_s"],
+            distance_m=raw["distance_m"],
+            avg_speed_mps=raw["avg_speed_mps"],
+            avg_hr=raw["avg_hr"],
+            avg_power=raw["avg_power"],
+            is_interval=raw["intensity"] in INTERVAL_INTENSITIES,
+        )
+        for lap_index, raw in enumerate(raw_laps, start=1)
+    ]
+
     return summary, laps
+
+
+def _weighted_avg(
+    a_value: float | None, a_weight: float, b_value: float | None, b_weight: float
+) -> float | None:
+    if a_value is None:
+        return b_value
+    if b_value is None:
+        return a_value
+    total_weight = a_weight + b_weight
+    if not total_weight:
+        return (a_value + b_value) / 2
+    return (a_value * a_weight + b_value * b_weight) / total_weight
+
+
+def _merge_autolap_splits(raw_laps: list[dict]) -> list[dict]:
+    """Merges consecutive raw device laps that share the same intensity — but only for
+    activities where intensity actually varies (a structured workout was followed), never for
+    a plain run/ride where every lap is uniformly 'active' (or uniformly anything else): there,
+    each lap boundary is a deliberate Auto Lap-by-distance split the user wants to keep (e.g.
+    per-km splits on a marathon), and merging them would collapse the whole activity into one
+    lap.
+
+    Garmin's distance-based Auto Lap (most commonly "every 1 km", a very common device default)
+    fires purely on elapsed distance, independent of a workout's own structure — so within a
+    structured workout it can trigger mid-effort and chop what the device itself still
+    considers one continuous phase (e.g. a planned 1800m rep) into multiple separate lap
+    entries with no change in intensity between them, unlike a genuinely distinct phase change
+    (warmup -> active, active -> rest, ...), which always does show up as an intensity change
+    in this device's lap stream. That gives a reliable signal — merge consecutive same-intensity
+    laps — without needing to guess the device's exact Auto Lap distance setting (1km, 1 mile,
+    ... it varies by user/device configuration). Verified against real recorded activities:
+    every legitimate distinct rep in a structured workout is separated by an intensity change;
+    only Auto Lap-interrupted phases ever show two consecutive laps of the identical intensity.
+    """
+    if len({raw["intensity"] for raw in raw_laps}) <= 1:
+        return raw_laps
+
+    merged: list[dict] = []
+    for raw in raw_laps:
+        if merged and merged[-1]["intensity"] == raw["intensity"]:
+            prev = merged[-1]
+            duration_s = prev["duration_s"] + raw["duration_s"]
+            distance_m = prev["distance_m"] + raw["distance_m"]
+            merged[-1] = {
+                "start_time_local": prev["start_time_local"],
+                "duration_s": duration_s,
+                "distance_m": distance_m,
+                "avg_speed_mps": distance_m / duration_s if duration_s else None,
+                "avg_hr": _weighted_avg(prev["avg_hr"], prev["duration_s"], raw["avg_hr"], raw["duration_s"]),
+                "avg_power": _weighted_avg(
+                    prev["avg_power"], prev["duration_s"], raw["avg_power"], raw["duration_s"]
+                ),
+                "intensity": raw["intensity"],
+            }
+        else:
+            merged.append(dict(raw))
+    return merged
 
 
 def session_utc_offset(fit_bytes: bytes, start_time_local: str) -> timedelta:

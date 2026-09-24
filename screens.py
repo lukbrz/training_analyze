@@ -1,4 +1,6 @@
+import math
 import uuid
+from collections import Counter
 from datetime import date, timedelta
 
 from rich.text import Text
@@ -18,6 +20,7 @@ import geocode
 import routes
 import storage
 from models import (
+    PACE_SPORTS,
     ActivitySummary,
     Lap,
     Route,
@@ -491,6 +494,7 @@ class LapsScreen(Screen):
         Binding("p", "physical_laps", "Physical laps"),
         Binding("i", "split_intervals", "Split intervals"),
         Binding("f", "toggle_interval_filter", "Interval-only"),
+        Binding("h", "phase_metrics", "Phase time/pace/power"),
     ]
 
     LAP_COLUMNS = ("#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Int")
@@ -795,6 +799,20 @@ class LapsScreen(Screen):
             return
         self.app.push_screen(CompareScreen(self.activity, marked, self._records, self._offset))
 
+    def action_phase_metrics(self) -> None:
+        # Interval phase-splits (finer-grained) take priority when present; otherwise
+        # histogram whatever's currently in the table — a whole-activity split by
+        # distance/time, detected physical laps, or (less usefully, but not blocked) the
+        # plain device laps.
+        if self.interval_splits:
+            phases = [phase for phases in self.interval_splits.values() for phase in phases]
+        else:
+            phases = list(self.current_laps)
+        if not phases:
+            self.notify("No laps to show a histogram for", severity="warning")
+            return
+        self.app.push_screen(PhaseMetricsScreen(self.activity, phases))
+
     def action_back(self) -> None:
         self.app.pop_screen()
 
@@ -962,6 +980,140 @@ class CompareScreen(Screen):
             has_data = True
         plt.title(title if has_data else f"{title} — no data")
         plt.xlabel(self.X_AXIS_LABELS[self.x_mode])
+        plot.refresh()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+def _histogram_bins(values: list[float], bin_width: float) -> list[tuple[float, int]]:
+    """(bin_start, count) pairs covering every bin from the lowest to the highest occupied
+    one, zero-count bins included — so the chart reads as a continuous distribution instead
+    of skipping the gaps between whichever bins happen to have a phase in them."""
+    if not values:
+        return []
+    counts = Counter(math.floor(v / bin_width) for v in values)
+    lo, hi = min(counts), max(counts)
+    return [(i * bin_width, counts.get(i, 0)) for i in range(lo, hi + 1)]
+
+
+def _adaptive_bin_width(values: list[float], base_width: float, max_bins: int) -> float:
+    """The narrowest whole multiple of `base_width` (base_width, 2x, 3x, ...) that keeps the
+    value range within `max_bins` bins — a widely-spread set of phases (e.g. mixing short and
+    long reps) grows from, say, 1s to 2s to 3s bins rather than flooding the histogram with
+    dozens of mostly-empty bars."""
+    if not values:
+        return base_width
+    span = max(values) - min(values)
+    width = base_width
+    while span / width > max_bins:
+        width += base_width
+    return width
+
+
+def _bin_label(start: float, width: float, base_width: float, edge_fmt) -> str:
+    """A bin's x-axis label: just its (formatted) start when the bin is its original,
+    unwidened size, or a "start-end" range once `_adaptive_bin_width` has widened it —
+    a single edge value would otherwise misread as the whole bin's worth of phases having
+    that exact value."""
+    if width <= base_width:
+        return edge_fmt(start)
+    return f"{edge_fmt(start)}-{edge_fmt(start + width)}"
+
+
+class PhaseMetricsScreen(Screen):
+    """Histograms of duration/pace/power across a set of splits — interval phase-splits
+    ("2.1", "2.2", ...), or a whole-activity split by distance/time when no intervals are
+    marked: how many splits fell in each time/pace/power bucket. Answers "how consistent are
+    my 300m reps" (a tight single peak) or "am I fading" (a spread with a slow tail) better
+    than a table of numbers or a per-split bar chart, where every split gets its own bar."""
+
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    MAX_BINS = 12
+    TIME_BIN_S = 1.0
+    PACE_BIN_S_PER_KM = 5.0
+    SPEED_BIN_KMH = 1.0
+    POWER_BIN_W = 5.0
+
+    def __init__(self, activity: ActivitySummary, phases: list[Lap]) -> None:
+        super().__init__()
+        self.activity = activity
+        self.phases = phases
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"Phase time/pace/power — {self.activity.name}", id="phase_metrics_status")
+        yield Vertical(
+            PlotextPlot(id="phase_time_plot"),
+            PlotextPlot(id="phase_pace_plot"),
+            PlotextPlot(id="phase_power_plot"),
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._redraw()
+
+    def _redraw(self) -> None:
+        phases = self.phases
+        pace_sport = self.activity.sport in PACE_SPORTS
+
+        self._draw_histogram(
+            "phase_time_plot",
+            [p.duration_s for p in phases],
+            self.TIME_BIN_S,
+            edge_fmt=lambda v: f"{int(round(v))}s",
+            unit_suffix="s",
+            title="Duration histogram",
+        )
+
+        if pace_sport:
+            self._draw_histogram(
+                "phase_pace_plot",
+                [1000 / p.avg_speed_mps for p in phases if p.avg_speed_mps],
+                self.PACE_BIN_S_PER_KM,
+                edge_fmt=format_duration,  # a sec/km edge value reads directly as m:ss pace
+                unit_suffix="s/km",
+                title="Pace histogram",
+            )
+        else:
+            self._draw_histogram(
+                "phase_pace_plot",
+                [p.avg_speed_mps * 3.6 for p in phases if p.avg_speed_mps],
+                self.SPEED_BIN_KMH,
+                edge_fmt=lambda v: f"{v:.0f} km/h",
+                unit_suffix=" km/h",
+                title="Speed histogram",
+            )
+
+        self._draw_histogram(
+            "phase_power_plot",
+            [p.avg_power for p in phases if p.avg_power is not None],
+            self.POWER_BIN_W,
+            edge_fmt=lambda v: f"{int(round(v))}W",
+            unit_suffix="W",
+            title="Power histogram",
+        )
+
+    def _draw_histogram(
+        self, widget_id: str, values: list[float], base_bin_width: float, edge_fmt, unit_suffix: str, title: str
+    ) -> None:
+        plot = self.query_one(f"#{widget_id}", PlotextPlot)
+        plt = plot.plt
+        plt.clear_data()
+        bin_width = _adaptive_bin_width(values, base_bin_width, self.MAX_BINS)
+        bins = _histogram_bins(values, bin_width)
+        if bins:
+            labels = [_bin_label(start, bin_width, base_bin_width, edge_fmt) for start, _ in bins]
+            counts = [count for _, count in bins]
+            plt.bar(labels, counts)
+            # A phase count is always a whole number — without this plotext picks fractional
+            # y-axis ticks (e.g. 0.00, 0.67, 1.33) to fill the plot height, which misreads as
+            # if fractional phase counts were possible.
+            plt.yticks(range(0, max(counts) + 1))
+        bins_desc = f"{int(bin_width)}{unit_suffix} bins"
+        plt.title(f"{title} ({bins_desc})" if bins else f"{title} — no data")
+        plt.ylabel("Phases")
         plot.refresh()
 
     def action_back(self) -> None:
