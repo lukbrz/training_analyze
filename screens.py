@@ -8,7 +8,7 @@ from textual.binding import Binding
 from textual.containers import HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Select, Static
 from textual_plotext import PlotextPlot
 
 import dedupe
@@ -24,6 +24,7 @@ from models import (
     ZoneTime,
     format_distance,
     format_duration,
+    format_duration_tenths,
     format_hr,
     format_lap_distance,
     format_power,
@@ -35,6 +36,8 @@ INITIAL_SYNC_DAYS = 365
 ACTIVITY_COLUMNS = (
     "Date", "Activity", "Sport", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Route"
 )
+
+ALL_SPORTS = "__all__"
 
 
 def _activity_row(activity: ActivitySummary, route_name: str) -> tuple:
@@ -257,6 +260,9 @@ class MainScreen(Screen):
         super().__init__()
         self.client = client
         self.activities_by_id: dict[str, ActivitySummary] = {}
+        self.all_activities: list[ActivitySummary] = []
+        self.routes_by_id: dict[str, Route] = {}
+        self.sport_filter: str = ALL_SPORTS
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -265,6 +271,7 @@ class MainScreen(Screen):
             Button("Sync (s)", id="sync_button", variant="primary"),
             Button("Reprocess (r)", id="reprocess_button"),
             Button("Routes (o)", id="routes_button"),
+            Select([("All sports", ALL_SPORTS)], value=ALL_SPORTS, id="sport_filter_select"),
         )
         yield DataTable(id="activities_table")
         yield Footer()
@@ -276,17 +283,35 @@ class MainScreen(Screen):
         self._refresh_table()
 
     def _refresh_table(self) -> None:
-        _, activities = storage.load_index()
-        routes_by_id = {r.route_id: r for r in storage.load_routes()}
+        _, self.all_activities = storage.load_index()
+        self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
+        self._update_sport_options()
+        self._render_table()
+
+    def _update_sport_options(self) -> None:
+        sports = sorted({a.sport for a in self.all_activities})
+        if self.sport_filter != ALL_SPORTS and self.sport_filter not in sports:
+            self.sport_filter = ALL_SPORTS
+        select = self.query_one("#sport_filter_select", Select)
+        select.set_options([("All sports", ALL_SPORTS)] + [(sport.title(), sport) for sport in sports])
+        select.value = self.sport_filter
+
+    def _render_table(self) -> None:
+        activities = [
+            a for a in self.all_activities if self.sport_filter == ALL_SPORTS or a.sport == self.sport_filter
+        ]
         self.activities_by_id = {a.activity_id: a for a in activities}
         table = self.query_one(DataTable)
         table.clear()
         for activity in sorted(activities, key=lambda a: a.start_time_local, reverse=True):
-            route = routes_by_id.get(activity.route_id)
+            route = self.routes_by_id.get(activity.route_id)
             table.add_row(
                 *_activity_row(activity, route.name if route else "–"), key=activity.activity_id
             )
-        self.query_one("#status", Static).update(f"{len(activities)} activities synced")
+        total = len(self.all_activities)
+        shown = len(activities)
+        status = f"{shown} activities synced" if shown == total else f"{shown} of {total} activities"
+        self.query_one("#status", Static).update(status)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "sync_button":
@@ -295,6 +320,11 @@ class MainScreen(Screen):
             self.action_reprocess()
         elif event.button.id == "routes_button":
             self.action_routes()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "sport_filter_select":
+            self.sport_filter = event.value
+            self._render_table()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
@@ -459,10 +489,12 @@ class LapsScreen(Screen):
         Binding("z", "zones", "Zones"),
         Binding("c", "compare", "Compare intervals"),
         Binding("p", "physical_laps", "Physical laps"),
+        Binding("i", "split_intervals", "Split intervals"),
+        Binding("f", "toggle_interval_filter", "Interval-only"),
     ]
 
     LAP_COLUMNS = ("#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Int")
-    INT_COLUMN_INDEX = len(LAP_COLUMNS) - 1
+    DEFAULT_INTERVAL_SPLIT_M = 300.0
 
     def __init__(self, activity: ActivitySummary, client) -> None:
         super().__init__()
@@ -472,6 +504,14 @@ class LapsScreen(Screen):
         self.viewing_device_laps = True
         self._records: list[fit_parser.RecordPoint] | None = None
         self._offset: timedelta | None = None
+        # lap_index -> phase splits of that (marked-interval) lap, shown as child rows
+        # "2.1", "2.2", ... under their parent — recomputed whenever current_laps changes.
+        self.interval_splits: dict[int, list[Lap]] = {}
+        self.show_intervals_only = False
+        # Row position -> index into current_laps, or None for a child phase-split row —
+        # lets action_toggle_interval and similar map a DataTable cursor row back to a lap
+        # even though rendered rows no longer correspond 1:1 with current_laps.
+        self._row_map: list[int | None] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -480,6 +520,8 @@ class LapsScreen(Screen):
             Input(placeholder="e.g. 400 or 60", id="split_value_input"),
             Button("Split by distance (m)", id="split_distance_button"),
             Button("Split by time (s)", id="split_time_button"),
+            Button("Split intervals (i)", id="split_intervals_button"),
+            Button("Interval only (f)", id="interval_filter_button"),
             Button("Reset", id="reset_button"),
             id="split_bar",
         )
@@ -512,23 +554,48 @@ class LapsScreen(Screen):
     def _rebuild_table(self) -> None:
         table = self.query_one(DataTable)
         table.clear()
-        for lap in self.current_laps:
-            table.add_row(
-                str(lap.lap_index),
-                lap.start_time_local[11:19] if lap.start_time_local else "–",
-                Text(format_duration(lap.duration_s), justify="right"),
-                format_lap_distance(self.activity.sport, lap.distance_m),
-                format_speed_or_pace(self.activity.sport, lap.avg_speed_mps),
-                format_hr(lap.avg_hr),
-                format_power(lap.avg_power),
-                "✓" if lap.is_interval else "",
-            )
+        self._row_map = []
+        for idx, lap in enumerate(self.current_laps):
+            if self.show_intervals_only and not lap.is_interval:
+                continue
+            table.add_row(*self._lap_row(lap, str(lap.lap_index), bold=lap.is_interval))
+            self._row_map.append(idx)
+            for phase_i, phase_lap in enumerate(self.interval_splits.get(lap.lap_index, []), start=1):
+                table.add_row(*self._lap_row(phase_lap, f"  {lap.lap_index}.{phase_i}", dim=True))
+                self._row_map.append(None)
+
+    def _lap_row(self, lap: Lap, index_label: str, bold: bool = False, dim: bool = False) -> tuple:
+        # Interval laps (bold) and their phase splits (dim) get tenths-of-a-second duration
+        # precision — it's the only way a rep's phase durations visibly sum back to the rep's
+        # own duration (see fit_parser._interpolate_at_distance/_interpolate_at_time); a
+        # plain, unmarked lap has no such reconciliation to show and keeps whole seconds.
+        marked = bold or dim
+        duration_text = format_duration_tenths(lap.duration_s) if marked else format_duration(lap.duration_s)
+        style = "bold" if bold else ("dim" if dim else "")
+
+        def cell(value):
+            return Text(str(value), style=style) if style else value
+
+        return (
+            cell(index_label),
+            cell(lap.start_time_local[11:19] if lap.start_time_local else "–"),
+            Text(duration_text, justify="right", style=style),
+            cell(format_lap_distance(self.activity.sport, lap.distance_m)),
+            cell(format_speed_or_pace(self.activity.sport, lap.avg_speed_mps)),
+            cell(format_hr(lap.avg_hr)),
+            cell(format_power(lap.avg_power)),
+            cell("✓" if lap.is_interval else ""),
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "split_distance_button":
             self._do_split("distance")
         elif event.button.id == "split_time_button":
             self._do_split("time")
+        elif event.button.id == "split_intervals_button":
+            self.action_split_intervals()
+        elif event.button.id == "interval_filter_button":
+            self.action_toggle_interval_filter()
         elif event.button.id == "reset_button":
             self._do_reset()
 
@@ -567,25 +634,36 @@ class LapsScreen(Screen):
 
         self.current_laps = laps
         self.viewing_device_laps = False
+        self.interval_splits = {}
         self._rebuild_table()
         self._refresh_interval_summary()
 
     def _do_reset(self) -> None:
         self.current_laps = storage.load_laps(self.activity.activity_id)
         self.viewing_device_laps = True
+        self.interval_splits = {}
         self._rebuild_table()
         self._refresh_interval_summary()
 
     def action_toggle_interval(self) -> None:
         table = self.query_one(DataTable)
         row = table.cursor_row
-        if row is None or row < 0 or row >= len(self.current_laps):
+        if row is None or row < 0 or row >= len(self._row_map):
             return
-        lap = self.current_laps[row]
+        lap_index = self._row_map[row]
+        if lap_index is None:
+            self.notify("Mark the parent lap, not a phase split", severity="warning")
+            return
+        lap = self.current_laps[lap_index]
         lap.is_interval = not lap.is_interval
-        table.update_cell_at(Coordinate(row, self.INT_COLUMN_INDEX), "✓" if lap.is_interval else "")
+        if not lap.is_interval:
+            self.interval_splits.pop(lap.lap_index, None)
         if self.viewing_device_laps:
             storage.save_laps(self.activity.activity_id, self.current_laps)
+        # A toggle changes more than the "Int" cell — duration precision and bold styling
+        # follow is_interval too, and the row may need to appear/disappear under the active
+        # filter — so a full rebuild is simpler and cheap at this table's size.
+        self._rebuild_table()
         self._refresh_interval_summary()
 
     def _refresh_interval_summary(self) -> None:
@@ -625,14 +703,85 @@ class LapsScreen(Screen):
         if not self._records:
             self.notify("No record data in this FIT file to analyze", severity="warning")
             return
-        laps = fit_parser.detect_physical_laps(self._records, self._offset)
+
+        # An optional value in the split input overrides the default "close to anchor"
+        # radius — the auto-detect can miss real loops under tree cover/GPS drift (a
+        # park loop never quite closing to within the default radius), so widening it
+        # by hand is the escape hatch rather than a code change.
+        raw_value = self.query_one("#split_value_input", Input).value.strip()
+        close_radius_m = fit_parser.DEFAULT_CLOSE_RADIUS_M
+        if raw_value:
+            try:
+                close_radius_m = float(raw_value)
+                if close_radius_m <= 0:
+                    raise ValueError
+            except ValueError:
+                self.notify("Enter a positive number of meters for the loop radius", severity="warning")
+                return
+
+        self.notify("Detecting course loops...")
+        self._detect_physical_laps(close_radius_m)
+
+    @work(thread=True)
+    def _detect_physical_laps(self, close_radius_m: float) -> None:
+        # Scores every candidate loop anchor across the whole track (see
+        # fit_parser.detect_physical_laps) — can take several seconds on a long activity,
+        # so it must not block the UI thread like the other split modes do.
+        laps = fit_parser.detect_physical_laps(self._records, self._offset, close_radius_m=close_radius_m)
+        self.app.call_from_thread(self._physical_laps_done, laps)
+
+    def _physical_laps_done(self, laps: list[Lap] | None) -> None:
         if not laps:
             self.notify("No repeated course laps detected", severity="warning")
             return
         self.current_laps = laps
         self.viewing_device_laps = False
+        self.interval_splits = {}
         self._rebuild_table()
         self._refresh_interval_summary()
+
+    def action_split_intervals(self) -> None:
+        marked = [lap for lap in self.current_laps if lap.is_interval]
+        if not marked:
+            self.notify("Mark at least one interval (m) before splitting it into phases", severity="warning")
+            return
+
+        raw_value = self.query_one("#split_value_input", Input).value.strip()
+        if raw_value:
+            try:
+                meters = float(raw_value)
+                if meters <= 0:
+                    raise ValueError
+            except ValueError:
+                self.notify("Enter a positive number for the split size", severity="warning")
+                return
+        else:
+            meters = self.DEFAULT_INTERVAL_SPLIT_M
+
+        if not self._ensure_records_loaded():
+            return
+        if not self._records:
+            self.notify("No record data in this FIT file to split", severity="warning")
+            return
+
+        self.interval_splits = {}
+        for lap in marked:
+            lap_records = fit_parser.lap_record_slice(self._records, lap, self._offset)
+            if lap_records:
+                self.interval_splits[lap.lap_index] = fit_parser.split_by_distance(
+                    lap_records, meters, self._offset
+                )
+        self._rebuild_table()
+        self.notify(f"Split {len(self.interval_splits)} interval(s) into {meters:.0f}m phases")
+
+    def action_toggle_interval_filter(self) -> None:
+        self.show_intervals_only = not self.show_intervals_only
+        self.query_one("#interval_filter_button", Button).variant = (
+            "primary" if self.show_intervals_only else "default"
+        )
+        self._rebuild_table()
+        if self.show_intervals_only and not any(lap.is_interval for lap in self.current_laps):
+            self.notify("No intervals marked yet (press m on a lap to mark it)", severity="warning")
 
     def action_zones(self) -> None:
         self.app.push_screen(ZonesScreen(self.activity, self.client))

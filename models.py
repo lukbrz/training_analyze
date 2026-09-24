@@ -74,6 +74,21 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+def format_duration_tenths(seconds: float) -> str:
+    """Like format_duration, but keeping one decimal place — for interval laps and their
+    phase splits, where FIT's native sub-second precision (and, for phase splits, distance
+    interpolation — see fit_parser._interpolate_at_distance) actually means something: it's
+    what lets a rep's phase durations visibly sum back to the rep's own duration instead of
+    silently rounding away a second or two."""
+    total_tenths = int(round(seconds * 10))
+    whole_secs, tenths = divmod(total_tenths, 10)
+    hours, rem = divmod(whole_secs, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{tenths}"
+    return f"{minutes}:{secs:02d}.{tenths}"
+
+
 def format_distance(meters: float) -> str:
     return f"{meters / 1000:.2f} km"
 

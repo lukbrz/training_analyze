@@ -159,24 +159,111 @@ def _bucket_to_lap(bucket: list[RecordPoint], lap_index: int, offset: timedelta)
     )
 
 
+def _lerp_record(prev: RecordPoint, nxt: RecordPoint, frac: float) -> RecordPoint:
+    """A synthetic record linearly interpolated between two real samples, `frac` of the way
+    (by time) from `prev` to `nxt`. Every field — not just the one a caller cares about — is
+    interpolated so the point behaves like a real sample anywhere it's used (bucketed into a
+    lap average, sliced into a chart series, etc)."""
+    frac = min(max(frac, 0.0), 1.0)
+
+    def lerp(a: float | None, b: float | None) -> float | None:
+        return a + frac * (b - a) if a is not None and b is not None else None
+
+    return RecordPoint(
+        timestamp_utc=prev.timestamp_utc + (nxt.timestamp_utc - prev.timestamp_utc) * frac,
+        distance_m=lerp(prev.distance_m, nxt.distance_m),
+        heart_rate=lerp(prev.heart_rate, nxt.heart_rate),
+        power=lerp(prev.power, nxt.power),
+        speed_mps=lerp(prev.speed_mps, nxt.speed_mps),
+        lat=lerp(prev.lat, nxt.lat),
+        lon=lerp(prev.lon, nxt.lon),
+    )
+
+
+def _interpolate_at_distance(prev: RecordPoint, nxt: RecordPoint, target_distance: float) -> RecordPoint:
+    """A synthetic record at exactly `target_distance`, interpolated between the two real
+    samples straddling it.
+
+    Records are only ever a handful of meters and a second or more apart (more under Smart
+    Recording's multi-second gaps), so snapping a distance-based split boundary to whichever
+    real sample first reaches the target — as a naive bucketing pass would — silently drops up
+    to one full sample interval of duration at every split point: the record that closes one
+    bucket can't also open the next. That's small per split but adds up, and it means several
+    splits of one lap never sum back to that lap's own (sub-second-precision, per the FIT spec)
+    duration — which is exactly the "2 seconds missing" a user will notice comparing a
+    300m-split interval against its marked parent lap. Interpolating a shared boundary point
+    that belongs to both buckets fixes that: it's still an estimate (pace is assumed constant
+    between the two straddling samples), but it's the closest available estimate of when the
+    target distance was actually reached.
+    """
+    prev_distance, next_distance = prev.distance_m, nxt.distance_m
+    if prev_distance is None or next_distance is None or next_distance <= prev_distance:
+        frac = 0.0
+    else:
+        frac = (target_distance - prev_distance) / (next_distance - prev_distance)
+    point = _lerp_record(prev, nxt, frac)
+    point.distance_m = target_distance  # exact, rather than whatever the frac lerp rounds to
+    return point
+
+
+def _interpolate_at_time(prev: RecordPoint, nxt: RecordPoint, target_time: datetime) -> RecordPoint:
+    """A synthetic record at exactly `target_time`, interpolated between the two real samples
+    straddling it — the time-axis counterpart of `_interpolate_at_distance`, used by
+    `lap_record_slice` so a lap's record slice reconstructs its full FIT-reported duration
+    instead of silently truncating up to one sample interval at each edge."""
+    total = (nxt.timestamp_utc - prev.timestamp_utc).total_seconds()
+    frac = (target_time - prev.timestamp_utc).total_seconds() / total if total else 0.0
+    point = _lerp_record(prev, nxt, frac)
+    point.timestamp_utc = target_time
+    return point
+
+
+def _fold_negligible_tail(segments: list[list[RecordPoint]], min_tail_distance: float) -> None:
+    """Mutates `segments` in place, folding a final segment shorter than `min_tail_distance`
+    into the one before it.
+
+    Without this, a segmenting pass's very last segment can end up a near-zero sliver with no
+    real signal in it — e.g. `split_by_distance` interpolates a boundary at exactly the target
+    distance, and when a lap's total distance happens to be an (near-)exact multiple of the
+    split size, that boundary lands right on the lap's last real record, leaving a trailing
+    "segment" that's just [boundary, that same record] a fraction of a meter/second apart.
+    """
+    if len(segments) < 2:
+        return
+    tail = segments[-1]
+    tail_distance = (tail[-1].distance_m or 0.0) - (tail[0].distance_m or 0.0)
+    if tail_distance < min_tail_distance:
+        segments[-2] = segments[-2] + tail
+        segments.pop()
+
+
 def split_by_distance(records: list[RecordPoint], meters: float, offset: timedelta) -> list[Lap]:
-    laps = []
+    segments: list[list[RecordPoint]] = []
     bucket: list[RecordPoint] = []
     bucket_start_distance = None
     for rec in records:
         if not bucket:
             bucket_start_distance = rec.distance_m
-        bucket.append(rec)
-        if (
+        elif (
             bucket_start_distance is not None
             and rec.distance_m is not None
             and rec.distance_m - bucket_start_distance >= meters
         ):
-            laps.append(_bucket_to_lap(bucket, len(laps) + 1, offset))
-            bucket = []
-    if bucket:
-        laps.append(_bucket_to_lap(bucket, len(laps) + 1, offset))
-    return laps
+            boundary = _interpolate_at_distance(bucket[-1], rec, bucket_start_distance + meters)
+            bucket.append(boundary)
+            segments.append(bucket)
+            bucket = [boundary]
+            bucket_start_distance = boundary.distance_m
+        bucket.append(rec)
+    if len(bucket) > 1:
+        segments.append(bucket)
+
+    # A genuine final partial split (the lap's distance doesn't divide evenly by `meters`) is
+    # usually close to a full split and should stand on its own — only fold away a sliver that
+    # couldn't be a meaningful phase on its own.
+    _fold_negligible_tail(segments, min_tail_distance=max(1.0, meters * 0.05))
+
+    return [_bucket_to_lap(segment, i, offset) for i, segment in enumerate(segments, start=1)]
 
 
 def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta) -> list[Lap]:
@@ -195,41 +282,21 @@ def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta)
     return laps
 
 
-ANCHOR_SMOOTHING_POINTS = 5
+DEFAULT_CLOSE_RADIUS_M = 75.0
+DEFAULT_MIN_LAP_DISTANCE_M = 150.0
+MAX_ANCHOR_CANDIDATES = 400
 
 
-def detect_physical_laps(
-    records: list[RecordPoint],
-    offset: timedelta,
-    close_radius_m: float = 50.0,
-    min_lap_distance_m: float = 200.0,
-) -> list[Lap] | None:
-    """Detect repeated physical loops (e.g. laps around a park) from GPS position alone,
-    independent of the device's own lap markers.
-
-    The activity's anchor is the average position of its first few GPS fixes (smoothing out
-    the fix-acquisition jitter common right after a GPS watch starts recording). A lap
-    boundary is marked each time the track comes back within `close_radius_m` of the anchor,
-    provided at least `min_lap_distance_m` has been covered since the last boundary (only the
-    first point of each such "visit" counts, so lingering near the start/finish doesn't create
-    duplicate boundaries). Returns None if fewer than 2 segments result — e.g. an out-and-back
-    or point-to-point course only ever nears its start once, at the very end.
-
-    `close_radius_m` defaults generously (50m) because consumer GPS accuracy commonly runs
-    20-50m under tree cover or in urban canyons — too tight a radius misses real loops
-    entirely. Known limitations: loops shorter than `min_lap_distance_m` won't be detected;
-    a course that happens to pass near the start mid-loop (not a real lap) can produce a
-    false split. Acceptable for a personal tool, not worth extra heuristics.
-    """
-    fixed = [r for r in records if r.lat is not None and r.lon is not None]
-    if len(fixed) < 20:
-        return None
-
-    anchor_sample = fixed[:ANCHOR_SMOOTHING_POINTS]
-    anchor_lat = sum(r.lat for r in anchor_sample) / len(anchor_sample)
-    anchor_lon = sum(r.lon for r in anchor_sample) / len(anchor_sample)
+def _boundaries_for_anchor(
+    records: list[RecordPoint], anchor_lat: float, anchor_lon: float,
+    close_radius_m: float, min_lap_distance_m: float,
+) -> list[int]:
+    """Record indices where `records` first comes within `close_radius_m` of (anchor_lat,
+    anchor_lon), each at least `min_lap_distance_m` (by cumulative distance) after the last —
+    i.e. how many times the track "closes a loop" back to this one point. Index 0 always
+    counts as the first boundary even though it isn't itself a return to the anchor."""
     boundaries = [0]
-    last_boundary_distance = fixed[0].distance_m or 0.0
+    last_boundary_distance = records[0].distance_m or 0.0
     inside_radius = False
     for i, rec in enumerate(records):
         if rec.lat is None or rec.lon is None:
@@ -244,24 +311,68 @@ def detect_physical_laps(
                     last_boundary_distance = rec.distance_m or last_boundary_distance
         else:
             inside_radius = False
+    return boundaries
 
-    if len(boundaries) < 2:
+
+def detect_physical_laps(
+    records: list[RecordPoint],
+    offset: timedelta,
+    close_radius_m: float = DEFAULT_CLOSE_RADIUS_M,
+    min_lap_distance_m: float = DEFAULT_MIN_LAP_DISTANCE_M,
+) -> list[Lap] | None:
+    """Detect repeated physical loops (e.g. laps around a park) from GPS position alone,
+    independent of the device's own lap markers.
+
+    The loop's anchor point is searched for across the *whole* track, not assumed to be the
+    recording's start: a real workout commonly has a non-looping warmup/cooldown leg (e.g.
+    running from home to a park and back), so a loop that only exists partway through the
+    activity would never be found by anchoring on the first few GPS fixes. Every candidate
+    anchor (subsampled across the track — `MAX_ANCHOR_CANDIDATES` — since testing every single
+    point is unnecessary and slow) is scored by how many times the track returns within
+    `close_radius_m` of it, each such return at least `min_lap_distance_m` (by cumulative
+    distance) after the last (only the first point of each "visit" counts, so lingering near
+    a point doesn't create duplicate boundaries); the best-scoring anchor's boundaries become
+    the lap splits. Returns None if the best anchor still yields fewer than 2 segments — e.g.
+    an out-and-back or point-to-point course that never repeats any single point.
+
+    `close_radius_m` defaults generously (75m) because consumer GPS accuracy commonly runs
+    20-50m under tree cover or in urban canyons (e.g. park loops) — too tight a radius misses
+    real loops entirely, which is the failure mode that matters most (silently detecting
+    nothing beats a wrong split, but detecting nothing is worse than a caller-supplied
+    override). Both parameters are also exposed to the UI (`LapsScreen`'s split-value input)
+    so a miss on a real activity can be retried with a wider radius without a code change.
+    Known limitations: loops shorter than `min_lap_distance_m` won't be detected; a course
+    that happens to pass near some point mid-loop (not a real lap boundary) can produce a
+    false split, and the anchor search only ever picks one loop location per activity, so an
+    activity mixing two different loop courses only finds whichever recurs more. Acceptable
+    for a personal tool, not worth extra heuristics.
+    """
+    fixed = [r for r in records if r.lat is not None and r.lon is not None]
+    if len(fixed) < 20:
+        return None
+
+    step = max(1, len(records) // MAX_ANCHOR_CANDIDATES)
+    best_boundaries = [0]
+    for i in range(0, len(records), step):
+        rec = records[i]
+        if rec.lat is None or rec.lon is None:
+            continue
+        boundaries = _boundaries_for_anchor(records, rec.lat, rec.lon, close_radius_m, min_lap_distance_m)
+        if len(boundaries) > len(best_boundaries):
+            best_boundaries = boundaries
+
+    if len(best_boundaries) < 2:
         return None
 
     segments = []
-    for start, end in zip(boundaries, boundaries[1:] + [len(records)]):
+    for start, end in zip(best_boundaries, best_boundaries[1:] + [len(records)]):
         segments.append(records[start:end])
 
     # Every segment except the last is guaranteed >= min_lap_distance_m by construction
     # (a boundary only gets added once that much has been covered). The last segment runs
     # to the end of the recording with no such guarantee — without this, a run that simply
     # *finishes* near where it started (extremely common) would masquerade as an extra lap.
-    # Fold a too-short tail into the previous segment instead.
-    if len(segments) >= 2:
-        tail_distance = (segments[-1][-1].distance_m or 0.0) - (segments[-1][0].distance_m or 0.0)
-        if tail_distance < min_lap_distance_m:
-            segments[-2] = segments[-2] + segments[-1]
-            segments.pop()
+    _fold_negligible_tail(segments, min_tail_distance=min_lap_distance_m)
 
     if len(segments) < 2:
         return None
@@ -270,12 +381,31 @@ def detect_physical_laps(
 
 
 def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) -> list[RecordPoint]:
-    """The subset of a full activity's record stream falling inside one lap's time window."""
+    """The subset of a full activity's record stream falling inside one lap's time window,
+    with the exact start/end instants included as interpolated records (see
+    `_interpolate_at_time`) when they fall between two real samples rather than on one."""
     if not lap.start_time_local:
         return []
     utc_start = datetime.fromisoformat(lap.start_time_local) - offset
     utc_end = utc_start + timedelta(seconds=lap.duration_s)
-    return [r for r in records if utc_start <= r.timestamp_utc <= utc_end]
+
+    start_idx = end_idx = None
+    for i, rec in enumerate(records):
+        if start_idx is None and rec.timestamp_utc >= utc_start:
+            start_idx = i
+        if rec.timestamp_utc <= utc_end:
+            end_idx = i
+        elif start_idx is not None:
+            break
+    if start_idx is None or end_idx is None or end_idx < start_idx:
+        return []
+
+    result = list(records[start_idx : end_idx + 1])
+    if start_idx > 0 and result[0].timestamp_utc > utc_start:
+        result.insert(0, _interpolate_at_time(records[start_idx - 1], result[0], utc_start))
+    if end_idx + 1 < len(records) and result[-1].timestamp_utc < utc_end:
+        result.append(_interpolate_at_time(result[-1], records[end_idx + 1], utc_end))
+    return result
 
 
 def lap_x_values(lap_records: list[RecordPoint], lap: Lap, mode: str) -> list[float]:
