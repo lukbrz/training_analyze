@@ -1,4 +1,6 @@
 import math
+import shutil
+import subprocess
 import uuid
 from collections import Counter
 from datetime import date, timedelta
@@ -19,8 +21,10 @@ import garmin_client
 import geocode
 import routes
 import storage
+import workouts
 from models import (
     PACE_SPORTS,
+    SWIM_SPORTS,
     ActivitySummary,
     Lap,
     Route,
@@ -28,10 +32,13 @@ from models import (
     format_distance,
     format_duration,
     format_duration_tenths,
+    format_elevation,
     format_hr,
     format_lap_distance,
     format_power,
     format_speed_or_pace,
+    format_split_value,
+    parse_split_value,
 )
 
 INITIAL_SYNC_DAYS = 365
@@ -41,6 +48,88 @@ ACTIVITY_COLUMNS = (
 )
 
 ALL_SPORTS = "__all__"
+
+
+LEG_NAMES = {"swimming": "Swim", "cycling": "Bike", "running": "Run", "transition": "Trans"}
+
+
+def _common_sport(laps: list[Lap], fallback: str) -> str:
+    """The sport all `laps` share (multisport laps carry their own), else `fallback`."""
+    sports = {lap.sport for lap in laps}
+    return sports.pop() if len(sports) == 1 and None not in sports else fallback
+
+
+def _legs(laps: list[Lap]) -> list[tuple[str, Lap]]:
+    """A multisport activity's legs (Swim, T1, Bike, T2, Run, ...): consecutive device laps of
+    the same sport aggregated into one Lap each, labelled for display."""
+    groups: list[list[Lap]] = []
+    for lap in laps:
+        if groups and groups[-1][0].sport == lap.sport:
+            groups[-1].append(lap)
+        else:
+            groups.append([lap])
+
+    def weighted(attr: str, group: list[Lap]) -> float | None:
+        samples = [(getattr(l, attr), l.duration_s) for l in group if getattr(l, attr) is not None]
+        total = sum(d for _, d in samples)
+        return sum(v * d for v, d in samples) / total if total else None
+
+    legs = []
+    transitions = 0
+    for group in groups:
+        sport = group[0].sport or "other"
+        if sport == "transition":
+            transitions += 1
+            name = f"T{transitions}"
+        else:
+            name = LEG_NAMES.get(sport, sport.replace("_", " ").title())
+        duration = sum(l.duration_s for l in group)
+        distance = sum(l.distance_m for l in group)
+        hr = weighted("avg_hr", group)
+        ascents = [l.total_ascent_m for l in group if l.total_ascent_m is not None]
+        legs.append((name, Lap(
+            lap_index=group[0].lap_index,
+            start_time_local=group[0].start_time_local,
+            duration_s=duration,
+            distance_m=distance,
+            avg_speed_mps=distance / duration if duration else None,
+            avg_hr=round(hr) if hr is not None else None,
+            avg_power=weighted("avg_power", group),
+            total_ascent_m=sum(ascents) if ascents else None,
+            sport=sport,
+        )))
+    return legs
+
+
+_CLIPBOARD_COMMANDS = (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"])
+
+
+def _cell_text(cell) -> str:
+    return (cell.plain if isinstance(cell, Text) else str(cell)).strip()
+
+
+def _table_as_tsv(table: DataTable) -> str:
+    """The table exactly as displayed (current filter, phase-split rows and all) as
+    tab-separated text, which pastes into a spreadsheet as cells."""
+    lines = ["\t".join(_cell_text(col.label) for col in table.columns.values())]
+    for row in range(table.row_count):
+        lines.append("\t".join(_cell_text(cell) for cell in table.get_row_at(row)))
+    return "\n".join(lines)
+
+
+def _copy_to_clipboard(screen: Screen, text: str, what: str) -> None:
+    """Copy via the terminal (OSC 52 — works in most terminals, but some ignore it) and, if
+    one is installed, a system clipboard tool too, which works regardless of the terminal."""
+    screen.app.copy_to_clipboard(text)
+    for command in _CLIPBOARD_COMMANDS:
+        if shutil.which(command[0]):
+            try:
+                subprocess.run(command, input=text.encode("utf-8"), check=True, timeout=5)
+            except (subprocess.SubprocessError, OSError):
+                continue
+            screen.notify(f"Copied {what}")
+            return
+    screen.notify(f"Copied {what} via the terminal (if pasting gives nothing, install xclip)")
 
 
 def _activity_row(activity: ActivitySummary, route_name: str) -> tuple:
@@ -74,7 +163,9 @@ def _assign_route(activity_id: str, fit_bytes: bytes, sport: str, routes_list: l
     return route.route_id
 
 
-def _merge_duplicates(activities: list[ActivitySummary]) -> tuple[list[ActivitySummary], int]:
+def _merge_duplicates(
+    activities: list[ActivitySummary], recompute_existing: bool
+) -> tuple[list[ActivitySummary], int]:
     """Detect activities that are the same physical session recorded by two devices and
     fold each into its primary (see dedupe.py) — filling in HR/power/GPS coverage the
     primary's own device missed, and dropping the secondary from the visible list.
@@ -82,16 +173,24 @@ def _merge_duplicates(activities: list[ActivitySummary]) -> tuple[list[ActivityS
     Fully idempotent and safe to run on every sync/reprocess: a secondary's raw .fit is
     never deleted, only excluded from the index via the merge ledger, so re-running this
     just recomputes the same result from scratch rather than accumulating state.
+
+    Rebuilding a merge means fully re-parsing both FIT files (tens of seconds for a few long
+    activities), so with `recompute_existing=False` (sync) only pairs that are new or have no
+    saved merged stream are rebuilt — `activities` loaded from the index already carry the
+    merged summaries of the rest. Reprocess passes True, since it has just re-parsed every
+    summary from scratch and the merge has to be reapplied on top.
     """
     ledger = storage.load_merge_ledger()
     visible = [a for a in activities if a.activity_id not in ledger]
 
     newly_merged = 0
+    new_primaries: set[str] = set()
     for a, b in dedupe.find_duplicate_pairs(visible):
         primary, secondary = dedupe.choose_primary(a, b)
         if secondary.activity_id in ledger:
             continue
         ledger[secondary.activity_id] = primary.activity_id
+        new_primaries.add(primary.activity_id)
         newly_merged += 1
     if newly_merged:
         storage.save_merge_ledger(ledger)
@@ -104,6 +203,8 @@ def _merge_duplicates(activities: list[ActivitySummary]) -> tuple[list[ActivityS
     for primary_id, secondary_ids in secondaries_by_primary.items():
         primary = by_id.get(primary_id)
         if primary is None:
+            continue
+        if not (recompute_existing or primary_id in new_primaries or not storage.has_merged_records(primary_id)):
             continue
 
         streams = []
@@ -257,6 +358,8 @@ class MainScreen(Screen):
         Binding("s", "sync", "Sync"),
         Binding("r", "reprocess", "Reprocess"),
         Binding("o", "routes", "Routes"),
+        Binding("w", "workouts", "Workouts"),
+        Binding("y", "copy", "Copy table"),
     ]
 
     def __init__(self, client) -> None:
@@ -274,6 +377,7 @@ class MainScreen(Screen):
             Button("Sync (s)", id="sync_button", variant="primary"),
             Button("Reprocess (r)", id="reprocess_button"),
             Button("Routes (o)", id="routes_button"),
+            Button("Workouts (w)", id="workouts_button"),
             Select([("All sports", ALL_SPORTS)], value=ALL_SPORTS, id="sport_filter_select"),
         )
         yield DataTable(id="activities_table")
@@ -323,6 +427,8 @@ class MainScreen(Screen):
             self.action_reprocess()
         elif event.button.id == "routes_button":
             self.action_routes()
+        elif event.button.id == "workouts_button":
+            self.action_workouts()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "sport_filter_select":
@@ -344,6 +450,13 @@ class MainScreen(Screen):
 
     def action_routes(self) -> None:
         self.app.push_screen(RoutesScreen(self.client))
+
+    def action_workouts(self) -> None:
+        self.app.push_screen(WorkoutsScreen(self.client))
+
+    def action_copy(self) -> None:
+        table = self.query_one(DataTable)
+        _copy_to_clipboard(self, _table_as_tsv(table), f"{table.row_count} activities")
 
     def _set_buttons_disabled(self, disabled: bool) -> None:
         self.query_one("#sync_button", Button).disabled = disabled
@@ -414,7 +527,8 @@ class MainScreen(Screen):
                 last_synced_date = activity_date
             storage.save_index(last_synced_date, activities)
 
-        activities, merged_count = _merge_duplicates(activities)
+        self.app.call_from_thread(self._set_status, "Checking for duplicate recordings...")
+        activities, merged_count = _merge_duplicates(activities, recompute_existing=False)
         storage.save_index(last_synced_date, activities)
 
         message = f"Sync complete: {new_count} new activities"
@@ -455,7 +569,12 @@ class MainScreen(Screen):
                 skipped += 1
                 continue
 
-            old_marks = {lap.lap_index: lap.is_interval for lap in storage.load_laps(activity.activity_id)}
+            old_laps = storage.load_laps(activity.activity_id)
+            old_marks = {lap.lap_index: lap.is_interval for lap in old_laps}
+            if len(old_laps) > 1 and all(old_marks.values()):
+                # Every lap marked is the old parser stamping all 'active' laps of an
+                # unstructured activity as intervals, not marks anyone made by hand.
+                old_marks = {}
             for lap in new_laps:
                 if old_marks.get(lap.lap_index):
                     lap.is_interval = True
@@ -468,7 +587,8 @@ class MainScreen(Screen):
             storage.save_index(last_synced_date, list(by_id.values()))
             reprocessed += 1
 
-        merged_activities, merged_count = _merge_duplicates(list(by_id.values()))
+        self.app.call_from_thread(self._set_status, "Re-merging duplicate recordings...")
+        merged_activities, merged_count = _merge_duplicates(list(by_id.values()), recompute_existing=True)
         storage.save_index(last_synced_date, merged_activities)
 
         message = f"Reprocessed {reprocessed} activities"
@@ -495,9 +615,12 @@ class LapsScreen(Screen):
         Binding("i", "split_intervals", "Split intervals"),
         Binding("f", "toggle_interval_filter", "Interval-only"),
         Binding("h", "phase_metrics", "Phase time/pace/power"),
+        Binding("y", "copy", "Copy table"),
     ]
 
-    LAP_COLUMNS = ("#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Int")
+    LAP_COLUMNS = (
+        "#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Ascent", "Descent", "Int"
+    )
     DEFAULT_INTERVAL_SPLIT_M = 300.0
 
     def __init__(self, activity: ActivitySummary, client) -> None:
@@ -516,14 +639,14 @@ class LapsScreen(Screen):
         # lets action_toggle_interval and similar map a DataTable cursor row back to a lap
         # even though rendered rows no longer correspond 1:1 with current_laps.
         self._row_map: list[int | None] = []
+        self.is_multisport = activity.sport == fit_parser.MULTISPORT
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(self._summary_text(), id="activity_summary")
         yield HorizontalGroup(
-            Input(placeholder="e.g. 400 or 60", id="split_value_input"),
-            Button("Split by distance (m)", id="split_distance_button"),
-            Button("Split by time (s)", id="split_time_button"),
+            Input(placeholder="400 = metres · 60s / 1m / 1:30 = time", id="split_value_input"),
+            Button("Split", id="split_button"),
             Button("Split intervals (i)", id="split_intervals_button"),
             Button("Interval only (f)", id="interval_filter_button"),
             Button("Reset", id="reset_button"),
@@ -535,18 +658,31 @@ class LapsScreen(Screen):
 
     def _summary_text(self) -> str:
         a = self.activity
-        return (
+        text = (
             f"{a.name}  |  {a.start_time_local}  |  {a.sport}\n"
             f"Duration: {format_duration(a.duration_s)}   "
             f"Distance: {format_distance(a.distance_m)}   "
             f"Avg: {format_speed_or_pace(a.sport, a.avg_speed_mps)}   "
             f"Avg HR: {format_hr(a.avg_hr)}   Avg Power: {format_power(a.avg_power)}"
         )
+        if self.is_multisport:
+            for name, leg in _legs(storage.load_laps(a.activity_id)):
+                text += (
+                    f"\n  {name:<5} {format_duration(leg.duration_s):>8}  "
+                    f"{format_lap_distance(leg.sport, leg.distance_m) if leg.sport in SWIM_SPORTS else format_distance(leg.distance_m):>9}  "
+                    f"{format_speed_or_pace(leg.sport, leg.avg_speed_mps):>12}  "
+                    f"HR {format_hr(leg.avg_hr):>3}  {format_power(leg.avg_power):>6}  "
+                    f"↑ {format_elevation(leg.total_ascent_m)}"
+                )
+        return text
 
     def on_mount(self) -> None:
         table = self.query_one(DataTable)
         table.cursor_type = "row"
-        table.add_columns(*self.LAP_COLUMNS)
+        columns = list(self.LAP_COLUMNS)
+        if self.is_multisport:
+            columns.insert(1, "Sport")
+        table.add_columns(*columns)
         self.current_laps = storage.load_laps(self.activity.activity_id)
         self.viewing_device_laps = True
         self._rebuild_table()
@@ -580,22 +716,25 @@ class LapsScreen(Screen):
         def cell(value):
             return Text(str(value), style=style) if style else value
 
+        sport = lap.sport or self.activity.sport
+        sport_cells = (cell(LEG_NAMES.get(sport, sport)),) if self.is_multisport else ()
         return (
             cell(index_label),
+            *sport_cells,
             cell(lap.start_time_local[11:19] if lap.start_time_local else "–"),
             Text(duration_text, justify="right", style=style),
-            cell(format_lap_distance(self.activity.sport, lap.distance_m)),
-            cell(format_speed_or_pace(self.activity.sport, lap.avg_speed_mps)),
+            cell(format_lap_distance(sport, lap.distance_m)),
+            cell(format_speed_or_pace(sport, lap.avg_speed_mps)),
             cell(format_hr(lap.avg_hr)),
             cell(format_power(lap.avg_power)),
+            cell(format_elevation(lap.total_ascent_m)),
+            cell(format_elevation(lap.total_descent_m)),
             cell("✓" if lap.is_interval else ""),
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "split_distance_button":
-            self._do_split("distance")
-        elif event.button.id == "split_time_button":
-            self._do_split("time")
+        if event.button.id == "split_button":
+            self._do_split()
         elif event.button.id == "split_intervals_button":
             self.action_split_intervals()
         elif event.button.id == "interval_filter_button":
@@ -615,28 +754,34 @@ class LapsScreen(Screen):
         self._offset = fit_parser.session_utc_offset(fit_bytes, self.activity.start_time_local)
         return True
 
-    def _do_split(self, mode: str) -> None:
+    def _read_split_value(self, default: tuple[str, float] | None = None) -> tuple[str, float] | None:
+        """The split input as ("distance", m) or ("time", s) — see models.parse_split_value.
+        Returns `default` when blank; notifies and returns None when unparseable."""
         raw_value = self.query_one("#split_value_input", Input).value.strip()
+        if not raw_value and default is not None:
+            return default
         try:
-            value = float(raw_value)
-            if value <= 0:
-                raise ValueError
+            return parse_split_value(raw_value)
         except ValueError:
-            self.notify("Enter a positive number for the split size", severity="warning")
-            return
+            self.notify("Split size: 400 (metres), 1.5km, or a time like 60s, 1m, 1m30s, 1:30", severity="warning")
+            return None
 
+    def _split(self, records: list[fit_parser.RecordPoint], mode: str, value: float) -> list[Lap]:
+        if mode == "distance":
+            return fit_parser.split_by_distance(records, value, self._offset)
+        return fit_parser.split_by_time(records, value, self._offset)
+
+    def _do_split(self) -> None:
+        parsed = self._read_split_value()
+        if parsed is None:
+            return
         if not self._ensure_records_loaded():
             return
         if not self._records:
             self.notify("No record data in this FIT file to split", severity="warning")
             return
 
-        if mode == "distance":
-            laps = fit_parser.split_by_distance(self._records, value, self._offset)
-        else:
-            laps = fit_parser.split_by_time(self._records, value, self._offset)
-
-        self.current_laps = laps
+        self.current_laps = self._split(self._records, *parsed)
         self.viewing_device_laps = False
         self.interval_splits = {}
         self._rebuild_table()
@@ -680,6 +825,7 @@ class LapsScreen(Screen):
         total_distance = sum(lap.distance_m for lap in marked)
         total_duration = sum(lap.duration_s for lap in marked)
         avg_speed = total_distance / total_duration if total_duration else None
+        sport = _common_sport(marked, self.activity.sport)
 
         hr_samples = [(lap.avg_hr, lap.duration_s) for lap in marked if lap.avg_hr is not None]
         avg_hr = (
@@ -695,9 +841,9 @@ class LapsScreen(Screen):
         )
 
         static.update(
-            f"Intervals: {len(marked)}  |  Distance: {format_lap_distance(self.activity.sport, total_distance)}  |  "
+            f"Intervals: {len(marked)}  |  Distance: {format_lap_distance(sport, total_distance)}  |  "
             f"Duration: {format_duration(total_duration)}  |  "
-            f"Avg: {format_speed_or_pace(self.activity.sport, avg_speed)}  |  "
+            f"Avg: {format_speed_or_pace(sport, avg_speed)}  |  "
             f"Avg HR: {format_hr(avg_hr)}  |  Avg Power: {format_power(avg_power)}"
         )
 
@@ -712,16 +858,13 @@ class LapsScreen(Screen):
         # radius — the auto-detect can miss real loops under tree cover/GPS drift (a
         # park loop never quite closing to within the default radius), so widening it
         # by hand is the escape hatch rather than a code change.
-        raw_value = self.query_one("#split_value_input", Input).value.strip()
-        close_radius_m = fit_parser.DEFAULT_CLOSE_RADIUS_M
-        if raw_value:
-            try:
-                close_radius_m = float(raw_value)
-                if close_radius_m <= 0:
-                    raise ValueError
-            except ValueError:
-                self.notify("Enter a positive number of meters for the loop radius", severity="warning")
-                return
+        parsed = self._read_split_value(default=("distance", fit_parser.DEFAULT_CLOSE_RADIUS_M))
+        if parsed is None:
+            return
+        mode, close_radius_m = parsed
+        if mode != "distance":
+            self.notify("Loop radius must be a distance in metres, e.g. 100", severity="warning")
+            return
 
         self.notify("Detecting course loops...")
         self._detect_physical_laps(close_radius_m)
@@ -750,17 +893,9 @@ class LapsScreen(Screen):
             self.notify("Mark at least one interval (m) before splitting it into phases", severity="warning")
             return
 
-        raw_value = self.query_one("#split_value_input", Input).value.strip()
-        if raw_value:
-            try:
-                meters = float(raw_value)
-                if meters <= 0:
-                    raise ValueError
-            except ValueError:
-                self.notify("Enter a positive number for the split size", severity="warning")
-                return
-        else:
-            meters = self.DEFAULT_INTERVAL_SPLIT_M
+        parsed = self._read_split_value(default=("distance", self.DEFAULT_INTERVAL_SPLIT_M))
+        if parsed is None:
+            return
 
         if not self._ensure_records_loaded():
             return
@@ -772,11 +907,12 @@ class LapsScreen(Screen):
         for lap in marked:
             lap_records = fit_parser.lap_record_slice(self._records, lap, self._offset)
             if lap_records:
-                self.interval_splits[lap.lap_index] = fit_parser.split_by_distance(
-                    lap_records, meters, self._offset
-                )
+                phases = self._split(lap_records, *parsed)
+                for phase in phases:
+                    phase.sport = lap.sport
+                self.interval_splits[lap.lap_index] = phases
         self._rebuild_table()
-        self.notify(f"Split {len(self.interval_splits)} interval(s) into {meters:.0f}m phases")
+        self.notify(f"Split {len(self.interval_splits)} interval(s) into {format_split_value(*parsed)} phases")
 
     def action_toggle_interval_filter(self) -> None:
         self.show_intervals_only = not self.show_intervals_only
@@ -798,6 +934,10 @@ class LapsScreen(Screen):
         if not self._ensure_records_loaded():
             return
         self.app.push_screen(CompareScreen(self.activity, marked, self._records, self._offset))
+
+    def action_copy(self) -> None:
+        table = self.query_one(DataTable)
+        _copy_to_clipboard(self, _table_as_tsv(table), f"{table.row_count} laps")
 
     def action_phase_metrics(self) -> None:
         # Interval phase-splits (finer-grained) take priority when present; otherwise
@@ -1028,7 +1168,10 @@ class PhaseMetricsScreen(Screen):
     my 300m reps" (a tight single peak) or "am I fading" (a spread with a slow tail) better
     than a table of numbers or a per-split bar chart, where every split gets its own bar."""
 
-    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("y", "copy", "Copy data"),
+    ]
 
     MAX_BINS = 12
     TIME_BIN_S = 1.0
@@ -1040,6 +1183,8 @@ class PhaseMetricsScreen(Screen):
         super().__init__()
         self.activity = activity
         self.phases = phases
+        # chart title -> [(bin label, count)], as last drawn — for copying to the clipboard
+        self.histogram_data: dict[str, list[tuple[str, int]]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1056,7 +1201,8 @@ class PhaseMetricsScreen(Screen):
 
     def _redraw(self) -> None:
         phases = self.phases
-        pace_sport = self.activity.sport in PACE_SPORTS
+        sport = _common_sport(phases, self.activity.sport)
+        pace_sport = sport in PACE_SPORTS
 
         self._draw_histogram(
             "phase_time_plot",
@@ -1067,7 +1213,16 @@ class PhaseMetricsScreen(Screen):
             title="Duration histogram",
         )
 
-        if pace_sport:
+        if sport in SWIM_SPORTS:
+            self._draw_histogram(
+                "phase_pace_plot",
+                [100 / p.avg_speed_mps for p in phases if p.avg_speed_mps],
+                self.PACE_BIN_S_PER_KM,
+                edge_fmt=format_duration,
+                unit_suffix="s/100m",
+                title="Pace histogram",
+            )
+        elif pace_sport:
             self._draw_histogram(
                 "phase_pace_plot",
                 [1000 / p.avg_speed_mps for p in phases if p.avg_speed_mps],
@@ -1103,18 +1258,25 @@ class PhaseMetricsScreen(Screen):
         plt.clear_data()
         bin_width = _adaptive_bin_width(values, base_bin_width, self.MAX_BINS)
         bins = _histogram_bins(values, bin_width)
+        bins_desc = f"{int(bin_width)}{unit_suffix} bins"
         if bins:
             labels = [_bin_label(start, bin_width, base_bin_width, edge_fmt) for start, _ in bins]
             counts = [count for _, count in bins]
+            self.histogram_data[f"{title} ({bins_desc})"] = list(zip(labels, counts))
             plt.bar(labels, counts)
             # A phase count is always a whole number — without this plotext picks fractional
             # y-axis ticks (e.g. 0.00, 0.67, 1.33) to fill the plot height, which misreads as
             # if fractional phase counts were possible.
             plt.yticks(range(0, max(counts) + 1))
-        bins_desc = f"{int(bin_width)}{unit_suffix} bins"
         plt.title(f"{title} ({bins_desc})" if bins else f"{title} — no data")
         plt.ylabel("Phases")
         plot.refresh()
+
+    def action_copy(self) -> None:
+        lines = ["Chart\tBin\tPhases"]
+        for chart, rows in self.histogram_data.items():
+            lines.extend(f"{chart}\t{label}\t{count}" for label, count in rows)
+        _copy_to_clipboard(self, "\n".join(lines), f"{len(self.histogram_data)} histograms")
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -1249,6 +1411,121 @@ class RouteActivitiesScreen(Screen):
         activity = self.activities_by_id.get(event.row_key.value)
         if activity is not None:
             self.app.push_screen(LapsScreen(activity, self.client))
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class WorkoutsScreen(Screen):
+    """Workout JSON files in storage.WORKOUTS_DIR (written by hand or by another agent against
+    workout_schema.json): validate, preview, and upload them to Garmin Connect."""
+
+    CSS = """
+    #workouts_table {
+        height: 1fr;
+    }
+
+    #workout_preview {
+        height: 1fr;
+        border: round $primary;
+        padding: 0 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("u", "upload", "Upload to Garmin"),
+        Binding("r", "refresh", "Refresh"),
+    ]
+
+    COLUMNS = ("File", "Name", "Sport", "Status", "Uploaded")
+
+    def __init__(self, client) -> None:
+        super().__init__()
+        self.client = client
+        # file name -> validated workout dict, or the validation error text
+        self.entries: dict[str, dict | str] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"Workouts in {storage.WORKOUTS_DIR}", id="workouts_status")
+        yield DataTable(id="workouts_table")
+        yield Static("", id="workout_preview")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns(*self.COLUMNS)
+        self.action_refresh()
+        table.focus()
+
+    def action_refresh(self) -> None:
+        storage.WORKOUTS_DIR.mkdir(parents=True, exist_ok=True)
+        uploaded = storage.load_uploaded_workouts()
+        self.entries = {}
+        table = self.query_one(DataTable)
+        table.clear()
+        for path in sorted(storage.WORKOUTS_DIR.glob("*.json")):
+            try:
+                entry = workouts.load(path)
+                name, sport, status = entry["name"], entry["sport"], "OK"
+            except workouts.WorkoutError as e:
+                entry = str(e)
+                name, sport, status = "–", "–", Text("invalid", style="red")
+            self.entries[path.name] = entry
+            uploaded_id = uploaded.get(path.name)
+            table.add_row(path.name, name, sport, status, str(uploaded_id) if uploaded_id else "", key=path.name)
+        self.query_one("#workouts_status", Static).update(
+            f"{len(self.entries)} workout file(s) in {storage.WORKOUTS_DIR}"
+        )
+        self._show_preview(self._selected_file())
+
+    def _selected_file(self) -> str | None:
+        table = self.query_one(DataTable)
+        if not table.row_count or table.cursor_row is None:
+            return None
+        return table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._show_preview(event.row_key.value if event.row_key else None)
+
+    def _show_preview(self, file_name: str | None) -> None:
+        preview = self.query_one("#workout_preview", Static)
+        entry = self.entries.get(file_name) if file_name else None
+        if entry is None:
+            preview.update("Put workout .json files in the folder above (see workout_schema.json), then press r.")
+        elif isinstance(entry, str):
+            preview.update(Text(f"Validation errors:\n{entry}", style="red"))
+        else:
+            preview.update("\n".join(workouts.describe(entry)))
+
+    def action_upload(self) -> None:
+        file_name = self._selected_file()
+        entry = self.entries.get(file_name) if file_name else None
+        if not isinstance(entry, dict):
+            self.notify("Select a valid workout to upload", severity="warning")
+            return
+        if file_name in storage.load_uploaded_workouts():
+            self.notify("Already uploaded — uploading again creates a second copy in Garmin", severity="warning")
+        self.notify(f"Uploading {entry['name']}...")
+        self._upload_workout(file_name, entry)
+
+    @work(thread=True)
+    def _upload_workout(self, file_name: str, entry: dict) -> None:
+        try:
+            workout_id = garmin_client.upload_workout(self.client, workouts.to_garmin(entry))
+            if entry.get("schedule_date"):
+                garmin_client.schedule_workout(self.client, workout_id, entry["schedule_date"])
+        except Exception as e:  # surface any API rejection (e.g. a malformed DTO) to the user
+            self.app.call_from_thread(self.notify, f"Upload failed: {e}", severity="error")
+            return
+        uploaded = storage.load_uploaded_workouts()
+        uploaded[file_name] = workout_id
+        storage.save_uploaded_workouts(uploaded)
+        scheduled = f", scheduled {entry['schedule_date']}" if entry.get("schedule_date") else ""
+        self.app.call_from_thread(self.notify, f"Uploaded {entry['name']} (id {workout_id}){scheduled}")
+        self.app.call_from_thread(self.action_refresh)
 
     def action_back(self) -> None:
         self.app.pop_screen()

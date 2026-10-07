@@ -1,0 +1,16 @@
+{
+  "name": "Swim 10x100 free",
+  "sport": "swimming",
+  "pool_length_m": 25,
+  "steps": [
+    { "type": "warmup", "duration": { "distance_m": 200 }, "stroke": "free" },
+    {
+      "repeat": 10,
+      "steps": [
+        { "type": "interval", "duration": { "distance_m": 100 }, "stroke": "free", "target": { "type": "pace", "from": "1:50", "to": "1:45" } },
+        { "type": "rest", "duration": { "time_s": 20 } }
+      ]
+    },
+    { "type": "cooldown", "duration": { "distance_m": 100 }, "stroke": "any_stroke", "description": "Easy" }
+  ]
+}

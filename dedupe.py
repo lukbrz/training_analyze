@@ -103,6 +103,7 @@ def merge_records(streams: list[list[RecordPoint]]) -> list[RecordPoint]:
                 speed_mps=_first_non_null(candidates, "speed_mps"),
                 lat=_first_non_null(candidates, "lat"),
                 lon=_first_non_null(candidates, "lon"),
+                altitude_m=_first_non_null(candidates, "altitude_m"),
             )
         )
     return merged

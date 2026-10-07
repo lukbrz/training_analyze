@@ -15,6 +15,8 @@ ROUTES_PATH = DATA_DIR / "routes.json"
 MERGED_RECORDS_DIR = DATA_DIR / "merged_records"
 MERGED_LEDGER_PATH = DATA_DIR / "merged_activities.json"
 SESSION_DIR = BASE_DIR / ".garmin_session"
+WORKOUTS_DIR = BASE_DIR / "workouts"
+UPLOADED_WORKOUTS_PATH = DATA_DIR / "uploaded_workouts.json"
 
 
 def _filtered(cls, raw: dict) -> dict:
@@ -105,6 +107,10 @@ def save_merged_records(
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
+def has_merged_records(activity_id: str, records_dir: Path = MERGED_RECORDS_DIR) -> bool:
+    return (records_dir / f"{activity_id}.json").exists()
+
+
 def load_merged_records(
     activity_id: str, records_dir: Path = MERGED_RECORDS_DIR
 ) -> list[RecordPoint] | None:
@@ -134,6 +140,18 @@ def load_merge_ledger(path: Path = MERGED_LEDGER_PATH) -> dict[str, str]:
 def save_merge_ledger(ledger: dict[str, str], path: Path = MERGED_LEDGER_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_uploaded_workouts(path: Path = UPLOADED_WORKOUTS_PATH) -> dict[str, int]:
+    """Maps a workout file name (in WORKOUTS_DIR) to the Garmin workout id it was uploaded as."""
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_uploaded_workouts(uploaded: dict[str, int], path: Path = UPLOADED_WORKOUTS_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(uploaded, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def load_zones(

@@ -1,0 +1,196 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "training_analyze/workout_schema.json",
+  "title": "Structured workout for upload to Garmin Connect",
+  "description": "One structured workout (running, cycling or pool swimming) that training_analyze converts to Garmin Connect's workout format and uploads (optionally scheduling it on a calendar date). Write exactly one workout object per JSON file and save it in the app's workouts/ folder. Steps run in order; nest a repeat block to repeat a group of steps. Every step needs a duration (time, distance, or until the lap button is pressed) and may have one target (pace, heart rate, power or cadence). Paces are 'm:ss' strings: per kilometre for running, per 100 m for swimming. Do not include any keys that are not defined here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "sport", "steps"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80,
+      "description": "Workout name as shown in Garmin Connect and on the watch, e.g. '6x600m @ 3:55'."
+    },
+    "sport": {
+      "enum": ["running", "cycling", "swimming"],
+      "description": "Sport of the workout. 'swimming' means pool swimming and requires pool_length_m."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000,
+      "description": "Optional free-text notes about the workout's purpose."
+    },
+    "pool_length_m": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 100,
+      "description": "Pool length in metres (usually 25 or 50). Required for swimming, not allowed otherwise."
+    },
+    "schedule_date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "Optional calendar date (YYYY-MM-DD) to schedule the workout on in Garmin Connect after upload."
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/stepOrRepeat" },
+      "description": "The workout's steps in order."
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "sport": { "const": "swimming" } } },
+      "then": { "required": ["pool_length_m"] },
+      "else": { "not": { "required": ["pool_length_m"] } }
+    }
+  ],
+  "$defs": {
+    "stepOrRepeat": {
+      "oneOf": [
+        { "$ref": "#/$defs/step" },
+        { "$ref": "#/$defs/repeat" }
+      ]
+    },
+    "repeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repeat", "steps"],
+      "description": "Repeat the contained steps a number of times, e.g. 6 x (600 m hard + 90 s jog).",
+      "properties": {
+        "repeat": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 99,
+          "description": "Number of iterations."
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/stepOrRepeat" },
+          "description": "Steps performed in each iteration. Repeats may be nested."
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "duration"],
+      "properties": {
+        "type": {
+          "enum": ["warmup", "interval", "recovery", "rest", "cooldown", "other"],
+          "description": "Step kind: 'interval' for work efforts, 'recovery' for active recovery (jog/easy spin), 'rest' for standing/wall rest."
+        },
+        "duration": { "$ref": "#/$defs/duration" },
+        "target": { "$ref": "#/$defs/target" },
+        "description": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Optional short note shown on the watch for this step, e.g. 'Hard', 'Easy jog'."
+        },
+        "stroke": {
+          "enum": ["any_stroke", "free", "backstroke", "breaststroke", "fly", "individual_medley", "mixed", "drill"],
+          "description": "Swimming only: stroke for this step. Defaults to 'free' for swimming."
+        },
+        "equipment": {
+          "enum": ["fins", "kickboard", "paddles", "pull_buoy", "snorkel"],
+          "description": "Swimming only: equipment used in this step."
+        }
+      }
+    },
+    "duration": {
+      "description": "How the step ends. Exactly one of time_s, distance_m or lap_button.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["time_s"],
+          "properties": { "time_s": { "type": "number", "exclusiveMinimum": 0, "description": "Duration in seconds." } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["distance_m"],
+          "properties": { "distance_m": { "type": "number", "exclusiveMinimum": 0, "description": "Distance in metres." } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["lap_button"],
+          "properties": { "lap_button": { "const": true, "description": "Step lasts until the lap button is pressed." } }
+        }
+      ]
+    },
+    "pace": {
+      "type": "string",
+      "pattern": "^\\d{1,2}:[0-5]\\d$",
+      "description": "Pace as 'm:ss' — per km for running, per 100 m for swimming."
+    },
+    "target": {
+      "description": "Optional intensity target for the step. 'from' is the easier end of the range and 'to' the harder end (for pace: from = slower, to = faster).",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from", "to"],
+          "properties": {
+            "type": { "const": "pace" },
+            "from": { "$ref": "#/$defs/pace" },
+            "to": { "$ref": "#/$defs/pace" }
+          },
+          "description": "Pace range, running or swimming only, e.g. {\"type\":\"pace\",\"from\":\"4:05\",\"to\":\"3:55\"}."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from", "to"],
+          "properties": {
+            "type": { "const": "heart_rate" },
+            "from": { "type": "integer", "minimum": 40, "maximum": 230, "description": "Lower bound, bpm." },
+            "to": { "type": "integer", "minimum": 40, "maximum": 230, "description": "Upper bound, bpm." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "zone"],
+          "properties": {
+            "type": { "const": "heart_rate_zone" },
+            "zone": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Heart rate zone from the athlete's Garmin settings." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from", "to"],
+          "properties": {
+            "type": { "const": "power" },
+            "from": { "type": "integer", "minimum": 0, "maximum": 2500, "description": "Lower bound, watts." },
+            "to": { "type": "integer", "minimum": 0, "maximum": 2500, "description": "Upper bound, watts." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "zone"],
+          "properties": {
+            "type": { "const": "power_zone" },
+            "zone": { "type": "integer", "minimum": 1, "maximum": 7, "description": "Power zone from the athlete's Garmin settings." }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "from", "to"],
+          "properties": {
+            "type": { "const": "cadence" },
+            "from": { "type": "integer", "minimum": 0, "maximum": 250, "description": "Lower bound, rpm (cycling) or steps/min (running)." },
+            "to": { "type": "integer", "minimum": 0, "maximum": 250, "description": "Upper bound." }
+          }
+        }
+      ]
+    }
+  }
+}

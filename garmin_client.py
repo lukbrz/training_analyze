@@ -133,6 +133,15 @@ def get_power_zones(garmin: Garmin, activity_id: str) -> list[ZoneTime]:
     return _parse_zone_response(garmin.get_activity_power_in_timezones(activity_id))
 
 
+def upload_workout(garmin: Garmin, workout_dto: dict) -> int:
+    """Create a workout in Garmin Connect from a DTO (see workouts.to_garmin); returns its id."""
+    return int(garmin.upload_workout(workout_dto)["workoutId"])
+
+
+def schedule_workout(garmin: Garmin, workout_id: int, date_str: str) -> None:
+    garmin.schedule_workout(workout_id, date_str)
+
+
 __all__ = [
     "MfaRequired",
     "try_cached_login",
@@ -142,6 +151,8 @@ __all__ = [
     "download_fit",
     "get_hr_zones",
     "get_power_zones",
+    "upload_workout",
+    "schedule_workout",
     "GarminConnectAuthenticationError",
     "GarminConnectConnectionError",
     "GarminConnectInvalidFileFormatError",

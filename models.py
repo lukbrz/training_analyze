@@ -1,7 +1,9 @@
+import re
 from dataclasses import dataclass
 from datetime import datetime
 
 PACE_SPORTS = {"running", "walking", "hiking"}
+SWIM_SPORTS = {"swimming"}
 
 
 @dataclass
@@ -29,6 +31,11 @@ class Lap:
     avg_hr: int | None = None
     avg_power: float | None = None
     is_interval: bool = False
+    total_ascent_m: float | None = None
+    total_descent_m: float | None = None
+    # The lap's own sport, for multisport activities where it differs per leg; None on laps
+    # saved before this existed and on custom splits, which fall back to the activity's sport.
+    sport: str | None = None
 
 
 @dataclass
@@ -40,6 +47,7 @@ class RecordPoint:
     speed_mps: float | None = None
     lat: float | None = None
     lon: float | None = None
+    altitude_m: float | None = None
 
 
 @dataclass
@@ -63,6 +71,45 @@ class Route:
     sport: str
     signature: RouteSignature
     place: str | None = None
+
+
+_NUMBER = r"\d+(?:\.\d+)?"
+_TIME_UNIT_SECONDS = {"h": 3600, "min": 60, "m": 60, "sec": 1, "s": 1}
+
+
+def parse_split_value(text: str) -> tuple[str, float]:
+    """Parse a split-size input into ("distance", metres) or ("time", seconds).
+
+    A bare number is metres ("300"); "km" is also distance ("1.5km"). Anything with a time
+    unit or a colon is time: "60s", "90sec", "1m"/"1min" (m means minutes here, not metres),
+    "1m30s", "1h", "1:30", "1:02:00". Raises ValueError for anything else or a non-positive
+    size.
+    """
+    t = text.strip().lower().replace(" ", "")
+    if re.fullmatch(_NUMBER, t):
+        mode, value = "distance", float(t)
+    elif re.fullmatch(rf"{_NUMBER}km", t):
+        mode, value = "distance", float(t[:-2]) * 1000
+    elif re.fullmatch(rf"{_NUMBER}(:{_NUMBER}){{1,2}}", t):
+        value = 0.0
+        for part in t.split(":"):
+            value = value * 60 + float(part)
+        mode = "time"
+    elif re.fullmatch(rf"({_NUMBER}(h|min|m|sec|s))+", t):
+        mode = "time"
+        value = sum(
+            float(amount) * _TIME_UNIT_SECONDS[unit]
+            for amount, unit in re.findall(rf"({_NUMBER})(h|min|m|sec|s)", t)
+        )
+    else:
+        raise ValueError(f"can't parse split size {text!r}")
+    if value <= 0:
+        raise ValueError("split size must be positive")
+    return mode, value
+
+
+def format_split_value(mode: str, value: float) -> str:
+    return f"{value:g}m" if mode == "distance" else format_duration(value)
 
 
 def format_duration(seconds: float) -> str:
@@ -98,12 +145,15 @@ def format_distance_m(meters: float) -> str:
 
 
 def format_lap_distance(sport: str, meters: float) -> str:
-    return format_distance_m(meters) if sport in PACE_SPORTS else format_distance(meters)
+    return format_distance_m(meters) if sport in PACE_SPORTS | SWIM_SPORTS else format_distance(meters)
 
 
 def format_speed_or_pace(sport: str, avg_speed_mps: float | None) -> str:
     if not avg_speed_mps:
         return "–"
+    if sport in SWIM_SPORTS:
+        minutes, secs = divmod(int(round(100 / avg_speed_mps)), 60)
+        return f"{minutes}:{secs:02d} /100m"
     if sport in PACE_SPORTS:
         pace_s_per_km = 1000 / avg_speed_mps
         minutes, secs = divmod(int(round(pace_s_per_km)), 60)
@@ -113,6 +163,10 @@ def format_speed_or_pace(sport: str, avg_speed_mps: float | None) -> str:
 
 def format_hr(hr: int | None) -> str:
     return str(hr) if hr else "–"
+
+
+def format_elevation(meters: float | None) -> str:
+    return "–" if meters is None else f"{meters:.0f} m"
 
 
 def format_power(watts: float | None) -> str:

@@ -1,0 +1,16 @@
+{
+  "name": "6x600m @ 3:55",
+  "sport": "running",
+  "description": "VO2max session: 6 x 600 m with 90 s jog recoveries.",
+  "steps": [
+    { "type": "warmup", "duration": { "distance_m": 1500 }, "target": { "type": "pace", "from": "6:00", "to": "5:20" }, "description": "Easy" },
+    {
+      "repeat": 6,
+      "steps": [
+        { "type": "interval", "duration": { "distance_m": 600 }, "target": { "type": "pace", "from": "4:00", "to": "3:50" }, "description": "Hard" },
+        { "type": "recovery", "duration": { "time_s": 90 }, "target": { "type": "heart_rate_zone", "zone": 1 }, "description": "Jog" }
+      ]
+    },
+    { "type": "cooldown", "duration": { "lap_button": true }, "description": "Easy until lap" }
+  ]
+}
