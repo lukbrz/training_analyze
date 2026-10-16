@@ -95,9 +95,8 @@ class LapsSession:
             path = storage.fit_path(self.activity.activity_id)
             if not path.exists():
                 raise LapsError("FIT file not found for this activity")
-            fit_bytes = path.read_bytes()
-            self.records = fit_parser.load_records(self.activity.activity_id, fit_bytes)
-            self.utc_offset = fit_parser.session_utc_offset(fit_bytes, self.activity.start_time_local)
+            self.records = fit_parser.load_records(self.activity.activity_id)
+            self.utc_offset = fit_parser.load_utc_offset(self.activity.activity_id, self.activity.start_time_local)
         if not self.records:
             raise LapsError("No record data in this FIT file")
         return self.records

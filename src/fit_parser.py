@@ -1,3 +1,5 @@
+import math
+from array import array
 from datetime import datetime, timedelta
 
 import fitparse
@@ -301,14 +303,86 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
     return records
 
 
-def load_records(activity_id: str, fit_bytes: bytes) -> list[RecordPoint]:
-    """The best available record stream for an activity: a persisted merged stream (see
-    dedupe.py — combining a duplicate-device recording of the same session) if one
-    exists, else freshly parsed from its own raw FIT bytes."""
+# Bump whenever parse_records() output changes, so stale caches are rebuilt rather than reused.
+RECORDS_CACHE_VERSION = 1
+_CACHED_FIELDS = ("distance_m", "heart_rate", "power", "speed_mps", "lat", "lon", "altitude_m")
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _records_cache_key(activity_id: str) -> str:
+    """Identifies the exact inputs a cached stream was built from: the FIT file (size and
+    modification time), the merged-duplicates stream if there is one, and the cache format."""
+    fit = storage.fit_path(activity_id)
+    merged = storage.MERGED_RECORDS_DIR / f"{activity_id}.json"
+    parts = [str(RECORDS_CACHE_VERSION)]
+    for path in (fit, merged):
+        stat = path.stat() if path.exists() else None
+        parts.append(f"{stat.st_size}:{stat.st_mtime_ns}" if stat else "-")
+    return "|".join(parts)
+
+
+def _encode_stream(records: list[RecordPoint], session_start_utc: datetime | None) -> dict:
+    """Column-wise arrays of doubles (NaN = no value): ~10x smaller and far faster to load
+    than per-record objects."""
+    nan = float("nan")
+    columns = {"timestamp": array("d", ((r.timestamp_utc - _EPOCH).total_seconds() for r in records)).tobytes()}
+    for name in _CACHED_FIELDS:
+        columns[name] = array("d", (nan if (v := getattr(r, name)) is None else float(v) for r in records)).tobytes()
+    return {"session_start_utc": session_start_utc, "columns": columns}
+
+
+def _decode_stream(payload: dict) -> list[RecordPoint]:
+    columns = {}
+    for name, raw in payload["columns"].items():
+        values = array("d")
+        values.frombytes(raw)
+        columns[name] = values
+    heart_rates = [None if math.isnan(v) else int(v) for v in columns["heart_rate"]]
+    other = {name: [None if math.isnan(v) else v for v in columns[name]] for name in _CACHED_FIELDS if name != "heart_rate"}
+    return [
+        RecordPoint(
+            timestamp_utc=_EPOCH + timedelta(seconds=ts),
+            heart_rate=heart_rates[i],
+            **{name: other[name][i] for name in other},
+        )
+        for i, ts in enumerate(columns["timestamp"])
+    ]
+
+
+def _session_start(fit_bytes: bytes) -> datetime | None:
+    session = next(fitparse.FitFile(fit_bytes).get_messages("session"), None)
+    start = session.get_value("start_time") if session is not None else None
+    return start.replace(tzinfo=None) if start else None
+
+
+def _load_stream(activity_id: str, fit_bytes: bytes | None = None) -> tuple[list[RecordPoint], datetime | None]:
+    key = _records_cache_key(activity_id)
+    cached = storage.load_records_cache(activity_id)
+    if cached is not None and cached.get("key") == key:
+        return _decode_stream(cached["stream"]), cached["stream"]["session_start_utc"]
+    if fit_bytes is None:
+        fit_bytes = storage.fit_path(activity_id).read_bytes()
     merged = storage.load_merged_records(activity_id)
-    if merged is not None:
-        return merged
-    return parse_records(fit_bytes)
+    records = merged if merged is not None else parse_records(fit_bytes)
+    session_start = _session_start(fit_bytes)
+    storage.save_records_cache(activity_id, {"key": key, "stream": _encode_stream(records, session_start)})
+    return records, session_start
+
+
+def load_records(activity_id: str, fit_bytes: bytes | None = None) -> list[RecordPoint]:
+    """The best available record stream for an activity: a persisted merged stream (see
+    dedupe.py — combining a duplicate-device recording of the same session) if one exists,
+    else parsed from its own FIT file. Parsing a long activity takes seconds (fitparse is
+    pure Python), so the result is cached on disk (storage.RECORDS_CACHE_DIR) and reused until
+    the FIT file, the merged stream or the parser changes — sync and reprocess fill the cache
+    as a side effect (route matching loads every activity's records)."""
+    return _load_stream(activity_id, fit_bytes)[0]
+
+
+def load_utc_offset(activity_id: str, start_time_local: str) -> timedelta:
+    """Same as session_utc_offset(), but from the records cache instead of a full re-parse."""
+    start = _load_stream(activity_id)[1]
+    return _utc_offset(start, datetime.fromisoformat(start_time_local))
 
 
 def _mean(values: list[float]) -> float | None:

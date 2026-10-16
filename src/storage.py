@@ -1,5 +1,7 @@
 import dataclasses
 import json
+import pickle
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +26,7 @@ ACTIVITY_STATS_PATH = DATA_DIR / "activity_stats.json"
 CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
+RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
 
 def _filtered(cls, raw: dict) -> dict:
@@ -233,3 +236,22 @@ def load_cached_workout(workout_id: int, cache_dir: Path = WORKOUT_CACHE_DIR) ->
 
 def save_cached_workout(workout_id: int, dto: dict, cache_dir: Path = WORKOUT_CACHE_DIR) -> None:
     _write_json(cache_dir / f"{workout_id}.json", dto)
+
+
+def load_records_cache(activity_id: str, cache_dir: Path = RECORDS_CACHE_DIR) -> dict | None:
+    """A parsed record stream cached by fit_parser (written only by this app, in the local
+    data folder — pickle is fine for that). None if absent or unreadable."""
+    path = cache_dir / f"{activity_id}.bin"
+    if not path.exists():
+        return None
+    try:
+        return pickle.loads(zlib.decompress(path.read_bytes()))
+    except Exception:  # truncated/corrupt cache file: just rebuild it
+        return None
+
+
+def save_records_cache(activity_id: str, payload: dict, cache_dir: Path = RECORDS_CACHE_DIR) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cache_dir / f"{activity_id}.bin.tmp"
+    tmp.write_bytes(zlib.compress(pickle.dumps(payload, protocol=5), 1))
+    tmp.replace(cache_dir / f"{activity_id}.bin")

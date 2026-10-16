@@ -10,6 +10,7 @@ OpenStreetMap (with the attribution Leaflet shows).
 
 import argparse
 import inspect
+import json
 from collections.abc import Callable
 from datetime import date, timedelta
 
@@ -362,7 +363,7 @@ LAP_ROW_STYLE = (
 )
 MAP_MODES = (("1", "Speed / pace", "speed_mps"), ("2", "Heart rate", "heart_rate"), ("3", "Power", "power"), ("4", "Elevation", "altitude_m"))
 RAMP = ["#7aa2f7", "#7dcfff", "#9ece6a", "#e0af68", "#f7768e"]
-COLOR_BUCKETS = 12
+COLOR_BUCKETS = 16
 
 
 def _ramp(t: float) -> str:
@@ -374,46 +375,87 @@ def _ramp(t: float) -> str:
     return "#" + "".join(f"{c:02x}" for c in channels)
 
 
-def draw_track(leaflet, points, values, highlights=(), selected=(), markers=()) -> tuple[float, float] | None:
-    """Draw a track on a Leaflet map, coloured by `values` (bucketed into a few polylines so
-    the browser isn't handed thousands of layers). Returns the value range used, if any."""
-    leaflet.clear_layers()
-    leaflet.tile_layer(
-        url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        options={"maxZoom": 19, "attribution": "© OpenStreetMap contributors"},
-    )
-    step = max(1, len(points) // 3000)
-    points, values = points[::step], values[::step]
-    for path, color, weight in ((selected, COLORS["cyan"], 13), *((h, "#ffffff", 10) for h in highlights)):
-        if len(path) > 1:
-            leaflet.generic_layer(name="polyline", args=[path[::max(1, len(path) // 800)], {"color": color, "weight": weight, "opacity": 0.6}])
-    leaflet.generic_layer(name="polyline", args=[points, {"color": COLORS["bg_dark"], "weight": 7, "opacity": 0.9}])
+MAX_TRACK_POINTS = 8000  # Leaflet simplifies per zoom itself; this just bounds the payload
+
+
+def track_payload(points, values, highlights=(), selected=(), markers=()) -> dict:
+    """Everything needed to draw a track, as plain data: the casing line, one multi-polyline
+    per colour bucket, outlines, lap markers and the colour range. Pure Python — run it off
+    the event loop for long activities."""
+    step = max(1, len(points) // MAX_TRACK_POINTS)
+    points, values = points[::step], list(values)[::step]
     present = sorted(v for v in values if v is not None)
     value_range = None
+    buckets: dict[int, list] = {}
     if present:
         low, high = present[len(present) // 20], present[-1 - len(present) // 20]
         high = high if high > low else low + 1
         value_range = (low, high)
-        segment, bucket = [points[0]], None
+        run, run_bucket = [points[0]], None
         for point, value in zip(points[1:], values[1:]):
-            b = None if value is None else min(COLOR_BUCKETS - 1, max(0, int((value - low) / (high - low) * COLOR_BUCKETS)))
-            if bucket is not None and b != bucket:
-                leaflet.generic_layer(name="polyline", args=[segment, {"color": _ramp((bucket + 0.5) / COLOR_BUCKETS), "weight": 4}])
-                segment = [segment[-1]]
-            segment.append(point)
-            bucket = b if b is not None else bucket
-        if len(segment) > 1:
-            leaflet.generic_layer(name="polyline", args=[segment, {"color": _ramp(((bucket or 0) + 0.5) / COLOR_BUCKETS), "weight": 4}])
-    else:
-        leaflet.generic_layer(name="polyline", args=[points, {"color": COLORS["accent"], "weight": 4}])
-    for lat, lon, text in markers[:60]:
-        layer = leaflet.generic_layer(name="circleMarker", args=[[lat, lon], {"radius": 8, "color": COLORS["bg_dark"], "fillColor": COLORS["fg"], "fillOpacity": 1, "weight": 1}])
-        layer.run_method("bindTooltip", text, {"permanent": True, "direction": "center", "className": "lap-label"})
-    for point, color in ((points[0], COLORS["green"]), (points[-1], COLORS["red"])):
-        leaflet.generic_layer(name="circleMarker", args=[point, {"radius": 7, "color": "#ffffff", "fillColor": color, "fillOpacity": 1, "weight": 2.5}])
-    lats, lons = [p[0] for p in points], [p[1] for p in points]
-    leaflet.run_map_method("fitBounds", [[min(lats), min(lons)], [max(lats), max(lons)]], {"padding": [30, 30]})
-    return value_range
+            bucket = run_bucket if value is None else min(COLOR_BUCKETS - 1, max(0, int((value - low) / (high - low) * COLOR_BUCKETS)))
+            if run_bucket is not None and bucket != run_bucket:
+                buckets.setdefault(run_bucket, []).append(run)
+                run = [run[-1]]
+            run.append(point)
+            run_bucket = bucket
+        if run_bucket is not None and len(run) > 1:
+            buckets.setdefault(run_bucket, []).append(run)
+
+    def thin(path):
+        return path[::max(1, len(path) // 1500)]
+
+    return {
+        "casing": points,
+        "colored": [{"color": _ramp((b + 0.5) / COLOR_BUCKETS), "lines": lines} for b, lines in buckets.items()],
+        "plain_color": COLORS["accent"],
+        "highlights": [thin(h) for h in highlights if len(h) > 1],
+        "selected": thin(selected) if len(selected) > 1 else [],
+        "markers": [[lat, lon, text] for lat, lon, text in markers],
+        "range": value_range,
+        "colors": {"casing": COLORS["bg_dark"], "highlight": "#ffffff", "selected": COLORS["cyan"],
+                   "marker": COLORS["fg"], "start": COLORS["green"], "end": COLORS["red"]},
+    }
+
+
+DRAW_TRACK_JS = """
+(() => {
+  const el = getElement(%(id)s); const map = el.map; const d = %(data)s;
+  if (el._track) { el._track.remove(); map.off('zoomend', el._relayout); }
+  const group = L.layerGroup().addTo(map); el._track = group;
+  const line = (latlngs, color, weight, opacity) => L.polyline(latlngs, {color, weight, opacity, interactive: false}).addTo(group);
+  if (d.selected.length) line(d.selected, d.colors.selected, 13, 0.6);
+  for (const h of d.highlights) line(h, d.colors.highlight, 10, 0.6);
+  line(d.casing, d.colors.casing, 7, 0.9);
+  if (d.colored.length) { for (const c of d.colored) line(c.lines, c.color, 4, 1); }
+  else line(d.casing, d.plain_color, 4, 1);
+  const marks = L.layerGroup().addTo(group);
+  // Lap markers that would overlap at the current zoom are skipped; zooming in reveals them.
+  el._relayout = () => {
+    marks.clearLayers(); let last = null;
+    for (const [lat, lon, text] of d.markers) {
+      const p = map.latLngToLayerPoint([lat, lon]);
+      if (last && p.distanceTo(last) < 24) continue;
+      last = p;
+      L.circleMarker([lat, lon], {radius: 8, color: d.colors.casing, fillColor: d.colors.marker, fillOpacity: 1, weight: 1})
+        .bindTooltip(text, {permanent: true, direction: 'center', className: 'lap-label'}).addTo(marks);
+    }
+  };
+  map.on('zoomend', el._relayout);
+  const first = d.casing[0], end = d.casing[d.casing.length - 1];
+  for (const [p, color] of [[first, d.colors.start], [end, d.colors.end]])
+    L.circleMarker(p, {radius: 7, color: '#ffffff', fillColor: color, fillOpacity: 1, weight: 2.5}).addTo(group);
+  map.fitBounds(L.polyline(d.casing).getBounds(), {padding: [30, 30]});
+  el._relayout();
+})()
+"""
+
+
+async def draw_track(leaflet, payload: dict) -> None:
+    """Draw a track payload (see track_payload) on a ui.leaflet in a single round trip —
+    one message, instead of one per polyline/marker/tooltip."""
+    await leaflet.initialized()
+    ui.run_javascript(DRAW_TRACK_JS % {"id": leaflet.id, "data": json.dumps(payload)})
 
 
 @ui.page("/activity/{activity_id}")
@@ -526,29 +568,40 @@ def laps_page(activity_id: str) -> None:
         state["map_mode"] = attr or state["map_mode"]
         for a, b in map_buttons.items():
             b.props(remove="outline") if a == state["map_mode"] else b.props("outline")
-        try:
+        row = await selected_row(table)
+        selected_lap = session.row_lap(row) if row is not None else None
+        mode = state["map_mode"]
+        if session.records is None:
+            map_legend.set_content("<span class='ta-status'>Loading track...</span>")
+
+        def build() -> dict | None:
+            # FIT load (first time only, then cached) and per-lap slicing can take seconds on
+            # a long activity — done in a worker thread so the server stays responsive.
             records = [r for r in session.ensure_records() if r.lat is not None and r.lon is not None]
+            if len(records) < 2:
+                return None
+
+            def coords(lap):
+                return [[r.lat, r.lon] for r in fit_parser.lap_record_slice(session.records, lap, session.utc_offset) if r.lat is not None]
+
+            return track_payload(
+                [[r.lat, r.lon] for r in records], [getattr(r, mode) for r in records],
+                highlights=[coords(lap) for lap in session.marked_laps()],
+                selected=coords(selected_lap) if selected_lap else [],
+                markers=[(*c[0], str(lap.lap_index)) for lap in session.current_laps if (c := coords(lap))],
+            )
+
+        try:
+            payload = await run.io_bound(build)
         except LapsError as e:
             notify(str(e), "warning")
             return
-        if len(records) < 2:
+        if payload is None:
             map_legend.set_content("<span class='ta-status'>No GPS track for this activity</span>")
             return
-        row = await selected_row(table)
-        selected_lap = session.row_lap(row) if row is not None else None
-
-        def coords(lap):
-            return [[r.lat, r.lon] for r in fit_parser.lap_record_slice(session.records, lap, session.utc_offset) if r.lat is not None]
-
-        mode = state["map_mode"]
-        values = [getattr(r, mode) for r in records]
-        await leaflet.initialized()
-        value_range = draw_track(
-            leaflet, [[r.lat, r.lon] for r in records], values,
-            highlights=[coords(lap) for lap in session.marked_laps()],
-            selected=coords(selected_lap) if selected_lap else [],
-            markers=[(*c[0], str(lap.lap_index)) for lap in session.current_laps if (c := coords(lap))],
-        )
+        await draw_track(leaflet, payload)
+        value_range = payload["range"]
+        map_legend.set_content("")
         if value_range:
             fmt = {
                 "speed_mps": lambda v: format_speed_or_pace(activity.sport, v),
@@ -686,9 +739,8 @@ def routes_page() -> None:
             f"<b>{route.name}</b> <span class='ta-status'>· {route.sport} · {route.place or 'unknown place'} · "
             f"{format_distance(route.signature.distance_m)} · {count} activities</span>"
         )
-        await leaflet.initialized()
         points = [[lat, lon] for lat, lon in route.signature.points]
-        draw_track(leaflet, points, [None] * len(points))
+        await draw_track(leaflet, track_payload(points, [None] * len(points)))
         # The stored signature is a coarse outline; swap in the latest activity's full track.
         _, activities = storage.load_index()
         latest = max((a for a in activities if a.route_id == route.route_id), key=lambda a: a.start_time_local, default=None)
@@ -697,7 +749,7 @@ def routes_page() -> None:
         records = await run.io_bound(fit_parser.load_records, latest.activity_id, storage.fit_path(latest.activity_id).read_bytes())
         track = [[r.lat, r.lon] for r in records if r.lat is not None and r.lon is not None]
         if len(track) > len(points) and await selected_row(table) == row:
-            draw_track(leaflet, track, [None] * len(track))
+            await draw_track(leaflet, await run.io_bound(track_payload, track, [None] * len(track)))
 
     async def rename() -> None:
         row = await selected_row(table)

@@ -370,12 +370,22 @@ class LapsPage(Page):
         self.window_.push(ComparePage(self.window_, self.activity, marked, records, offset))
 
     def open_map(self) -> None:
-        try:
-            page = MapPage(self.window_, self.session, self.session.row_lap(self.table.currentRow()))
-        except LapsError as e:
-            self.notify(str(e), "warning")
+        selected = self.session.row_lap(self.table.currentRow())
+
+        def show(_=None) -> None:
+            try:
+                page = MapPage(self.window_, self.session, selected)
+            except LapsError as e:
+                self.notify(str(e), "warning")
+                return
+            self.window_.push(page)
+
+        if self.session.records is not None:
+            show()
             return
-        self.window_.push(page)
+        # First open of this activity: parsing a long FIT file takes seconds — keep the UI live.
+        self.notify("Loading track...")
+        run_background(self.session.ensure_records, show, lambda e: self.notify(str(e), "warning"))
 
     def histograms(self) -> None:
         try:

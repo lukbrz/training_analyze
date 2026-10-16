@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QWidget
 
 import storage
@@ -24,7 +24,11 @@ from gui_common import COLORS, on_ui
 TILE_SIZE = 256
 TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 MIN_ZOOM, MAX_ZOOM = 3, 18
-MAX_DRAWN_POINTS = 4000
+COLOR_BUCKETS = 16
+# Points closer than this (Manhattan distance, screen pixels) to the previous kept point are
+# dropped when building a zoom level's paths.
+SIMPLIFY_PX = 1.5
+MARKER_SPACING_PX = 24
 ATTRIBUTION = "© OpenStreetMap contributors"
 # Few parallel downloads, as the OSM tile policy asks.
 _tile_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tiles")
@@ -94,6 +98,11 @@ class TrackMap(QWidget):
         self._drag_from: QPointF | None = None
         self._needs_fit = True
         self._value_range = (0.0, 1.0)
+        # Track geometry projected once, in zoom-0 world pixels; per-zoom drawable paths are
+        # built from it lazily and cached, so panning only translates and redraws them.
+        self._world: list[tuple[float, float]] = []
+        self._buckets: list[int | None] = []  # colour bucket per point (None = no value)
+        self._paths: dict[int, dict] = {}
 
     # --- data ---------------------------------------------------------------------
 
@@ -104,6 +113,13 @@ class TrackMap(QWidget):
             # 5th-95th percentile, so a GPS spike or a stop doesn't wash out the whole colour scale.
             low, high = present[len(present) // 20], present[-1 - len(present) // 20]
             self._value_range = (low, high if high > low else low + 1)
+        low, high = self._value_range
+        self._world = [world_xy(lat, lon, 0) for lat, lon in data.points]
+        self._buckets = [
+            None if v is None else min(COLOR_BUCKETS - 1, max(0, int((v - low) / (high - low) * COLOR_BUCKETS)))
+            for v in data.values
+        ] if present else [None] * len(data.points)
+        self._paths = {}
         if refit or self._needs_fit:
             self._needs_fit = True
             self.fit()
@@ -148,8 +164,6 @@ class TrackMap(QWidget):
         self._draw_tiles(painter)
         # Dim the (bright) map a little so the coloured track stands out in the dark theme.
         painter.fillRect(self.rect(), QColor(26, 27, 38, 70))
-        for path, color, width in ((self.data.selected, COLORS["cyan"], 13), *((h, "#ffffff", 10) for h in self.data.highlights)):
-            self._draw_polyline(painter, path, QColor(color), width, alpha=150)
         self._draw_track(painter)
         self._draw_markers(painter)
         self._draw_legend(painter)
@@ -168,8 +182,24 @@ class TrackMap(QWidget):
                 pixmap = self.tiles.get(key)
                 if key not in self.tiles:
                     self._request_tile(key)
+                target = QRectF(tx * TILE_SIZE - left, ty * TILE_SIZE - top, TILE_SIZE, TILE_SIZE)
                 if pixmap is not None:
-                    painter.drawPixmap(QPointF(tx * TILE_SIZE - left, ty * TILE_SIZE - top), pixmap)
+                    painter.drawPixmap(target.topLeft(), pixmap)
+                else:
+                    self._draw_placeholder_tile(painter, key, target)
+
+    def _draw_placeholder_tile(self, painter: QPainter, key: tuple[int, int, int], target: QRectF) -> None:
+        """While a tile downloads, stretch the matching part of an already-loaded tile from a
+        lower zoom level over its place, so zooming in never flashes blank."""
+        z, x, y = key
+        for up in range(1, 4):
+            parent = self.tiles.get((z - up, x >> up, y >> up))
+            if parent is None:
+                continue
+            size = TILE_SIZE / 2**up
+            source = QRectF((x % 2**up) * size, (y % 2**up) * size, size, size)
+            painter.drawPixmap(target, parent, source)
+            return
 
     def _request_tile(self, key: tuple[int, int, int]) -> None:
         self.tiles[key] = None  # pending (and stays None if the download fails)
@@ -183,46 +213,96 @@ class TrackMap(QWidget):
                 self.tiles[key] = pixmap
                 self.update()
 
-    def _sampled(self, points):
-        step = max(1, len(points) // MAX_DRAWN_POINTS)
-        return points[::step] if step > 1 else points
+    @staticmethod
+    def _simplified_path(world: list[tuple[float, float]], scale: float) -> QPainterPath:
+        """A polyline as a QPainterPath in world pixels at `scale` (2**zoom), dropping points
+        closer than SIMPLIFY_PX to the last kept one — invisible at that zoom anyway."""
+        path = QPainterPath()
+        last = None
+        for i, (wx, wy) in enumerate(world):
+            x, y = wx * scale, wy * scale
+            if last is None:
+                path.moveTo(x, y)
+            elif abs(x - last[0]) + abs(y - last[1]) >= SIMPLIFY_PX or i == len(world) - 1:
+                path.lineTo(x, y)
+            else:
+                continue
+            last = (x, y)
+        return path
 
-    def _draw_polyline(self, painter: QPainter, points, color: QColor, width: float, alpha: int = 255) -> None:
-        if len(points) < 2:
-            return
-        color = QColor(color)
-        color.setAlpha(alpha)
-        pen = QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.drawPolyline(QPolygonF([self._screen(lat, lon) for lat, lon in self._sampled(points)]))
+    def _zoom_paths(self) -> dict:
+        """The track's drawable paths at the current zoom (built once per zoom level)."""
+        cached = self._paths.get(self.zoom)
+        if cached is not None:
+            return cached
+        scale = 2**self.zoom
+        data = self.data
+        # Coloured track: one path per colour bucket, so a paint is a dozen drawPath calls
+        # instead of thousands of separately-coloured line segments.
+        colored: dict[int | None, QPainterPath] = {}
+        last, last_bucket = None, object()
+        for (wx, wy), bucket in zip(self._world, self._buckets):
+            x, y = wx * scale, wy * scale
+            if last is not None and abs(x - last[0]) + abs(y - last[1]) < SIMPLIFY_PX:
+                continue
+            if last is not None:
+                path = colored.setdefault(bucket, QPainterPath())
+                if bucket != last_bucket or path.currentPosition() != QPointF(*last):
+                    path.moveTo(*last)
+                path.lineTo(x, y)
+            last, last_bucket = (x, y), bucket
+        cached = {
+            "casing": self._simplified_path(self._world, scale),
+            "colored": colored,
+            "highlights": [self._simplified_path([world_xy(lat, lon, 0) for lat, lon in h], scale) for h in data.highlights if len(h) > 1],
+            "selected": self._simplified_path([world_xy(lat, lon, 0) for lat, lon in data.selected], scale) if len(data.selected) > 1 else None,
+        }
+        self._paths[self.zoom] = cached
+        return cached
+
+    @staticmethod
+    def _pen(color: str, width: float, alpha: int = 255) -> QPen:
+        qcolor = QColor(color)
+        qcolor.setAlpha(alpha)
+        return QPen(qcolor, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
 
     def _draw_track(self, painter: QPainter) -> None:
-        points, values = self.data.points, self.data.values
-        step = max(1, len(points) // MAX_DRAWN_POINTS)
-        low, high = self._value_range
+        paths = self._zoom_paths()
+        painter.save()
+        painter.translate(self.width() / 2 - self.center.x(), self.height() / 2 - self.center.y())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if paths["selected"] is not None:
+            painter.setPen(self._pen(COLORS["cyan"], 13, 150))
+            painter.drawPath(paths["selected"])
+        painter.setPen(self._pen("#ffffff", 10, 150))
+        for highlight in paths["highlights"]:
+            painter.drawPath(highlight)
         # Dark casing first, so the coloured line reads on any map background.
-        self._draw_polyline(painter, points, QColor(COLORS["bg_dark"]), 6.5)
-        if not any(v is not None for v in values):  # nothing to colour by (e.g. a route outline)
-            self._draw_polyline(painter, points, QColor(COLORS["accent"]), 4)
-            return
-        previous = None
-        for i in range(0, len(points), step):
-            here = self._screen(*points[i])
-            if previous is not None:
-                value = values[i]
-                color = ramp_color((value - low) / (high - low)) if value is not None else QColor(COLORS["comment"])
-                painter.setPen(QPen(color, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                painter.drawLine(previous, here)
-            previous = here
+        painter.setPen(self._pen(COLORS["bg_dark"], 6.5))
+        painter.drawPath(paths["casing"])
+        if not paths["colored"] or set(paths["colored"]) == {None}:  # nothing to colour by (a route outline)
+            painter.setPen(self._pen(COLORS["accent"], 4))
+            painter.drawPath(paths["casing"])
+        else:
+            for bucket, path in paths["colored"].items():
+                color = COLORS["comment"] if bucket is None else ramp_color((bucket + 0.5) / COLOR_BUCKETS).name()
+                painter.setPen(self._pen(color, 4))
+                painter.drawPath(path)
+        painter.restore()
 
     def _draw_markers(self, painter: QPainter) -> None:
         font = QFont()
         font.setPointSizeF(7.5)
         font.setBold(True)
         painter.setFont(font)
-        markers = self.data.lap_markers if len(self.data.lap_markers) <= 60 else []
-        for lat, lon, text in markers:
+        last = None
+        for lat, lon, text in self.data.lap_markers:
             p = self._screen(lat, lon)
+            # Skip markers that would overlap the previous one drawn (e.g. 1 km laps seen from
+            # far out); zooming in reveals them.
+            if last is not None and abs(p.x() - last.x()) + abs(p.y() - last.y()) < MARKER_SPACING_PX:
+                continue
+            last = p
             rect = QRectF(p.x() - 9, p.y() - 9, 18, 18)
             painter.setPen(QPen(QColor(COLORS["bg_dark"]), 1.5))
             painter.setBrush(QBrush(QColor(COLORS["fg"])))
