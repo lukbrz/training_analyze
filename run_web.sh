@@ -9,4 +9,4 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
-python web.py "$@"
+python src/web.py "$@"

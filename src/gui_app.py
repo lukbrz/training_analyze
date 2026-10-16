@@ -4,8 +4,18 @@ run_gui.sh. All behaviour is shared with the TUI (see gui_pages.py)."""
 
 import sys
 
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QStackedWidget, QStyleFactory, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QStyleFactory,
+    QVBoxLayout,
+    QWidget,
+)
 
 import garmin_client
 from gui_common import COLORS, STYLESHEET, Page, init_bridge, label, run_background
@@ -26,8 +36,12 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
         self.header = label(APP_TITLE, "appHeader")
         self.stack = QStackedWidget()
-        self.footer = QLabel()
+        # Like Textual's Footer: one button per key binding — press the key or click it.
+        self.footer = QWidget()
         self.footer.setObjectName("footer")
+        self.footer_layout = QHBoxLayout(self.footer)
+        self.footer_layout.setContentsMargins(8, 4, 8, 4)
+        self.footer_layout.setSpacing(2)
         layout.addWidget(self.header)
         layout.addWidget(self.stack, 1)
         layout.addWidget(self.footer)
@@ -66,15 +80,38 @@ class MainWindow(QMainWindow):
     def _page_changed(self) -> None:
         page: Page = self.stack.currentWidget()
         self.header.setText(f"{APP_TITLE}  ·  {page.title}" if page.title else APP_TITLE)
-        keys = "   ".join(
-            f"<span style='background:{COLORS['surface2']}; color:{COLORS['accent']}; font-weight:600'>&nbsp;{key}&nbsp;</span> {text}"
-            for key, text in page.bindings
-        )
-        self.footer.setText(keys)
+        self._rebuild_footer(page)
         page.on_shown()
         target = page.focus_widget()
         if target is not None:
             target.setFocus()
+
+    def _rebuild_footer(self, page: Page) -> None:
+        while self.footer_layout.count():
+            widget = self.footer_layout.takeAt(0).widget()
+            if widget is not None:
+                # Detach now — deleteLater alone leaves the old buttons drawn until the event
+                # loop gets round to deleting them, overlapping the new ones.
+                widget.setParent(None)
+                widget.deleteLater()
+        for key, text, action in page.bindings:
+            entry = QPushButton()
+            entry.setObjectName("footerKey")
+            inner = QHBoxLayout(entry)
+            inner.setContentsMargins(6, 2, 8, 2)
+            inner.setSpacing(6)
+            for part, name in ((key, "footerCap"), (text, "footerText")):
+                part_label = QLabel(part)
+                part_label.setObjectName(name)
+                part_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                inner.addWidget(part_label)
+            entry.setMinimumWidth(inner.sizeHint().width())
+            entry.setCursor(Qt.CursorShape.PointingHandCursor)
+            entry.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keep focus (and key bindings) on the page
+            entry.setToolTip(f"Press {key}")
+            entry.clicked.connect(lambda _=False, act=action: act())
+            self.footer_layout.addWidget(entry)
+        self.footer_layout.addStretch(1)
 
     # --- notifications (Textual's notify) ------------------------------------------
 

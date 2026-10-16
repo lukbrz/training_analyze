@@ -5,7 +5,8 @@ from pathlib import Path
 
 from models import ActivitySummary, Lap, RecordPoint, Route, RouteSignature, ZoneTime
 
-BASE_DIR = Path(__file__).parent
+# Source lives in src/; user data (data/, workouts/, the Garmin session) stays at the project root.
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 INDEX_PATH = DATA_DIR / "activities_index.json"
 LAPS_DIR = DATA_DIR / "laps"
@@ -22,6 +23,7 @@ THRESHOLDS_OVERRIDE_PATH = DATA_DIR / "thresholds_override.json"
 ACTIVITY_STATS_PATH = DATA_DIR / "activity_stats.json"
 CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
+TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 
 
 def _filtered(cls, raw: dict) -> dict:

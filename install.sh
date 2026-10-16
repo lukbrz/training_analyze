@@ -15,6 +15,6 @@ fi
 
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r src/requirements.txt
 
 echo "Done. Run ./run.sh to start the app."

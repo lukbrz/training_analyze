@@ -1,3 +1,4 @@
+import math
 import shutil
 import subprocess
 from datetime import date, timedelta
@@ -6,7 +7,7 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import HorizontalGroup, Vertical
+from textual.containers import Horizontal, HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Select, Static
@@ -677,6 +678,18 @@ class RoutesScreen(Screen):
     #rename_input {
         width: 1fr;
     }
+
+    #routes_body {
+        height: 1fr;
+    }
+
+    #routes_table {
+        width: 3fr;
+    }
+
+    #route_plot {
+        width: 2fr;
+    }
     """
 
     BINDINGS = [
@@ -699,7 +712,7 @@ class RoutesScreen(Screen):
             Button("Rename", id="rename_button"),
             id="rename_bar",
         )
-        yield DataTable(id="routes_table")
+        yield Horizontal(DataTable(id="routes_table"), PlotextPlot(id="route_plot"), id="routes_body")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -721,6 +734,25 @@ class RoutesScreen(Screen):
         for route, count in grouped:
             table.add_row(*display.route_row(route, count), key=route.route_id)
         self.query_one("#routes_status", Static).update(f"{len(grouped)} routes with 2+ activities")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        route = self.routes_by_key.get(event.row_key.value) if event.row_key else None
+        plot = self.query_one("#route_plot", PlotextPlot)
+        plt = plot.plt
+        plt.clear_data()
+        plt.clear_figure()
+        if route is not None and route.signature.points:
+            lats = [lat for lat, _ in route.signature.points]
+            # Scale longitude by cos(latitude) so the outline isn't stretched east-west.
+            scale = math.cos(math.radians(sum(lats) / len(lats)))
+            xs = [lon * scale for _, lon in route.signature.points]
+            plt.plot(xs, lats, marker="braille", color="cyan")
+            plt.scatter([xs[0]], [lats[0]], marker="●", color="green")
+            plt.scatter([xs[-1]], [lats[-1]], marker="●", color="red")
+            plt.xticks([])
+            plt.yticks([])
+            plt.title(f"{route.name} — outline (start green, finish red)")
+        plot.refresh()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "rename_button":
@@ -866,6 +898,7 @@ class WorkoutsScreen(Screen):
         Binding("escape", "back", "Back", priority=True),
         Binding("u", "upload", "Upload workout"),
         Binding("U", "upload_week", "Upload week"),
+        Binding("x", "toggle_week", "Expand/collapse week"),
         Binding("r", "refresh", "Refresh"),
     ]
 
@@ -891,8 +924,11 @@ class WorkoutsScreen(Screen):
     def action_refresh(self) -> None:
         for message in self.library.refresh():
             self.notify(message, severity="information" if message.startswith("Unpacked") else "error")
+        self._fill_table()
+
+    def _fill_table(self, select_key: str | None = None) -> None:
         table = self.query_one(DataTable)
-        previous_key = self._selected_key()
+        previous_key = select_key or self._selected_key()
         table.clear()
         for row in self.library.rows:
             if row.kind == "week":
@@ -918,6 +954,22 @@ class WorkoutsScreen(Screen):
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._show_preview(event.row_key.value if event.row_key else None)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        # Enter / click on a week header expands or collapses it.
+        key = event.row_key.value if event.row_key else None
+        if key and key.startswith(workout_library.WEEK_KEY_PREFIX):
+            self._toggle(key)
+
+    def action_toggle_week(self) -> None:
+        self._toggle(self._selected_key())
+
+    def _toggle(self, key: str | None) -> None:
+        if not self.library.toggle_week(key):
+            self.notify("Not part of a week plan", severity="warning")
+            return
+        # Keep the cursor on the week's header (its workout rows may have just disappeared).
+        self._fill_table(select_key=f"{workout_library.WEEK_KEY_PREFIX}{self.library.week_of(key)}")
 
     def _show_preview(self, key: str | None) -> None:
         text, is_error = self.library.preview(key)

@@ -9,4 +9,4 @@ if [ ! -d ".venv" ]; then
 fi
 
 source .venv/bin/activate
-python gui_app.py "$@"
+python src/gui_app.py "$@"

@@ -59,8 +59,17 @@ class WorkoutLibrary:
 
     @property
     def rows(self) -> list[LibraryRow]:
-        """The rows to display: everything except the workouts of collapsed weeks."""
-        return [r for r in self.all_rows if r.kind == "week" or self.week_of(r.key) not in self.collapsed or "/" not in r.key]
+        """The rows to display: everything except the workouts of collapsed weeks, with each
+        week header showing ▸ (collapsed) or ▾ (expanded)."""
+        rows = []
+        for row in self.all_rows:
+            week = self.week_of(row.key)
+            if row.kind == "week":
+                arrow = "▸" if week in self.collapsed else "▾"
+                rows.append(LibraryRow(row.key, (f"{arrow} {row.values[0]}", *row.values[1:]), row.kind))
+            elif week not in self.collapsed:
+                rows.append(row)
+        return rows
 
     def toggle_week(self, key: str | None) -> bool:
         """Collapse/expand the week a row belongs to; False if the row isn't in a week."""
@@ -102,7 +111,7 @@ class WorkoutLibrary:
             self.all_rows.append(LibraryRow(
                 f"{WEEK_KEY_PREFIX}{week_dir.name}",
                 (
-                    f"{'▸' if week_dir.name in self.collapsed else '▾'} {week_dir.name}",
+                    week_dir.name,
                     f"{dates[0]} – {dates[-1]}" if dates else "",
                     f"{len(keys)} workouts",
                     "",

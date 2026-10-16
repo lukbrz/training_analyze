@@ -14,9 +14,13 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSplitter,
+    QVBoxLayout,
+    QWidget,
 )
 
 import display
+import fit_parser
 import garmin_client
 import services
 import storage
@@ -25,7 +29,10 @@ import workout_library
 from gui_common import (
     COLORS,
     SPORT_COLORS,
+    LegCard,
     Page,
+    StackedBar,
+    StatRow,
     fill_table,
     label,
     make_chart_view,
@@ -37,8 +44,9 @@ from gui_common import (
     run_background,
     table_as_tsv,
 )
+from gui_map import TrackData, TrackMap
 from laps_session import LapsError, LapsSession
-from models import ActivitySummary
+from models import PACE_SPORTS, SWIM_SPORTS, ActivitySummary, format_distance, format_speed_or_pace
 from workout_library import LibraryError, WorkoutLibrary
 
 ALL_SPORTS = "__all__"
@@ -255,13 +263,27 @@ class LapsPage(Page):
         self.activity = activity
         self.client = client
         self.session = LapsSession(activity)
-        summary = label(self.session.summary_text(), "card")
+        a = activity
+        heading = label(
+            f"<span style='color:{SPORT_COLORS.get(a.sport, COLORS['fg'])}; font-weight:600'>{a.sport}</span>"
+            f"&nbsp;&nbsp;·&nbsp;&nbsp;{a.start_time_local.replace('T', ' ')[:16]}", "status",
+        )
+        activity_tiles = StatRow()
+        activity_tiles.set_stats(display.activity_stats(a))
         self.split_input = QLineEdit(placeholderText="400 = metres · 60s / 1m / 1:30 = time")
         self.split_input.returnPressed.connect(lambda: self._run(lambda: self.session.split(self.split_input.text())))
         self.filter_button = button("Interval only (f)", self.toggle_filter, checkable=True)
         self.table = make_table(self.session.columns)
-        self.interval_summary = label("", "status")
-        self.layout_.addWidget(summary)
+        self.interval_tiles = StatRow()
+        self.interval_hint = label("", "status")
+        self.layout_.addWidget(heading)
+        self.layout_.addWidget(activity_tiles)
+        if self.session.multisport:
+            legs_row = QHBoxLayout()
+            legs_row.setSpacing(10)
+            for name, sport, stats in display.leg_stats(storage.load_laps(a.activity_id)):
+                legs_row.addWidget(LegCard(name, sport, stats), 1)
+            self.layout_.addLayout(legs_row)
         self.layout_.addLayout(row_layout(
             self.split_input,
             button("Split", lambda: self._run(lambda: self.session.split(self.split_input.text()))),
@@ -271,7 +293,8 @@ class LapsPage(Page):
             stretch_index=0,
         ))
         self.layout_.addWidget(self.table, 1)
-        self.layout_.addWidget(self.interval_summary)
+        self.layout_.addWidget(self.interval_tiles)
+        self.layout_.addWidget(self.interval_hint)
         self.bind_back()
         self.bind("m", "Mark interval", self.toggle_interval)
         self.bind("z", "Zones", lambda: self.window_.push(ZonesPage(self.window_, activity, client)))
@@ -280,6 +303,7 @@ class LapsPage(Page):
         self.bind("i", "Split intervals", self.split_intervals)
         self.bind("f", "Interval-only", self.toggle_filter)
         self.bind("h", "Phase time/pace/power", self.histograms)
+        self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         self._rebuild()
 
@@ -292,7 +316,10 @@ class LapsPage(Page):
             self.table, [r.values for r in rows], [self.STYLE_BY_KIND[r.kind] for r in rows],
             right_aligned={self.session.duration_column},
         )
-        self.interval_summary.setText(self.session.interval_summary())
+        stats = display.interval_stats(self.session.current_laps, self.activity.sport)
+        self.interval_tiles.set_stats(stats, "Marked\nintervals")
+        self.interval_hint.setText("" if stats else self.session.interval_summary())
+        self.interval_hint.setVisible(not stats)
 
     def _run(self, operation) -> bool:
         try:
@@ -342,6 +369,14 @@ class LapsPage(Page):
             return
         self.window_.push(ComparePage(self.window_, self.activity, marked, records, offset))
 
+    def open_map(self) -> None:
+        try:
+            page = MapPage(self.window_, self.session, self.session.row_lap(self.table.currentRow()))
+        except LapsError as e:
+            self.notify(str(e), "warning")
+            return
+        self.window_.push(page)
+
     def histograms(self) -> None:
         try:
             phases = self.session.histogram_phases()
@@ -349,6 +384,100 @@ class LapsPage(Page):
             self.notify(str(e), "warning")
             return
         self.window_.push(PhaseMetricsPage(self.window_, self.activity, phases))
+
+
+class MapPage(Page):
+    """GUI-only: the activity's GPS track on a map (see gui_map), coloured by a metric, with
+    marked intervals outlined and the lap selected on the laps page highlighted."""
+
+    MODES = (
+        ("1", "Speed / pace", "speed_mps"),
+        ("2", "Heart rate", "heart_rate"),
+        ("3", "Power", "power"),
+        ("4", "Elevation", "altitude_m"),
+    )
+
+    def __init__(self, window, session: LapsSession, selected_lap) -> None:
+        super().__init__(window)
+        self.title = f"Map — {session.activity.name}"
+        self.session = session
+        records = session.ensure_records()  # raises LapsError when there's nothing to draw
+        self.records = [r for r in records if r.lat is not None and r.lon is not None]
+        if len(self.records) < 2:
+            raise LapsError("No GPS track for this activity (e.g. a pool swim or indoor session)")
+        self.sport = session.activity.sport
+        self.mode = "speed_mps"
+        self.highlights = [self._coords(lap) for lap in session.marked_laps()]
+        self.selected = self._coords(selected_lap) if selected_lap is not None else []
+        self.lap_markers = []
+        for lap in session.current_laps:
+            coords = self._coords(lap)
+            if coords:
+                self.lap_markers.append((*coords[0], str(lap.lap_index)))
+
+        caption = f"{session.activity.name}  ·  {len(self.highlights)} marked interval(s) outlined"
+        if selected_lap is not None:
+            caption += "  ·  selected lap highlighted in cyan"
+        self.mode_buttons = {}
+        group = QButtonGroup(self)
+        for key, text, attr in self.MODES:
+            b = button(f"{text} ({key})", lambda _=False, a=attr: self.set_mode(a), checkable=True)
+            group.addButton(b)
+            self.mode_buttons[attr] = b
+        self.map = TrackMap()
+        self.layout_.addWidget(label(caption, "status"))
+        self.layout_.addLayout(row_layout(
+            *self.mode_buttons.values(), button("Fit (0)", self.map.fit), button("+", self.map.zoom_in), button("−", self.map.zoom_out),
+        ))
+        self.layout_.addWidget(self.map, 1)
+        self.bind_back()
+        for key, text, attr in self.MODES:
+            self.bind(key, text, lambda a=attr: self.set_mode(a))
+        self.bind("0", "Fit track", self.map.fit)
+        self.bind("+", "Zoom in", self.map.zoom_in)
+        self.bind("-", "Zoom out", self.map.zoom_out)
+        self.set_mode(self.mode, refit=True)
+
+    def _coords(self, lap) -> list[tuple[float, float]]:
+        lap_records = fit_parser.lap_record_slice(self.session.records, lap, self.session.utc_offset)
+        return [(r.lat, r.lon) for r in lap_records if r.lat is not None and r.lon is not None]
+
+    def set_mode(self, attr: str, refit: bool = False) -> None:
+        self.mode = attr
+        self.mode_buttons[attr].setChecked(True)
+        label_text, fmt = {
+            "speed_mps": ("Pace" if self.sport in PACE_SPORTS | SWIM_SPORTS else "Speed",
+                          lambda v: format_speed_or_pace(self.sport, v)),
+            "heart_rate": ("Heart rate", lambda v: f"{v:.0f} bpm"),
+            "power": ("Power", lambda v: f"{v:.0f} W"),
+            "altitude_m": ("Elevation", lambda v: f"{v:.0f} m"),
+        }[attr]
+        values = [getattr(r, attr) for r in self.records]
+        if attr == "speed_mps" and not any(v is not None for v in values):
+            values = self._speed_from_distance()
+        self.map.set_track(TrackData(
+            points=[(r.lat, r.lon) for r in self.records],
+            values=values,
+            value_label=label_text,
+            value_format=fmt,
+            highlights=self.highlights,
+            selected=self.selected,
+            lap_markers=self.lap_markers,
+        ), refit=refit)
+
+    def _speed_from_distance(self) -> list[float | None]:
+        """Speed from cumulative distance when the device recorded no speed channel."""
+        values: list[float | None] = [None]
+        for a, b in zip(self.records, self.records[1:]):
+            seconds = (b.timestamp_utc - a.timestamp_utc).total_seconds()
+            if seconds > 0 and a.distance_m is not None and b.distance_m is not None:
+                values.append((b.distance_m - a.distance_m) / seconds)
+            else:
+                values.append(None)
+        return values
+
+    def focus_widget(self):
+        return self.map
 
 
 class ZonesPage(Page):
@@ -469,11 +598,28 @@ class RoutesPage(Page):
         self.rename_input.returnPressed.connect(self.rename)
         self.table = make_table(display.ROUTE_COLUMNS, stretch_column=0)
         self.table.cellActivated.connect(lambda row, _: self._open(row))
+        self.table.currentCellChanged.connect(lambda row, *_: self._show_route(row))
+        self.map = TrackMap()
+        self.map_caption = label("", "status")
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addLayout(row_layout(self.rename_input, button("Rename", self.rename), stretch_index=0))
+        left_layout.addWidget(self.table, 1)
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self.map_caption)
+        right_layout.addWidget(self.map, 1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(left)
+        splitter.addWidget(right)
+        splitter.setSizes([560, 700])
         self.layout_.addWidget(self.status)
-        self.layout_.addLayout(row_layout(self.rename_input, button("Rename", self.rename), stretch_index=0))
-        self.layout_.addWidget(self.table, 1)
+        self.layout_.addWidget(splitter, 1)
         self.bind_back()
         self.bind("e", "Rename route", self.rename)
+        self.bind("0", "Fit map", self.map.fit)
         self._refresh()
 
     def focus_widget(self):
@@ -484,7 +630,36 @@ class RoutesPage(Page):
         _, activities = storage.load_index()
         self.grouped = display.grouped_routes(self.all_routes, activities)
         fill_table(self.table, [display.route_row(r, n) for r, n in self.grouped])
-        self.status.setText(f"{len(self.grouped)} routes with 2+ activities")
+        self.status.setText(f"{len(self.grouped)} routes with 2+ activities — select one to see it on the map, Enter to list its activities")
+        self._show_route(self.table.currentRow())
+
+    def _show_route(self, row: int) -> None:
+        if not 0 <= row < len(self.grouped):
+            return
+        route, count = self.grouped[row]
+        points = [(lat, lon) for lat, lon in route.signature.points]
+        self.map_caption.setText(
+            f"<b>{route.name}</b> · {route.sport} · {route.place or 'unknown place'} · "
+            f"{format_distance(route.signature.distance_m)} · {count} activities"
+        )
+        # The stored signature is a coarse 20-point outline: show it at once, then replace it with
+        # the full GPS track of the route's latest activity, parsed off the UI thread.
+        self.map.set_track(TrackData(points=points, values=[None] * len(points)), refit=True)
+        _, activities = storage.load_index()
+        latest = max((a for a in activities if a.route_id == route.route_id), key=lambda a: a.start_time_local, default=None)
+        if latest is None or not storage.has_fit(latest.activity_id):
+            return
+
+        def load_track():
+            records = fit_parser.load_records(latest.activity_id, storage.fit_path(latest.activity_id).read_bytes())
+            return [(r.lat, r.lon) for r in records if r.lat is not None and r.lon is not None]
+
+        def show(track):
+            if self.table.currentRow() == row and len(track) > len(points):  # still the selected route
+                self.map.set_track(TrackData(points=track, values=[None] * len(track)), refit=False)
+                self.map_caption.setText(self.map_caption.text() + f" · track of {latest.start_time_local[:10]}")
+
+        run_background(load_track, show, lambda e: None)
 
     def rename(self) -> None:
         row = self.table.currentRow()
@@ -538,6 +713,7 @@ class WorkoutsPage(Page):
         self.status = label("", "status")
         self.table = make_table(workout_library.COLUMNS, stretch_column=2)
         self.table.currentCellChanged.connect(lambda *_: self._show_preview())
+        self.table.cellActivated.connect(lambda row, _: self._activated(row))
         self.preview = QPlainTextEdit(readOnly=True)
         self.preview.setObjectName("card")
         self.layout_.addWidget(self.status)
@@ -546,6 +722,7 @@ class WorkoutsPage(Page):
         self.bind_back()
         self.bind("u", "Upload workout", self.upload)
         self.bind("Shift+U", "Upload week", self.upload_week, display_key="U")
+        self.bind("x", "Expand/collapse week", lambda: self._toggle(self._selected_key()))
         self.bind("r", "Refresh", self.refresh)
         self.refresh()
 
@@ -557,21 +734,37 @@ class WorkoutsPage(Page):
         return self.library.rows[row].key if 0 <= row < len(self.library.rows) else None
 
     def refresh(self) -> None:
-        previous = self._selected_key()
+        previous = self._selected_key()  # before the library's rows change
         for message in self.library.refresh():
             self.notify(message, "information" if message.startswith("Unpacked") else "error")
+        self._fill(previous)
+
+    def _activated(self, row: int) -> None:
+        # Enter / double-click on a week header expands or collapses it.
+        rows = self.library.rows
+        if 0 <= row < len(rows) and rows[row].kind == "week":
+            self._toggle(rows[row].key)
+
+    def _toggle(self, key: str | None) -> None:
+        if key is None or not self.library.toggle_week(key):
+            self.notify("Not part of a week plan", "warning")
+            return
+        self._fill(select_key=f"{workout_library.WEEK_KEY_PREFIX}{self.library.week_of(key)}")
+
+    def _fill(self, select_key: str | None) -> None:
+        rows = self.library.rows
         styles = []
-        for row in self.library.rows:
+        for row in rows:
             if row.kind == "week":
                 styles.append({"bold": True, "color": COLORS["accent"], "color_columns": {4: COLORS["red"]} if row.values[4] != "OK" else {}})
             elif row.kind == "invalid":
                 styles.append({"color_columns": {4: COLORS["red"]}})
             else:
                 styles.append({"color_columns": {4: COLORS["green"]}})
-        fill_table(self.table, [r.values for r in self.library.rows], styles)
-        keys = [r.key for r in self.library.rows]
-        if previous in keys:
-            self.table.selectRow(keys.index(previous))
+        fill_table(self.table, [r.values for r in rows], styles)
+        keys = [r.key for r in rows]
+        if select_key in keys:
+            self.table.selectRow(keys.index(select_key))
         self.status.setText(self.library.status_text)
         self._show_preview()
 
@@ -629,7 +822,9 @@ class TrainingWeekPage(Page):
         self.week = training_load.week_start(date.today())
         self.view = None
         self.week_title = label("", "pageTitle")
-        self.summary = label("", "card")
+        self.load_tiles = StatRow()
+        self.tss_bar = StackedBar()
+        self.thresholds = label("", "status")
         self.table = make_table(display.WEEK_COLUMNS, stretch_column=4)
         self.notes = label("", "notes", wrap=True)
         chart_view, self.chart = make_chart_view()
@@ -638,7 +833,9 @@ class TrainingWeekPage(Page):
             button("◀ Previous ([)", self.prev_week), self.week_title, button("Next (]) ▶", self.next_week),
             button("This week (t)", self.this_week), button("Refresh (r)", self.refresh), stretch_index=1,
         ))
-        self.layout_.addWidget(self.summary)
+        self.layout_.addWidget(self.load_tiles)
+        self.layout_.addWidget(self.tss_bar)
+        self.layout_.addWidget(self.thresholds)
         self.layout_.addWidget(self.table, 2)
         self.layout_.addWidget(self.notes)
         self.layout_.addWidget(chart_view, 2)
@@ -658,7 +855,15 @@ class TrainingWeekPage(Page):
         self.view = services.load_training_week(self.week)
         today = date.today()
         self.week_title.setText(display.week_title(self.week))
-        self.summary.setText(display.week_summary_text(self.view))
+        self.load_tiles.set_stats(display.week_load_stats(self.view))
+        parts = display.week_tss_parts(self.view)
+        self.tss_bar.set_parts(
+            f"Week TSS — {parts['done']} done + {parts['remaining']} remaining = {parts['done'] + parts['remaining']}"
+            + (f"   ·   {parts['missed']} missed" if parts["missed"] else ""),
+            [("done", parts["done"], COLORS["green"]), ("remaining", parts["remaining"], COLORS["accent"]),
+             ("missed", parts["missed"], COLORS["red"])],
+        )
+        self.thresholds.setText(display.format_thresholds(self.view.thresholds))
         rows, styles = [], []
         for item in self.view.week.items:
             cells, color = display.week_item_cells(item, today)

@@ -9,4 +9,4 @@ if not exist ".venv" (
 )
 
 call .venv\Scripts\activate.bat
-python gui_app.py %*
+python src\gui_app.py %*

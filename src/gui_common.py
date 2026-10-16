@@ -18,11 +18,12 @@ from PySide6.QtCharts import (
     QLineSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDate, QDateTime, QMargins, QObject, QPointF, Qt, QTime, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QDate, QDateTime, QMargins, QObject, QPointF, QRectF, Qt, QTime, Signal, Slot
+from PySide6.QtGui import QBrush, QColor, QFont, QKeySequence, QPainter, QPainterPath, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QTableWidget,
@@ -31,20 +32,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-# Tokyo Night — the same palette the browser GUI's Textual theme uses.
-COLORS = {
-    "bg": "#1a1b26", "bg_dark": "#16161e", "surface": "#1f2335", "surface2": "#24283b",
-    "border": "#292e42", "border2": "#3b4261", "fg": "#c0caf5", "muted": "#565f89",
-    "comment": "#737aa2", "accent": "#7aa2f7", "green": "#9ece6a", "red": "#f7768e",
-    "yellow": "#e0af68", "cyan": "#7dcfff", "magenta": "#bb9af7", "orange": "#ff9e64",
-    "selection": "#2e3c64",
-}
-SERIES_COLORS = ["#7aa2f7", "#9ece6a", "#e0af68", "#bb9af7", "#7dcfff", "#ff9e64", "#f7768e", "#73daca"]
-SPORT_COLORS = {
-    "running": COLORS["green"], "cycling": COLORS["accent"], "swimming": COLORS["cyan"],
-    "training": COLORS["magenta"], "strength_training": COLORS["magenta"],
-    "multisport": COLORS["orange"], "hiking": COLORS["yellow"],
-}
+from theme import COLORS, SERIES_COLORS, SPORT_COLORS
+
 MONO_FONT = "JetBrains Mono, DejaVu Sans Mono, Consolas, monospace"
 
 STYLESHEET = f"""
@@ -56,10 +45,19 @@ QLabel#appHeader {{
     background: {COLORS['bg_dark']}; color: {COLORS['accent']};
     font-size: 13pt; font-weight: 600; padding: 10px 16px; border-bottom: 1px solid {COLORS['border']};
 }}
-QLabel#footer {{
-    background: {COLORS['bg_dark']}; color: {COLORS['comment']};
-    padding: 6px 12px; border-top: 1px solid {COLORS['border']};
+QWidget#footer {{
+    background: {COLORS['bg_dark']}; border-top: 1px solid {COLORS['border']};
 }}
+QPushButton#footerKey {{
+    background: transparent; border: none; border-radius: 6px; padding: 0; min-height: 26px;
+}}
+QPushButton#footerKey:hover {{ background: {COLORS['surface2']}; color: {COLORS['fg']}; }}
+QLabel#footerCap {{
+    background: {COLORS['surface2']}; color: {COLORS['accent']}; font-weight: 600;
+    border-radius: 4px; padding: 1px 6px;
+}}
+QLabel#footerText {{ background: transparent; color: {COLORS['comment']}; }}
+QPushButton#footerKey:hover QLabel#footerText {{ color: {COLORS['fg']}; }}
 QLabel#pageTitle {{ font-size: 12pt; font-weight: 600; color: {COLORS['fg']}; }}
 QLabel#status {{ color: {COLORS['comment']}; }}
 QLabel#notes {{ color: {COLORS['yellow']}; }}
@@ -83,7 +81,7 @@ QPushButton {{
 QPushButton:hover {{ border-color: {COLORS['accent']}; background: #2f3549; }}
 QPushButton:pressed {{ background: {COLORS['selection']}; }}
 QPushButton:checked, QPushButton[primary="true"] {{
-    background: {COLORS['accent']}; color: {COLORS['bg']}; border-color: {COLORS['accent']}; font-weight: 600;
+    background: {COLORS['accent']}; color: {COLORS['bg']}; border-color: {COLORS['accent']};
 }}
 QPushButton:disabled {{ color: {COLORS['muted']}; border-color: {COLORS['border']}; }}
 QLineEdit, QComboBox {{
@@ -95,6 +93,11 @@ QStatusBar {{ background: {COLORS['bg_dark']}; color: {COLORS['fg']}; }}
 QScrollBar:vertical {{ background: {COLORS['bg_dark']}; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {COLORS['border2']}; border-radius: 5px; min-height: 24px; }}
 QMessageBox QLabel {{ font-family: {MONO_FONT}; }}
+QFrame#tile {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 12px; }}
+QFrame#tile QLabel {{ background: transparent; }}
+QLabel#tileCaption {{ color: {COLORS['comment']}; font-size: 8pt; font-weight: 600; letter-spacing: 1px; }}
+QLabel#tileHint {{ color: {COLORS['comment']}; font-size: 8.5pt; }}
+QLabel#tileHeading {{ color: {COLORS['accent']}; font-weight: 600; min-width: 48px; }}
 """
 
 
@@ -153,7 +156,7 @@ class Page(QWidget):
     def __init__(self, window) -> None:
         super().__init__()
         self.window_ = window
-        self.bindings: list[tuple[str, str]] = []
+        self.bindings: list[tuple[str, str, Callable]] = []  # (key shown, label, action)
         self.layout_ = QVBoxLayout(self)
         self.layout_.setContentsMargins(14, 12, 14, 10)
         self.layout_.setSpacing(10)
@@ -162,7 +165,7 @@ class Page(QWidget):
         shortcut = QShortcut(QKeySequence(key), self)
         shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         shortcut.activated.connect(fn)
-        self.bindings.append((display_key or key, label))
+        self.bindings.append((display_key or key, label, fn))
 
     def bind_back(self) -> None:
         self.bind("Escape", "Back", self.window_.pop, display_key="esc")
@@ -412,3 +415,130 @@ def card(widget: QWidget) -> QFrame:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.addWidget(widget)
     return frame
+
+
+# --- Graphical summaries (stat tiles, stacked bar) ---------------------------------
+
+
+def palette(name: str) -> str:
+    return COLORS.get(name, COLORS["fg"]) if name else COLORS["fg"]
+
+
+class StatTile(QFrame):
+    """A dashboard tile: small caption, big coloured value with unit, optional hint line."""
+
+    def __init__(self, stat) -> None:
+        super().__init__()
+        self.setObjectName("tile")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(0)
+        caption = QLabel(stat.label.upper())
+        caption.setObjectName("tileCaption")
+        value = QLabel(
+            f"<span style='font-size:18pt; font-weight:600; color:{palette(stat.color)}'>{stat.value}</span>"
+            f"<span style='font-size:9.5pt; color:{COLORS['comment']}'>&nbsp;{stat.unit}</span>"
+        )
+        layout.addWidget(caption)
+        layout.addWidget(value)
+        if stat.hint:
+            hint = QLabel(stat.hint)
+            hint.setObjectName("tileHint")
+            layout.addWidget(hint)
+
+
+class StatRow(QWidget):
+    """A row of StatTiles that can be refilled."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(10)
+
+    def set_stats(self, stats, title: str = "") -> None:
+        while self.row.count():
+            widget = self.row.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        if title:
+            heading = QLabel(title)
+            heading.setObjectName("tileHeading")
+            self.row.addWidget(heading)
+        for stat in stats:
+            self.row.addWidget(StatTile(stat), 1)
+        self.setVisible(bool(stats))
+
+
+class StackedBar(QWidget):
+    """A rounded horizontal bar split into coloured parts, each labelled with its value."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(54)
+        self.parts: list[tuple[str, int, str]] = []  # (label, value, colour)
+        self.title = ""
+
+    def set_parts(self, title: str, parts: list[tuple[str, int, str]]) -> None:
+        self.title, self.parts = title, parts
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        font = QFont()
+        font.setPointSizeF(9)
+        painter.setFont(font)
+        painter.setPen(QColor(COLORS["comment"]))
+        painter.drawText(QRectF(0, 0, self.width(), 18), Qt.AlignmentFlag.AlignLeft, self.title)
+        bar = QRectF(0, 22, self.width(), 26)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(COLORS["surface"])))
+        painter.drawRoundedRect(bar, 8, 8)
+        total = sum(value for _, value, _ in self.parts)
+        if not total:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(bar, 8, 8)
+        painter.setClipPath(path)
+        x = bar.left()
+        for text, value, color in self.parts:
+            if not value:
+                continue
+            width = bar.width() * value / total
+            segment = QRectF(x, bar.top(), width, bar.height())
+            painter.setBrush(QBrush(QColor(color)))
+            painter.drawRect(segment)
+            painter.setPen(QColor(COLORS["bg"]))
+            bold = QFont(font)
+            bold.setBold(True)
+            painter.setFont(bold)
+            label_text = f"{text} {value}"
+            if painter.fontMetrics().horizontalAdvance(label_text) + 12 > width:
+                label_text = str(value)
+            if painter.fontMetrics().horizontalAdvance(label_text) + 6 <= width:
+                painter.drawText(segment, Qt.AlignmentFlag.AlignCenter, label_text)
+            painter.setPen(Qt.PenStyle.NoPen)
+            x += width
+
+
+class LegCard(QFrame):
+    """One multisport leg (Swim / T1 / Bike / ...) as a compact card."""
+
+    def __init__(self, name: str, sport: str, stats) -> None:
+        super().__init__()
+        self.setObjectName("tile")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(1)
+        color = SPORT_COLORS.get(sport, COLORS["fg"])
+        title = QLabel(f"<span style='font-size:12pt; font-weight:600; color:{color}'>{name}</span>")
+        layout.addWidget(title)
+        for stat in stats:
+            line = QLabel(
+                f"<span style='color:{COLORS['comment']}'>{stat.label}</span>&nbsp; "
+                f"<span style='color:{palette(stat.color)}; font-weight:600'>{stat.value}</span>"
+                f"<span style='color:{COLORS['comment']}'>&nbsp;{stat.unit}</span>"
+            )
+            layout.addWidget(line)

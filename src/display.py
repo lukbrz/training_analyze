@@ -4,6 +4,7 @@ and the GUIs render the same content. Plain Python — no UI toolkit imports her
 
 import math
 from collections import Counter
+from dataclasses import dataclass
 from datetime import date, timedelta
 
 import fit_parser
@@ -394,3 +395,115 @@ def grouped_routes(routes, activities: list[ActivitySummary]) -> list[tuple]:
 
 def route_row(route, count: int) -> tuple[str, ...]:
     return (route.name, route.sport, route.place or "–", str(count), format_distance(route.signature.distance_m))
+
+
+# --- Structured stats for the graphical front ends (stat tiles) -----------------
+
+
+@dataclass
+class Stat:
+    label: str
+    value: str
+    unit: str = ""
+    color: str = ""  # palette name: green, red, yellow, cyan, magenta, accent, orange ("" = default)
+    hint: str = ""
+
+
+def _split_unit(text: str) -> tuple[str, str]:
+    """"5:21 /km" -> ("5:21", "/km"), "137" -> ("137", "")."""
+    value, _, unit = text.partition(" ")
+    return value, unit
+
+
+def activity_stats(activity: ActivitySummary) -> list[Stat]:
+    pace = _split_unit(format_speed_or_pace(activity.sport, activity.avg_speed_mps))
+    distance = _split_unit(format_distance(activity.distance_m))
+    stats = [
+        Stat("Duration", format_duration(activity.duration_s)),
+        Stat("Distance", *distance),
+        Stat("Pace" if activity.sport in ("running", "walking", "hiking") or activity.sport in SWIM_SPORTS else "Speed", *pace),
+        Stat("Avg HR", format_hr(activity.avg_hr), "bpm" if activity.avg_hr else "", "red" if activity.avg_hr else ""),
+        Stat("Avg power", *_split_unit(format_power(activity.avg_power)), "magenta" if activity.avg_power else ""),
+    ]
+    if activity.total_ascent_m:
+        stats.append(Stat("Ascent", f"{activity.total_ascent_m:.0f}", "m", "yellow"))
+    return stats
+
+
+def leg_stats(device_laps: list[Lap]) -> list[tuple[str, str, list[Stat]]]:
+    """Per-leg stats of a multisport activity: [(leg name, sport, stats)]."""
+    out = []
+    for name, leg in legs(device_laps):
+        distance = format_lap_distance(leg.sport, leg.distance_m) if leg.sport in SWIM_SPORTS else format_distance(leg.distance_m)
+        stats = [
+            Stat("Time", format_duration(leg.duration_s)),
+            Stat("Distance", *_split_unit(distance)),
+            Stat("Pace/Speed", *_split_unit(format_speed_or_pace(leg.sport, leg.avg_speed_mps))),
+            Stat("HR", format_hr(leg.avg_hr), "bpm" if leg.avg_hr else "", "red" if leg.avg_hr else ""),
+        ]
+        if leg.avg_power:
+            stats.append(Stat("Power", *_split_unit(format_power(leg.avg_power)), "magenta"))
+        out.append((name, leg.sport, stats))
+    return out
+
+
+def interval_stats(laps: list[Lap], activity_sport: str) -> list[Stat]:
+    marked = [lap for lap in laps if lap.is_interval]
+    if not marked:
+        return []
+    total_distance = sum(lap.distance_m for lap in marked)
+    total_duration = sum(lap.duration_s for lap in marked)
+    sport = common_sport(marked, activity_sport)
+
+    def weighted(attr: str) -> float | None:
+        samples = [(getattr(lap, attr), lap.duration_s) for lap in marked if getattr(lap, attr) is not None]
+        total = sum(d for _, d in samples)
+        return sum(v * d for v, d in samples) / total if total else None
+
+    hr, power = weighted("avg_hr"), weighted("avg_power")
+    return [
+        Stat("Intervals", str(len(marked)), "", "accent"),
+        Stat("Distance", *_split_unit(format_lap_distance(sport, total_distance))),
+        Stat("Time", format_duration(total_duration)),
+        Stat("Avg", *_split_unit(format_speed_or_pace(sport, total_distance / total_duration if total_duration else None)), "green"),
+        Stat("Avg HR", format_hr(round(hr) if hr is not None else None), "bpm" if hr else "", "red" if hr else ""),
+        Stat("Avg power", *_split_unit(format_power(power)), "magenta" if power else ""),
+    ]
+
+
+def form_color(tsb: float) -> tuple[str, str]:
+    """(colour, wording) for a TSB value, along the usual Performance Management Chart bands."""
+    if tsb > 15:
+        return "cyan", "very fresh"
+    if tsb > 5:
+        return "green", "fresh"
+    if tsb >= -10:
+        return "", "neutral"
+    if tsb >= -30:
+        return "yellow", "productive load"
+    return "red", "overreaching risk"
+
+
+def week_load_stats(view: services.TrainingWeekView) -> list[Stat]:
+    """CTL / ATL / TSB tiles: today's value, with the week-end projection as a hint."""
+    today, end = view.today_point, view.week_end_point
+    projected = end is not None and end.day > date.today()
+    end_label = "week end (plan)" if projected else "week end"
+
+    def hint(value) -> str:
+        return f"→ {round(value):+d} {end_label}" if value is not None else ""
+
+    if today is None:
+        return [Stat("Fitness (CTL)", "–"), Stat("Fatigue (ATL)", "–"), Stat("Form (TSB)", "–")]
+    color, wording = form_color(today.tsb)
+    return [
+        Stat("Fitness (CTL)", str(round(today.ctl)), "", "accent", f"→ {round(end.ctl)} {end_label}" if end else ""),
+        Stat("Fatigue (ATL)", str(round(today.atl)), "", "magenta", f"→ {round(end.atl)} {end_label}" if end else ""),
+        Stat("Form (TSB)", f"{round(today.tsb):+d}", wording, color, hint(end.tsb if end else None)),
+    ]
+
+
+def week_tss_parts(view: services.TrainingWeekView) -> dict[str, int]:
+    """Rounded TSS done / remaining / missed, for a stacked progress bar."""
+    w = view.week
+    return {"done": round_tss(w.done_tss), "remaining": round_tss(w.remaining_tss), "missed": round_tss(w.missed_tss)}

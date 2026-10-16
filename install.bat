@@ -16,6 +16,6 @@ if not exist ".venv" (
 
 call .venv\Scripts\activate.bat
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r src\requirements.txt
 
 echo Done. Run run.bat to start the app.

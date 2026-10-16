@@ -25,6 +25,7 @@ class LapRow:
     values: tuple[str, ...]
     kind: str  # "interval" (marked lap), "plain" (unmarked lap) or "phase" (split of an interval)
     lap_position: int | None  # index into LapsSession.current_laps; None for phase rows
+    lap: Lap  # the lap (or phase split) this row shows
 
 
 class LapsSession:
@@ -68,15 +69,21 @@ class LapsSession:
                 display.lap_row(lap, str(lap.lap_index), self.activity.sport, self.multisport, precise=lap.is_interval),
                 "interval" if lap.is_interval else "plain",
                 position,
+                lap,
             ))
             for phase_number, phase in enumerate(self.interval_splits.get(lap.lap_index, []), start=1):
                 rows.append(LapRow(
                     display.lap_row(phase, f"  {lap.lap_index}.{phase_number}", self.activity.sport, self.multisport, precise=True),
                     "phase",
                     None,
+                    phase,
                 ))
         self._rows = rows
         return rows
+
+    def row_lap(self, row_index: int) -> Lap | None:
+        """The lap (or phase split) shown in a displayed row."""
+        return self._rows[row_index].lap if 0 <= row_index < len(self._rows) else None
 
     def marked_laps(self) -> list[Lap]:
         return [lap for lap in self.current_laps if lap.is_interval]

@@ -9,4 +9,4 @@ if not exist ".venv" (
 )
 
 call .venv\Scripts\activate.bat
-python web.py %*
+python src\web.py %*
