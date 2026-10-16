@@ -8,7 +8,8 @@ account had (see POOL_LENGTH_UNIT).
 """
 
 import json
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 import jsonschema
 
@@ -45,6 +46,75 @@ POOL_LENGTH_UNIT = {"unitId": 1, "unitKey": "meter", "factor": 100.0}
 
 class WorkoutError(ValueError):
     pass
+
+
+# A week's plan is a handful of small JSON files; anything far beyond that is not a plan.
+MAX_ARCHIVE_MEMBERS = 100
+MAX_MEMBER_BYTES = 1_000_000
+
+
+def extract_archive(zip_path: Path, dest_dir: Path) -> list[str]:
+    """Extract the workout JSON files from a week's zip into `dest_dir`; returns the names of
+    members that were ignored (non-JSON files, macOS metadata).
+
+    The archive comes from another agent, so extraction is deliberately narrow: only `.json`
+    members, written under their bare file name (any folders inside the zip are flattened,
+    which also makes "../" path escapes impossible), with count and size limits checked
+    against the bytes actually read rather than the sizes the zip headers claim. The whole
+    archive is read and checked before anything is written, so a bad archive leaves the
+    previous extraction untouched. Re-extracting replaces only the folder's .json files.
+    """
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile as e:
+        raise WorkoutError(f"{zip_path.name}: not a valid zip archive ({e})") from e
+
+    files: dict[str, bytes] = {}
+    ignored: list[str] = []
+    with archive:
+        members = [info for info in archive.infolist() if not info.is_dir()]
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise WorkoutError(f"{zip_path.name}: {len(members)} files, more than the {MAX_ARCHIVE_MEMBERS} allowed")
+        for info in members:
+            name = PurePosixPath(info.filename.replace("\\", "/")).name
+            if "__MACOSX" in info.filename or name.startswith(".") or not name.lower().endswith(".json"):
+                ignored.append(info.filename)
+                continue
+            with archive.open(info) as member:
+                data = member.read(MAX_MEMBER_BYTES + 1)
+            if len(data) > MAX_MEMBER_BYTES:
+                raise WorkoutError(f"{zip_path.name}: {info.filename} is larger than {MAX_MEMBER_BYTES} bytes")
+            if name in files:
+                raise WorkoutError(f"{zip_path.name}: two files are named {name}")
+            files[name] = data
+
+    if not files:
+        raise WorkoutError(f"{zip_path.name}: no .json workout files inside")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for stale in dest_dir.glob("*.json"):
+        stale.unlink()
+    for name, data in files.items():
+        (dest_dir / name).write_bytes(data)
+    return ignored
+
+
+def extract_new_archives(workouts_dir: Path) -> list[str]:
+    """Extract every `<week>.zip` in `workouts_dir` into `workouts_dir/<week>/`, but only when
+    that folder doesn't exist yet or the zip is newer than it (a re-delivered plan). Returns
+    one message per extraction or failure, for showing to the user."""
+    messages = []
+    for zip_path in sorted(workouts_dir.glob("*.zip")):
+        dest_dir = workouts_dir / zip_path.stem
+        if dest_dir.exists() and dest_dir.stat().st_mtime >= zip_path.stat().st_mtime:
+            continue
+        try:
+            ignored = extract_archive(zip_path, dest_dir)
+        except WorkoutError as e:
+            messages.append(str(e))
+            continue
+        note = f" (ignored: {', '.join(ignored)})" if ignored else ""
+        messages.append(f"Unpacked {zip_path.name} into {dest_dir.name}/{note}")
+    return messages
 
 
 def _load_schema() -> dict:

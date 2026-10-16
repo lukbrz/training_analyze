@@ -4,6 +4,7 @@ import subprocess
 import uuid
 from collections import Counter
 from datetime import date, timedelta
+from pathlib import Path
 
 from rich.text import Text
 from textual import work
@@ -11,7 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Select, Static
 from textual_plotext import PlotextPlot
 
@@ -1416,9 +1417,70 @@ class RouteActivitiesScreen(Screen):
         self.app.pop_screen()
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """A yes/no dialog; dismisses with True only on an explicit confirm."""
+
+    CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+
+    #confirm_box {
+        width: 90;
+        max-width: 95%;
+        height: auto;
+        max-height: 90%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #confirm_buttons {
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+        Binding("y", "confirm", "Yes"),
+        Binding("n", "cancel", "No"),
+    ]
+
+    def __init__(self, prompt_text: str, confirm_label: str) -> None:
+        super().__init__()
+        self.prompt_text = prompt_text
+        self.confirm_label = confirm_label
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static(self.prompt_text),
+            HorizontalGroup(
+                Button(f"{self.confirm_label} (y)", id="confirm_yes", variant="primary"),
+                Button("Cancel (n)", id="confirm_no"),
+                id="confirm_buttons",
+            ),
+            id="confirm_box",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm_yes")
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class WorkoutsScreen(Screen):
     """Workout JSON files in storage.WORKOUTS_DIR (written by hand or by another agent against
-    workout_schema.json): validate, preview, and upload them to Garmin Connect."""
+    workout_schema.json): validate, preview, and upload them to Garmin Connect.
+
+    Loose files sit at the top. A week's plan delivered as `<week>.zip` is unpacked into
+    `<week>/` (see workouts.extract_new_archives) and listed as a group that can be uploaded
+    in one go with U. Rows are keyed by path relative to WORKOUTS_DIR ("week/file.json"),
+    which is also the key in the uploaded-workouts ledger; week header rows are "week:<dir>".
+    """
 
     CSS = """
     #workouts_table {
@@ -1434,17 +1496,21 @@ class WorkoutsScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
-        Binding("u", "upload", "Upload to Garmin"),
+        Binding("u", "upload", "Upload workout"),
+        Binding("U", "upload_week", "Upload week"),
         Binding("r", "refresh", "Refresh"),
     ]
 
-    COLUMNS = ("File", "Name", "Sport", "Status", "Uploaded")
+    COLUMNS = ("File", "Date", "Name", "Sport", "Status", "Uploaded")
+    WEEK_KEY_PREFIX = "week:"
 
     def __init__(self, client) -> None:
         super().__init__()
         self.client = client
-        # file name -> validated workout dict, or the validation error text
+        # relative path -> validated workout dict, or the validation error text
         self.entries: dict[str, dict | str] = {}
+        # week folder name -> relative paths of its workouts, in date order
+        self.week_dirs: dict[str, list[str]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1460,71 +1526,202 @@ class WorkoutsScreen(Screen):
         self.action_refresh()
         table.focus()
 
+    def _load_entry(self, path: Path) -> dict | str:
+        try:
+            return workouts.load(path)
+        except workouts.WorkoutError as e:
+            return str(e)
+
+    def _entry_cells(self, key: str, label: str, uploaded: dict[str, int]) -> tuple:
+        entry = self.entries[key]
+        uploaded_id = uploaded.get(key)
+        if isinstance(entry, dict):
+            return (label, entry.get("schedule_date", ""), entry["name"], entry["sport"], "OK",
+                    str(uploaded_id) if uploaded_id else "")
+        return (label, "", "–", "–", Text("invalid", style="red"), str(uploaded_id) if uploaded_id else "")
+
     def action_refresh(self) -> None:
-        storage.WORKOUTS_DIR.mkdir(parents=True, exist_ok=True)
+        root = storage.WORKOUTS_DIR
+        root.mkdir(parents=True, exist_ok=True)
+        for message in workouts.extract_new_archives(root):
+            self.notify(message, severity="error" if "Unpacked" not in message else "information")
+
         uploaded = storage.load_uploaded_workouts()
+        previous_key = self._selected_key()
         self.entries = {}
+        self.week_dirs = {}
         table = self.query_one(DataTable)
         table.clear()
-        for path in sorted(storage.WORKOUTS_DIR.glob("*.json")):
-            try:
-                entry = workouts.load(path)
-                name, sport, status = entry["name"], entry["sport"], "OK"
-            except workouts.WorkoutError as e:
-                entry = str(e)
-                name, sport, status = "–", "–", Text("invalid", style="red")
-            self.entries[path.name] = entry
-            uploaded_id = uploaded.get(path.name)
-            table.add_row(path.name, name, sport, status, str(uploaded_id) if uploaded_id else "", key=path.name)
-        self.query_one("#workouts_status", Static).update(
-            f"{len(self.entries)} workout file(s) in {storage.WORKOUTS_DIR}"
-        )
-        self._show_preview(self._selected_file())
 
-    def _selected_file(self) -> str | None:
+        for path in sorted(root.glob("*.json")):
+            self.entries[path.name] = self._load_entry(path)
+            table.add_row(*self._entry_cells(path.name, path.name, uploaded), key=path.name)
+
+        for week_dir in sorted(d for d in root.iterdir() if d.is_dir()):
+            keys = []
+            for path in week_dir.glob("*.json"):
+                key = f"{week_dir.name}/{path.name}"
+                self.entries[key] = self._load_entry(path)
+                keys.append(key)
+            if not keys:
+                continue
+            keys.sort(key=lambda k: (self._date_of(k), k))
+            self.week_dirs[week_dir.name] = keys
+
+            dates = [d for d in (self._date_of(k) for k in keys) if d]
+            invalid = sum(not isinstance(self.entries[k], dict) for k in keys)
+            done = sum(k in uploaded for k in keys)
+            bold = "bold"
+            table.add_row(
+                Text(f"▾ {week_dir.name}", style=bold),
+                Text(f"{dates[0]} – {dates[-1]}" if dates else "", style=bold),
+                Text(f"{len(keys)} workouts", style=bold),
+                "",
+                Text(f"{invalid} invalid", style="bold red") if invalid else Text("OK", style=bold),
+                Text(f"{done}/{len(keys)}", style=bold),
+                key=f"{self.WEEK_KEY_PREFIX}{week_dir.name}",
+            )
+            for key in keys:
+                table.add_row(*self._entry_cells(key, f"  {key.split('/', 1)[1]}", uploaded), key=key)
+
+        self.query_one("#workouts_status", Static).update(
+            f"{len(self.entries)} workout(s), {len(self.week_dirs)} week plan(s) in {root}"
+        )
+        if previous_key in table.rows:
+            table.move_cursor(row=table.get_row_index(previous_key))
+        self._show_preview(self._selected_key())
+
+    def _date_of(self, key: str) -> str:
+        entry = self.entries.get(key)
+        return entry.get("schedule_date", "") if isinstance(entry, dict) else ""
+
+    def _selected_key(self) -> str | None:
         table = self.query_one(DataTable)
         if not table.row_count or table.cursor_row is None:
             return None
         return table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value
 
+    def _week_of(self, key: str | None) -> str | None:
+        """The week folder a row belongs to (its header row or one of its workouts)."""
+        if key is None:
+            return None
+        if key.startswith(self.WEEK_KEY_PREFIX):
+            return key[len(self.WEEK_KEY_PREFIX):]
+        return key.split("/", 1)[0] if "/" in key else None
+
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         self._show_preview(event.row_key.value if event.row_key else None)
 
-    def _show_preview(self, file_name: str | None) -> None:
+    def _show_preview(self, key: str | None) -> None:
         preview = self.query_one("#workout_preview", Static)
-        entry = self.entries.get(file_name) if file_name else None
+        if key is not None and key.startswith(self.WEEK_KEY_PREFIX):
+            uploaded = storage.load_uploaded_workouts()
+            lines = [f"Week plan {self._week_of(key)} — press U to upload the whole week", ""]
+            for member in self.week_dirs.get(self._week_of(key), []):
+                entry = self.entries[member]
+                mark = "✓ uploaded" if member in uploaded else ""
+                if isinstance(entry, dict):
+                    lines.append(f"{entry.get('schedule_date', '          ')}  {workouts.describe(entry)[0]}  {mark}")
+                else:
+                    lines.append(f"{member}: INVALID")
+            preview.update("\n".join(lines))
+            return
+        entry = self.entries.get(key) if key else None
         if entry is None:
-            preview.update("Put workout .json files in the folder above (see workout_schema.json), then press r.")
+            preview.update(
+                "Put workout .json files, or a week's plan as a .zip of them, in the folder above "
+                "(see workout_schema.json), then press r."
+            )
         elif isinstance(entry, str):
             preview.update(Text(f"Validation errors:\n{entry}", style="red"))
         else:
             preview.update("\n".join(workouts.describe(entry)))
 
     def action_upload(self) -> None:
-        file_name = self._selected_file()
-        entry = self.entries.get(file_name) if file_name else None
+        key = self._selected_key()
+        if key is not None and key.startswith(self.WEEK_KEY_PREFIX):
+            self.notify("This is a week — press U to upload all of it, or select one workout", severity="warning")
+            return
+        entry = self.entries.get(key) if key else None
         if not isinstance(entry, dict):
             self.notify("Select a valid workout to upload", severity="warning")
             return
-        if file_name in storage.load_uploaded_workouts():
+        if key in storage.load_uploaded_workouts():
             self.notify("Already uploaded — uploading again creates a second copy in Garmin", severity="warning")
-        self.notify(f"Uploading {entry['name']}...")
-        self._upload_workout(file_name, entry)
+        self._upload_many([(key, entry)])
 
-    @work(thread=True)
-    def _upload_workout(self, file_name: str, entry: dict) -> None:
-        try:
-            workout_id = garmin_client.upload_workout(self.client, workouts.to_garmin(entry))
-            if entry.get("schedule_date"):
-                garmin_client.schedule_workout(self.client, workout_id, entry["schedule_date"])
-        except Exception as e:  # surface any API rejection (e.g. a malformed DTO) to the user
-            self.app.call_from_thread(self.notify, f"Upload failed: {e}", severity="error")
+    def action_upload_week(self) -> None:
+        week = self._week_of(self._selected_key())
+        if week is None or week not in self.week_dirs:
+            self.notify("Select a week plan (or one of its workouts) to upload the week", severity="warning")
+            return
+        keys = self.week_dirs[week]
+        invalid = [k for k in keys if not isinstance(self.entries[k], dict)]
+        if invalid:
+            self.notify(
+                f"{len(invalid)} workout(s) in {week} are invalid — fix or remove them first: "
+                + ", ".join(k.split("/", 1)[1] for k in invalid),
+                severity="error",
+            )
             return
         uploaded = storage.load_uploaded_workouts()
-        uploaded[file_name] = workout_id
+        pending = [k for k in keys if k not in uploaded]
+        if not pending:
+            self.notify(f"Everything in {week} is already uploaded")
+            return
+
+        today = date.today().isoformat()
+        lines = [f"Upload {len(pending)} workout(s) from {week} to Garmin Connect and schedule them?", ""]
+        for key in keys:
+            entry = self.entries[key]
+            when = entry.get("schedule_date") or "not scheduled"
+            note = "  (already uploaded — skipped)" if key in uploaded else ""
+            if key not in uploaded and entry.get("schedule_date") and entry["schedule_date"] < today:
+                note = "  ⚠ date is in the past"
+            lines.append(f"  {when:<13} {entry['name']} [{entry['sport']}]{note}")
+        self.app.push_screen(
+            ConfirmScreen("\n".join(lines), "Upload"),
+            lambda confirmed: self._upload_many([(k, self.entries[k]) for k in pending]) if confirmed else None,
+        )
+
+    def _upload_one(self, key: str, entry: dict) -> str:
+        """Create one workout in Garmin, record it in the ledger, then schedule it. Returns a
+        warning when the workout was created but scheduling failed. The ledger is written
+        before scheduling on purpose: an unrecorded upload would get uploaded again on retry,
+        leaving a duplicate workout in Garmin."""
+        workout_id = garmin_client.upload_workout(self.client, workouts.to_garmin(entry))
+        uploaded = storage.load_uploaded_workouts()
+        uploaded[key] = workout_id
         storage.save_uploaded_workouts(uploaded)
-        scheduled = f", scheduled {entry['schedule_date']}" if entry.get("schedule_date") else ""
-        self.app.call_from_thread(self.notify, f"Uploaded {entry['name']} (id {workout_id}){scheduled}")
+        if entry.get("schedule_date"):
+            try:
+                garmin_client.schedule_workout(self.client, workout_id, entry["schedule_date"])
+            except Exception as e:  # the workout exists; only the calendar entry is missing
+                return f"{entry['name']} uploaded but not scheduled: {e}"
+        return ""
+
+    @work(thread=True, exclusive=True, group="workout_upload")
+    def _upload_many(self, items: list[tuple[str, dict]]) -> None:
+        status = self.query_one("#workouts_status", Static)
+        failures, warnings = [], []
+        done = 0
+        for i, (key, entry) in enumerate(items, start=1):
+            self.app.call_from_thread(status.update, f"Uploading {i}/{len(items)}: {entry['name']}...")
+            try:
+                warning = self._upload_one(key, entry)
+            except Exception as e:  # surface any API rejection (e.g. a malformed DTO) and carry on
+                failures.append(f"{entry['name']}: {e}")
+                continue
+            done += 1
+            if warning:
+                warnings.append(warning)
+
+        for message in failures:
+            self.app.call_from_thread(self.notify, f"Upload failed — {message}", severity="error", timeout=15)
+        for message in warnings:
+            self.app.call_from_thread(self.notify, message, severity="warning", timeout=15)
+        if done:
+            self.app.call_from_thread(self.notify, f"Uploaded {done} of {len(items)} workout(s) to Garmin Connect")
         self.app.call_from_thread(self.action_refresh)
 
     def action_back(self) -> None:
