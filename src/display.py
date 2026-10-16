@@ -234,18 +234,86 @@ def bin_label(start: float, width: float, base_width: float, edge_fmt) -> str:
 
 
 MAX_HISTOGRAM_BINS = 12
+# Below this many values, every value gets a regular bin (outlier fences need a real spread).
+MIN_VALUES_FOR_OUTLIER_BINS = 8
 
 
-def phase_histograms(phases: list[Lap], activity_sport: str) -> list[tuple[str, list[tuple[str, int]]]]:
-    """The three phase histograms (duration, pace/speed, power) as (title, [(label, count)])."""
+@dataclass
+class HistogramBar:
+    label: str
+    count: int
+    outlier: bool = False  # an edge bar collecting values beyond the Tukey fences
+
+
+def _tukey_fences(values: list[float]) -> tuple[float, float]:
+    """The usual box-plot fences, Q1 - 1.5*IQR .. Q3 + 1.5*IQR, clamped to the data. Values
+    beyond them — e.g. a 100 m split that includes an aid-station stop — are what stretch a
+    histogram until every normal value lands in one or two bars."""
+    ordered = sorted(values)
+    if len(ordered) < MIN_VALUES_FOR_OUTLIER_BINS:
+        return ordered[0], ordered[-1]
+
+    def quantile(q: float) -> float:
+        position = q * (len(ordered) - 1)
+        low = int(position)
+        high = min(low + 1, len(ordered) - 1)
+        return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+    q1, q3 = quantile(0.25), quantile(0.75)
+    iqr = q3 - q1
+    return max(ordered[0], q1 - 1.5 * iqr), min(ordered[-1], q3 + 1.5 * iqr)
+
+
+def robust_histogram(values: list[float], base_width: float, edge_fmt) -> tuple[float, list[HistogramBar]]:
+    """(bin width, bars): up to MAX_HISTOGRAM_BINS regular bars spanning the bulk of the
+    values (inside the Tukey fences), plus "<x" / "≥y" edge bars counting the outliers, so a
+    few extreme values can't flatten the rest of the distribution. Edge bars are only used
+    when the outliers would otherwise force wider bins."""
+    if not values:
+        return base_width, []
+    low, high = _tukey_fences(values)
+    width = adaptive_bin_width([low, high], base_width, MAX_HISTOGRAM_BINS)
+    if adaptive_bin_width(values, base_width, MAX_HISTOGRAM_BINS) == width:
+        # Every value already fits at this resolution: nothing to gain from edge bars, and
+        # a genuinely slow rep shouldn't be lumped in with pauses.
+        low, high = min(values), max(values)
+    first, last = math.floor(low / width), math.floor(high / width)
+    counts = Counter(math.floor(v / width) for v in values)
+    below = sum(n for i, n in counts.items() if i < first)
+    above = sum(n for i, n in counts.items() if i > last)
+    bars = [HistogramBar(f"<{edge_fmt(first * width)}", below, True)] if below else []
+    bars += [HistogramBar(bin_label(i * width, width, base_width, edge_fmt), counts.get(i, 0)) for i in range(first, last + 1)]
+    if above:
+        bars.append(HistogramBar(f"≥{edge_fmt((last + 1) * width)}", above, True))
+    return width, bars
+
+
+def histograms_tsv(histograms: dict[str, list[HistogramBar]]) -> str:
+    """Histogram data as tab-separated text, for every front end's "copy"."""
+    return tsv(("Chart", "Bin", "Phases"), [(title, bar.label, bar.count) for title, bars in histograms.items() for bar in bars])
+
+
+def count_tick_step(top: int, max_ticks: int = 6) -> int:
+    """A "nice" whole-number step (1, 2, 5, 10, 20, 25, 50, 100, ...) giving at most
+    `max_ticks` intervals on a count axis: counts are integers, so ticks must be too."""
+    magnitude = 1
+    while True:
+        for factor in (1, 2, 2.5, 5):
+            step = factor * magnitude
+            if step == int(step) and top / step <= max_ticks:
+                return int(step)
+        magnitude *= 10
+
+
+def phase_histograms(phases: list[Lap], activity_sport: str) -> list[tuple[str, list[HistogramBar]]]:
+    """The three phase histograms (duration, pace/speed, power) as (title, bars)."""
     sport = common_sport(phases, activity_sport)
 
     def build(values, base_width, edge_fmt, unit_suffix, title):
-        width = adaptive_bin_width(values, base_width, MAX_HISTOGRAM_BINS)
-        bins = histogram_bins(values, width)
-        return f"{title} ({int(width)}{unit_suffix} bins)", [
-            (bin_label(start, width, base_width, edge_fmt), count) for start, count in bins
-        ]
+        width, bars = robust_histogram(values, base_width, edge_fmt)
+        outliers = sum(b.count for b in bars if b.outlier)
+        note = f", {outliers} outlier{'s' if outliers != 1 else ''} in edge bars" if outliers else ""
+        return f"{title} ({int(width)}{unit_suffix} bins{note})", bars
 
     out = [build([p.duration_s for p in phases], 1.0, lambda v: f"{int(round(v))}s", "s", "Duration histogram")]
     if sport in SWIM_SPORTS:

@@ -3,6 +3,7 @@ base class that mirrors a Textual Screen (title, key bindings shown in a footer)
 and chart helpers. The GUI deliberately mirrors the TUI's screens and keys one to one; all
 behaviour lives in the shared modules (services, laps_session, workout_library, display)."""
 
+import math
 import threading
 import traceback
 from collections.abc import Callable
@@ -10,12 +11,12 @@ from datetime import date
 
 from PySide6.QtCharts import (
     QBarCategoryAxis,
-    QBarSeries,
     QBarSet,
     QChart,
     QChartView,
     QDateTimeAxis,
     QLineSeries,
+    QStackedBarSeries,
     QValueAxis,
 )
 from PySide6.QtCore import QDate, QDateTime, QMargins, QObject, QPointF, QRectF, Qt, QTime, Signal, Slot
@@ -333,26 +334,29 @@ def plot_lines(
         axis.setLabelFormat("%.0f")
 
 
-def plot_bars(chart: QChart, title: str, rows: list[tuple[str, int]], color: str, y_title: str = "") -> None:
-    reset_chart(chart, title if rows else f"{title} — no data")
+def plot_bars(chart: QChart, title: str, bars, color: str, y_title: str = "") -> None:
+    """A histogram from display.HistogramBar items; outlier edge bars are drawn grey."""
+    reset_chart(chart, title if bars else f"{title} — no data")
     chart.legend().setVisible(False)
-    if not rows:
+    if not bars:
         return
-    bar_set = QBarSet("count")
-    bar_set.append([float(count) for _, count in rows])
-    bar_set.setColor(QColor(color))
-    bar_set.setBorderColor(QColor(color))
-    series = QBarSeries()
-    series.append(bar_set)
+    series = QStackedBarSeries()  # two stacked sets: regular counts, and grey outlier counts
+    for outlier, bar_color in ((False, color), (True, COLORS["comment"])):
+        bar_set = QBarSet("outliers" if outlier else "count")
+        bar_set.append([float(bar.count if bar.outlier == outlier else 0) for bar in bars])
+        bar_set.setColor(QColor(bar_color))
+        bar_set.setBorderColor(QColor(bar_color))
+        series.append(bar_set)
     series.setBarWidth(0.85)
     chart.addSeries(series)
     x_axis = QBarCategoryAxis()
-    x_axis.append([label for label, _ in rows])
+    x_axis.append([bar.label for bar in bars])
     y_axis = QValueAxis()
-    top = max(count for _, count in rows)
-    # Counts are whole numbers: integer labels and one tick per count.
-    y_axis.setRange(0, top)
-    y_axis.setTickCount(top + 1 if top <= 12 else 7)
+    top = max(bar.count for bar in bars)
+    # Counts are whole numbers: integer labels on a whole-number tick step.
+    step = display.count_tick_step(top)
+    y_axis.setRange(0, step * math.ceil(top / step))
+    y_axis.setTickCount(math.ceil(top / step) + 1)
     y_axis.setLabelFormat("%d")
     y_axis.setTitleText(y_title)
     for axis, align in ((x_axis, Qt.AlignmentFlag.AlignBottom), (y_axis, Qt.AlignmentFlag.AlignLeft)):

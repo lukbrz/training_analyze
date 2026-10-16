@@ -717,7 +717,7 @@ class PhaseMetricsScreen(Screen):
         self.activity = activity
         self.phases = phases
         # chart title -> [(bin label, count)], as last drawn — for copying to the clipboard
-        self.histogram_data: dict[str, list[tuple[str, int]]] = {}
+        self.histogram_data: dict[str, list[display.HistogramBar]] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -741,20 +741,21 @@ class PhaseMetricsScreen(Screen):
             plt = plot.plt
             plt.clear_data()
             if rows:
-                counts = [count for _, count in rows]
-                plt.bar([label for label, _ in rows], counts)
+                counts = [bar.count for bar in rows]
+                # Outlier edge bars ("<x" / "≥y") in grey, the regular ones in the theme colour.
+                plt.bar([bar.label for bar in rows], [0 if bar.outlier else bar.count for bar in rows], color=_rgb("accent"))
+                if any(bar.outlier for bar in rows):
+                    plt.bar([bar.label for bar in rows], [bar.count if bar.outlier else 0 for bar in rows], color=_rgb("comment"))
                 # A phase count is always a whole number — without this plotext picks
                 # fractional y-axis ticks (e.g. 0.00, 0.67, 1.33) to fill the plot height.
-                plt.yticks(range(0, max(counts) + 1))
+                top = max(counts)
+                plt.yticks(range(0, top + 1, display.count_tick_step(top)))
             plt.title(title if rows else f"{title} — no data")
             plt.ylabel("Phases")
             plot.refresh()
 
     def action_copy(self) -> None:
-        lines = ["Chart\tBin\tPhases"]
-        for chart, rows in self.histogram_data.items():
-            lines.extend(f"{chart}\t{label}\t{count}" for label, count in rows)
-        _copy_to_clipboard(self, "\n".join(lines), f"{len(self.histogram_data)} histograms")
+        _copy_to_clipboard(self, display.histograms_tsv(self.histogram_data), f"{len(self.histogram_data)} histograms")
 
     def action_back(self) -> None:
         self.app.pop_screen()

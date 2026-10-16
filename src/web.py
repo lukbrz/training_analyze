@@ -338,9 +338,12 @@ def laps_page(activity_id: str) -> None:
             for (title, rows), color in zip(histograms, (COLORS["accent"], COLORS["green"], COLORS["magenta"])):
                 ui.echart({
                     **ECHART_BASE, "title": {"text": title, "left": "center", "textStyle": {"color": COLORS["fg"], "fontSize": 13}},
-                    "xAxis": axis_style(type="category", data=[label for label, _ in rows]),
+                    "xAxis": axis_style(type="category", data=[bar.label for bar in rows]),
                     "yAxis": axis_style(type="value", minInterval=1, name="Phases"),
-                    "series": [{"type": "bar", "data": [count for _, count in rows], "itemStyle": {"color": color, "borderRadius": [4, 4, 0, 0]}}],
+                    # Outlier edge bars ("<x" / "≥y") in grey, the regular ones in the chart colour.
+                    "series": [{"type": "bar", "data": [
+                        {"value": bar.count, "itemStyle": {"color": COLORS["comment"] if bar.outlier else color}} for bar in rows
+                    ], "itemStyle": {"borderRadius": [4, 4, 0, 0]}}],
                 }).classes("w-full").style("height: 30vh")
 
     def draw_compare(mode: str | None = None) -> None:

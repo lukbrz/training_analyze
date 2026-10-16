@@ -576,10 +576,7 @@ class PhaseMetricsPage(Page):
         self.bind("y", "Copy data", self.copy)
 
     def copy(self) -> None:
-        lines = ["Chart\tBin\tPhases"]
-        for chart, rows in self.histogram_data.items():
-            lines.extend(f"{chart}\t{bin_label}\t{count}" for bin_label, count in rows)
-        copy_text(self, "\n".join(lines), f"{len(self.histogram_data)} histograms")
+        copy_text(self, display.histograms_tsv(self.histogram_data), f"{len(self.histogram_data)} histograms")
 
 
 # --- Routes --------------------------------------------------------------------------
