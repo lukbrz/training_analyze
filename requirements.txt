@@ -3,3 +3,5 @@ garminconnect>=0.3.8,<0.4
 python-fitparse
 textual-plotext==1.0.1
 jsonschema
+textual-serve
+PySide6

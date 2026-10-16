@@ -133,6 +133,63 @@ def get_power_zones(garmin: Garmin, activity_id: str) -> list[ZoneTime]:
     return _parse_zone_response(garmin.get_activity_power_in_timezones(activity_id))
 
 
+STAT_FIELDS = ("trainingStressScore", "normPower", "intensityFactor", "avgPower", "averageHR")
+
+
+def activity_stats(garmin: Garmin, start_date: str, end_date: str) -> dict[str, dict]:
+    """Per-activity load fields from Garmin's activity list (normalized power, and Garmin's
+    own TSS when it computed one) — values the local FIT summary doesn't carry. Keyed by
+    activity id; one paginated list call, no per-activity requests."""
+    return {
+        str(raw["activityId"]): {key: raw.get(key) for key in STAT_FIELDS}
+        for raw in garmin.get_activities_by_date(start_date, end_date, sortorder="asc")
+    }
+
+
+def get_thresholds(garmin: Garmin) -> dict:
+    """The athlete's current thresholds as configured/detected in Garmin Connect. Fields that
+    can't be fetched are simply left out (training_load falls back gracefully)."""
+    out: dict = {}
+    try:
+        ftp = garmin.get_cycling_ftp()
+        if isinstance(ftp, dict) and ftp.get("functionalThresholdPower"):
+            out["ftp_cycling_w"] = float(ftp["functionalThresholdPower"])
+    except Exception:  # optional data: a missing endpoint/field must not break the screen
+        pass
+    try:
+        lt = garmin.get_lactate_threshold()
+        hr_speed = lt.get("speed_and_heart_rate") or {}
+        if hr_speed.get("heartRate"):
+            out["lthr_running"] = float(hr_speed["heartRate"])
+        if hr_speed.get("heartRateCycling"):
+            out["lthr_cycling"] = float(hr_speed["heartRateCycling"])
+        if hr_speed.get("speed"):
+            # Garmin reports lactate-threshold speed in units of 10 m/s (0.3778 = 3.778 m/s,
+            # i.e. 4:25/km — consistent with the athlete's threshold HR and race paces).
+            out["threshold_speed_running_mps"] = float(hr_speed["speed"]) * 10
+        power = lt.get("power") or {}
+        if power.get("sport") == "RUNNING" and power.get("functionalThresholdPower"):
+            out["ftp_running_w"] = float(power["functionalThresholdPower"])
+    except Exception:
+        pass
+    try:
+        for zones in garmin.get_heart_rate_zones():
+            if zones.get("sport") == "DEFAULT" and zones.get("lactateThresholdHeartRateUsed"):
+                out["lthr_default"] = float(zones["lactateThresholdHeartRateUsed"])
+    except Exception:
+        pass
+    return out
+
+
+def get_calendar_month(garmin: Garmin, year: int, month: int) -> list[dict]:
+    """Calendar items (planned workouts, completed activities, ...) for one month (1-12)."""
+    return garmin.get_scheduled_workouts(year, month).get("calendarItems", [])
+
+
+def get_workout(garmin: Garmin, workout_id: int) -> dict:
+    return garmin.get_workout_by_id(workout_id)
+
+
 def upload_workout(garmin: Garmin, workout_dto: dict) -> int:
     """Create a workout in Garmin Connect from a DTO (see workouts.to_garmin); returns its id."""
     return int(garmin.upload_workout(workout_dto)["workoutId"])
@@ -153,6 +210,10 @@ __all__ = [
     "get_power_zones",
     "upload_workout",
     "schedule_workout",
+    "activity_stats",
+    "get_thresholds",
+    "get_calendar_month",
+    "get_workout",
     "GarminConnectAuthenticationError",
     "GarminConnectConnectionError",
     "GarminConnectInvalidFileFormatError",

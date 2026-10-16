@@ -303,6 +303,8 @@ def _estimate(steps: list[dict], sport: str, repeat: int = 1) -> tuple[float, fl
 def to_garmin(workout: dict) -> dict:
     sport = workout["sport"]
     seconds, meters = _estimate(workout["steps"], sport)
+    # The agent's own estimate wins: it knows how long lap-button steps are meant to take.
+    seconds = workout.get("estimated_duration_s") or seconds
     dto = {
         "workoutName": workout["name"],
         "description": workout.get("description"),

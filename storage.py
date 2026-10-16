@@ -17,6 +17,11 @@ MERGED_LEDGER_PATH = DATA_DIR / "merged_activities.json"
 SESSION_DIR = BASE_DIR / ".garmin_session"
 WORKOUTS_DIR = BASE_DIR / "workouts"
 UPLOADED_WORKOUTS_PATH = DATA_DIR / "uploaded_workouts.json"
+THRESHOLDS_PATH = DATA_DIR / "thresholds.json"
+THRESHOLDS_OVERRIDE_PATH = DATA_DIR / "thresholds_override.json"
+ACTIVITY_STATS_PATH = DATA_DIR / "activity_stats.json"
+CALENDAR_DIR = DATA_DIR / "calendar"
+WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
 
 
 def _filtered(cls, raw: dict) -> dict:
@@ -179,3 +184,50 @@ def save_zones(
         "power_zones": [dataclasses.asdict(z) for z in power_zones],
     }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _read_json(path: Path, default):
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_thresholds(path: Path = THRESHOLDS_PATH, override_path: Path = THRESHOLDS_OVERRIDE_PATH) -> dict:
+    """Thresholds last fetched from Garmin, with any hand-set values from
+    thresholds_override.json on top (e.g. {"ftp_cycling_w": 280})."""
+    return {**_read_json(path, {}), **_read_json(override_path, {})}
+
+
+def save_thresholds(thresholds: dict, path: Path = THRESHOLDS_PATH) -> None:
+    _write_json(path, thresholds)
+
+
+def load_activity_stats(path: Path = ACTIVITY_STATS_PATH) -> tuple[str | None, dict[str, dict]]:
+    """(date fetched up to, {activity_id: Garmin load fields}) — see garmin_client.activity_stats."""
+    data = _read_json(path, {})
+    return data.get("fetched_until"), data.get("stats", {})
+
+
+def save_activity_stats(fetched_until: str, stats: dict[str, dict], path: Path = ACTIVITY_STATS_PATH) -> None:
+    _write_json(path, {"fetched_until": fetched_until, "stats": stats})
+
+
+def load_calendar_month(year: int, month: int, calendar_dir: Path = CALENDAR_DIR) -> list[dict] | None:
+    return _read_json(calendar_dir / f"{year:04d}-{month:02d}.json", None)
+
+
+def save_calendar_month(year: int, month: int, items: list[dict], calendar_dir: Path = CALENDAR_DIR) -> None:
+    _write_json(calendar_dir / f"{year:04d}-{month:02d}.json", items)
+
+
+def load_cached_workout(workout_id: int, cache_dir: Path = WORKOUT_CACHE_DIR) -> dict | None:
+    return _read_json(cache_dir / f"{workout_id}.json", None)
+
+
+def save_cached_workout(workout_id: int, dto: dict, cache_dir: Path = WORKOUT_CACHE_DIR) -> None:
+    _write_json(cache_dir / f"{workout_id}.json", dto)

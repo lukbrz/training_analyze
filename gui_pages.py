@@ -1,0 +1,732 @@
+"""The Qt GUI's pages — one per TUI screen in screens.py, same layout and same keys. Each is a
+thin shell over the shared logic (services, laps_session, workout_library, display), exactly
+like its Textual counterpart."""
+
+from datetime import date, timedelta
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QComboBox,
+    QHBoxLayout,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+)
+
+import display
+import garmin_client
+import services
+import storage
+import training_load
+import workout_library
+from gui_common import (
+    COLORS,
+    SPORT_COLORS,
+    Page,
+    fill_table,
+    label,
+    make_chart_view,
+    make_table,
+    on_ui,
+    plot_bars,
+    plot_dated_lines,
+    plot_lines,
+    run_background,
+    table_as_tsv,
+)
+from laps_session import LapsError, LapsSession
+from models import ActivitySummary
+from workout_library import LibraryError, WorkoutLibrary
+
+ALL_SPORTS = "__all__"
+
+
+def button(text: str, on_click, primary: bool = False, checkable: bool = False) -> QPushButton:
+    widget = QPushButton(text)
+    widget.setProperty("primary", primary)
+    widget.setCheckable(checkable)
+    widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keep keyboard focus on the table, like the TUI
+    widget.clicked.connect(on_click)
+    return widget
+
+
+def row_layout(*widgets, stretch_index: int | None = None) -> QHBoxLayout:
+    layout = QHBoxLayout()
+    layout.setSpacing(8)
+    for i, widget in enumerate(widgets):
+        layout.addWidget(widget, 1 if i == stretch_index else 0)
+    if stretch_index is None:
+        layout.addStretch(1)
+    return layout
+
+
+def copy_text(page: Page, text: str, what: str) -> None:
+    QApplication.clipboard().setText(text)
+    page.notify(f"Copied {what}")
+
+
+def activity_styles(activities: list[ActivitySummary]) -> list[dict]:
+    return [{"color_columns": {2: SPORT_COLORS.get(a.sport, COLORS["fg"])}} for a in activities]
+
+
+# --- Login -------------------------------------------------------------------------
+
+
+class LoginPage(Page):
+    title = "Log in to Garmin Connect"
+
+    def __init__(self, window) -> None:
+        super().__init__(window)
+        self.mfa_pending = None
+        self.status = label("", "status")
+        self.email = QLineEdit(placeholderText="Email")
+        self.password = QLineEdit(placeholderText="Password", echoMode=QLineEdit.EchoMode.Password)
+        self.mfa = QLineEdit(placeholderText="MFA code")
+        self.mfa.hide()
+        self.login_button = button("Log in", self.submit, primary=True)
+        for widget in (label("Log in to Garmin Connect", "pageTitle"), self.status, self.email, self.password, self.mfa, self.login_button):
+            widget.setMaximumWidth(420)
+            self.layout_.addWidget(widget)
+        self.layout_.addStretch(1)
+        for field in (self.email, self.password, self.mfa):
+            field.returnPressed.connect(self.submit)
+
+    def focus_widget(self):
+        return self.email
+
+    def _set_busy(self, busy: bool, text: str = "") -> None:
+        self.status.setText(text)
+        for widget in (self.email, self.password, self.login_button):
+            widget.setEnabled(not busy)
+        self.mfa.setEnabled(not busy)
+
+    def submit(self) -> None:
+        if self.mfa_pending is not None:
+            code = self.mfa.text().strip()
+            if not code:
+                self.notify("Enter the MFA code", "warning")
+                return
+            self._set_busy(True, "Verifying code...")
+            pending = self.mfa_pending
+            run_background(lambda: garmin_client.complete_mfa(pending, code), self.window_.logged_in, self._failed)
+            return
+        email, password = self.email.text().strip(), self.password.text()
+        if not email or not password:
+            self.notify("Enter email and password", "warning")
+            return
+        self._set_busy(True, "Logging in...")
+        run_background(lambda: garmin_client.begin_login(email, password), self.window_.logged_in, self._failed)
+
+    def _failed(self, error: Exception) -> None:
+        if isinstance(error, garmin_client.MfaRequired):
+            self.mfa_pending = error.garmin
+            self._set_busy(False, "Enter the MFA code sent to your device")
+            self.email.setEnabled(False)
+            self.password.setEnabled(False)
+            self.mfa.show()
+            self.mfa.setFocus()
+            return
+        self._set_busy(False)
+        self.notify(str(error), "error")
+
+
+# --- Activities --------------------------------------------------------------------
+
+
+class MainPage(Page):
+    title = "Activities"
+
+    def __init__(self, window, client) -> None:
+        super().__init__(window)
+        self.client = client
+        self.all_activities: list[ActivitySummary] = []
+        self.shown: list[ActivitySummary] = []
+        self.status = label("", "status")
+        self.sync_button = button("Sync (s)", self.sync, primary=True)
+        self.reprocess_button = button("Reprocess (r)", self.reprocess)
+        self.sport_filter = QComboBox()
+        self.sport_filter.setMinimumWidth(180)
+        self.sport_filter.currentIndexChanged.connect(lambda _: self._render_table())
+        self.table = make_table(display.ACTIVITY_COLUMNS, stretch_column=1)
+        self.table.cellActivated.connect(lambda row, _: self._open(row))
+        self.layout_.addWidget(self.status)
+        self.layout_.addLayout(row_layout(
+            self.sync_button, self.reprocess_button, button("Routes (o)", self.routes),
+            button("Workouts (w)", self.workouts), button("Calendar (c)", self.calendar), self.sport_filter,
+        ))
+        self.layout_.addWidget(self.table, 1)
+        self.bind("s", "Sync", self.sync)
+        self.bind("r", "Reprocess", self.reprocess)
+        self.bind("o", "Routes", self.routes)
+        self.bind("w", "Workouts", self.workouts)
+        self.bind("c", "Calendar & load", self.calendar)
+        self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} activities"))
+        self.refresh_table()
+
+    def focus_widget(self):
+        return self.table
+
+    def refresh_table(self) -> None:
+        _, self.all_activities = storage.load_index()
+        self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
+        current = self.sport_filter.currentData() or ALL_SPORTS
+        sports = sorted({a.sport for a in self.all_activities})
+        self.sport_filter.blockSignals(True)
+        self.sport_filter.clear()
+        self.sport_filter.addItem("All sports", ALL_SPORTS)
+        for sport in sports:
+            self.sport_filter.addItem(sport.title(), sport)
+        index = self.sport_filter.findData(current)
+        self.sport_filter.setCurrentIndex(max(index, 0))
+        self.sport_filter.blockSignals(False)
+        self._render_table()
+
+    def _render_table(self) -> None:
+        sport = self.sport_filter.currentData() or ALL_SPORTS
+        self.shown = sorted(
+            (a for a in self.all_activities if sport == ALL_SPORTS or a.sport == sport),
+            key=lambda a: a.start_time_local, reverse=True,
+        )
+        rows = []
+        for activity in self.shown:
+            route = self.routes_by_id.get(activity.route_id)
+            rows.append(display.activity_row(activity, route.name if route else "–"))
+        fill_table(self.table, rows, activity_styles(self.shown), right_aligned={display.ACTIVITY_DURATION_COLUMN})
+        total, shown = len(self.all_activities), len(self.shown)
+        self.status.setText(f"{shown} activities synced" if shown == total else f"{shown} of {total} activities")
+
+    def _open(self, row: int) -> None:
+        if 0 <= row < len(self.shown):
+            self.window_.push(LapsPage(self.window_, self.shown[row], self.client))
+
+    def _run_job(self, job) -> None:
+        self.sync_button.setEnabled(False)
+        self.reprocess_button.setEnabled(False)
+
+        def done(message: str) -> None:
+            self.sync_button.setEnabled(True)
+            self.reprocess_button.setEnabled(True)
+            self.status.setText(message)
+            self.refresh_table()
+            self.notify(message)
+
+        def failed(error: Exception) -> None:
+            done(f"Failed: {error}")
+
+        run_background(job, done, failed)
+
+    def _progress(self, message: str) -> None:
+        on_ui(self.status.setText, message)
+
+    def sync(self) -> None:
+        if self.client is None:
+            self.notify("Not logged in to Garmin", "warning")
+            return
+        self._run_job(lambda: services.sync_activities(self.client, progress=self._progress))
+
+    def reprocess(self) -> None:
+        self._run_job(lambda: services.reprocess_activities(progress=self._progress))
+
+    def routes(self) -> None:
+        self.window_.push(RoutesPage(self.window_, self.client))
+
+    def workouts(self) -> None:
+        self.window_.push(WorkoutsPage(self.window_, self.client))
+
+    def calendar(self) -> None:
+        self.window_.push(TrainingWeekPage(self.window_, self.client))
+
+    def on_shown(self) -> None:
+        self.refresh_table()
+
+
+# --- Laps ----------------------------------------------------------------------------
+
+
+class LapsPage(Page):
+    STYLE_BY_KIND = {"interval": {"bold": True}, "phase": {"dim": True, "italic": True}, "plain": {}}
+
+    def __init__(self, window, activity: ActivitySummary, client) -> None:
+        super().__init__(window)
+        self.title = activity.name
+        self.activity = activity
+        self.client = client
+        self.session = LapsSession(activity)
+        summary = label(self.session.summary_text(), "card")
+        self.split_input = QLineEdit(placeholderText="400 = metres · 60s / 1m / 1:30 = time")
+        self.split_input.returnPressed.connect(lambda: self._run(lambda: self.session.split(self.split_input.text())))
+        self.filter_button = button("Interval only (f)", self.toggle_filter, checkable=True)
+        self.table = make_table(self.session.columns)
+        self.interval_summary = label("", "status")
+        self.layout_.addWidget(summary)
+        self.layout_.addLayout(row_layout(
+            self.split_input,
+            button("Split", lambda: self._run(lambda: self.session.split(self.split_input.text()))),
+            button("Split intervals (i)", self.split_intervals),
+            self.filter_button,
+            button("Reset", lambda: self._run(self.session.reset)),
+            stretch_index=0,
+        ))
+        self.layout_.addWidget(self.table, 1)
+        self.layout_.addWidget(self.interval_summary)
+        self.bind_back()
+        self.bind("m", "Mark interval", self.toggle_interval)
+        self.bind("z", "Zones", lambda: self.window_.push(ZonesPage(self.window_, activity, client)))
+        self.bind("c", "Compare intervals", self.compare)
+        self.bind("p", "Physical laps", self.physical_laps)
+        self.bind("i", "Split intervals", self.split_intervals)
+        self.bind("f", "Interval-only", self.toggle_filter)
+        self.bind("h", "Phase time/pace/power", self.histograms)
+        self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
+        self._rebuild()
+
+    def focus_widget(self):
+        return self.table
+
+    def _rebuild(self) -> None:
+        rows = self.session.rows()
+        fill_table(
+            self.table, [r.values for r in rows], [self.STYLE_BY_KIND[r.kind] for r in rows],
+            right_aligned={self.session.duration_column},
+        )
+        self.interval_summary.setText(self.session.interval_summary())
+
+    def _run(self, operation) -> bool:
+        try:
+            message = operation()
+        except LapsError as e:
+            self.notify(str(e), "warning")
+            return False
+        self._rebuild()
+        if message:
+            self.notify(message)
+        return True
+
+    def toggle_interval(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self._run(lambda: self.session.toggle_interval(row))
+
+    def split_intervals(self) -> None:
+        self._run(lambda: self.session.split_intervals(self.split_input.text()))
+
+    def toggle_filter(self) -> None:
+        def toggle():
+            warning = self.session.toggle_filter()
+            self.filter_button.setChecked(self.session.show_intervals_only)
+            if warning:
+                self.notify(warning, "warning")
+        self._run(toggle)
+
+    def physical_laps(self) -> None:
+        try:
+            radius = self.session.physical_laps_radius(self.split_input.text())
+        except LapsError as e:
+            self.notify(str(e), "warning")
+            return
+        self.notify("Detecting course loops...")
+        run_background(
+            lambda: self.session.detect_physical_laps(radius),
+            lambda laps: self._run(lambda: self.session.apply_physical_laps(laps)),
+            lambda e: self.notify(f"Loop detection failed: {e}", "error"),
+        )
+
+    def compare(self) -> None:
+        try:
+            marked, records, offset = self.session.compare_inputs()
+        except LapsError as e:
+            self.notify(str(e), "warning")
+            return
+        self.window_.push(ComparePage(self.window_, self.activity, marked, records, offset))
+
+    def histograms(self) -> None:
+        try:
+            phases = self.session.histogram_phases()
+        except LapsError as e:
+            self.notify(str(e), "warning")
+            return
+        self.window_.push(PhaseMetricsPage(self.window_, self.activity, phases))
+
+
+class ZonesPage(Page):
+    def __init__(self, window, activity: ActivitySummary, client) -> None:
+        super().__init__(window)
+        self.title = f"Zones — {activity.name}"
+        self.status = label(self.title, "status")
+        self.hr_table = make_table(display.ZONE_COLUMNS)
+        self.power_table = make_table(display.ZONE_COLUMNS)
+        self.layout_.addWidget(self.status)
+        self.layout_.addWidget(label("Heart Rate", "pageTitle"))
+        self.layout_.addWidget(self.hr_table, 1)
+        self.layout_.addWidget(label("Power", "pageTitle"))
+        self.layout_.addWidget(self.power_table, 1)
+        self.bind_back()
+        cached = storage.load_zones(activity.activity_id)
+        if cached is not None:
+            self._render(cached)
+        elif client is None:
+            self.status.setText("Not logged in — zones aren't cached for this activity")
+        else:
+            self.status.setText("Fetching zones from Garmin Connect...")
+
+            def fetch():
+                hr = garmin_client.get_hr_zones(client, activity.activity_id)
+                power = garmin_client.get_power_zones(client, activity.activity_id)
+                storage.save_zones(activity.activity_id, hr, power)
+                return hr, power
+
+            run_background(fetch, self._render, lambda e: self._error(f"Couldn't fetch zones: {e}"))
+
+    def focus_widget(self):
+        return self.hr_table
+
+    def _render(self, zones) -> None:
+        hr_zones, power_zones = zones
+        self.status.setText(self.title)
+        fill_table(self.hr_table, display.zone_rows(hr_zones))
+        fill_table(self.power_table, display.zone_rows(power_zones))
+
+    def _error(self, message: str) -> None:
+        self.status.setText(message)
+        self.notify(message, "error")
+
+
+class ComparePage(Page):
+    X_MODES = (("Time", "time"), ("Distance", "distance"), ("%", "percent"))
+
+    def __init__(self, window, activity, marked_laps, records, utc_offset) -> None:
+        super().__init__(window)
+        self.title = f"Comparing {len(marked_laps)} intervals — {activity.name}"
+        self.marked_laps, self.records, self.utc_offset = marked_laps, records, utc_offset
+        self.x_mode = "time"
+        self.layout_.addWidget(label(self.title, "status"))
+        group = QButtonGroup(self)
+        buttons = []
+        for text, mode in self.X_MODES:
+            b = button(text, lambda _=False, m=mode: self._set_mode(m), checkable=True)
+            b.setChecked(mode == self.x_mode)
+            group.addButton(b)
+            buttons.append(b)
+        self.layout_.addLayout(row_layout(*buttons))
+        self.charts = []
+        for _ in display.COMPARE_METRICS:
+            view, chart = make_chart_view()
+            chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.layout_.addWidget(view, 1)
+            self.charts.append(chart)
+        self.bind_back()
+        self._redraw()
+
+    def _set_mode(self, mode: str) -> None:
+        self.x_mode = mode
+        self._redraw()
+
+    def _redraw(self) -> None:
+        last = len(self.charts) - 1
+        for i, (chart, (attr, title, scale)) in enumerate(zip(self.charts, display.COMPARE_METRICS)):
+            series = display.compare_series(self.marked_laps, self.records, self.utc_offset, attr, self.x_mode, scale)
+            # Same laps on every chart: one legend (top) and one x-axis title (bottom) are enough,
+            # leaving each plot the height its axis labels need.
+            plot_lines(chart, title, series, display.COMPARE_X_AXIS_LABELS[self.x_mode] if i == last else "", legend=i == 0)
+
+
+class PhaseMetricsPage(Page):
+    COLORS_BY_CHART = (COLORS["accent"], COLORS["green"], COLORS["magenta"])
+
+    def __init__(self, window, activity, phases) -> None:
+        super().__init__(window)
+        self.title = f"Phase time/pace/power — {activity.name}"
+        self.histogram_data = dict(display.phase_histograms(phases, activity.sport))
+        self.layout_.addWidget(label(self.title, "status"))
+        for (title, rows), color in zip(self.histogram_data.items(), self.COLORS_BY_CHART):
+            view, chart = make_chart_view()
+            plot_bars(chart, title, rows, color, "Phases")
+            self.layout_.addWidget(view, 1)
+        self.bind_back()
+        self.bind("y", "Copy data", self.copy)
+
+    def copy(self) -> None:
+        lines = ["Chart\tBin\tPhases"]
+        for chart, rows in self.histogram_data.items():
+            lines.extend(f"{chart}\t{bin_label}\t{count}" for bin_label, count in rows)
+        copy_text(self, "\n".join(lines), f"{len(self.histogram_data)} histograms")
+
+
+# --- Routes --------------------------------------------------------------------------
+
+
+class RoutesPage(Page):
+    title = "Routes"
+
+    def __init__(self, window, client) -> None:
+        super().__init__(window)
+        self.client = client
+        self.status = label("Routes", "status")
+        self.rename_input = QLineEdit(placeholderText="New name")
+        self.rename_input.returnPressed.connect(self.rename)
+        self.table = make_table(display.ROUTE_COLUMNS, stretch_column=0)
+        self.table.cellActivated.connect(lambda row, _: self._open(row))
+        self.layout_.addWidget(self.status)
+        self.layout_.addLayout(row_layout(self.rename_input, button("Rename", self.rename), stretch_index=0))
+        self.layout_.addWidget(self.table, 1)
+        self.bind_back()
+        self.bind("e", "Rename route", self.rename)
+        self._refresh()
+
+    def focus_widget(self):
+        return self.table
+
+    def _refresh(self) -> None:
+        self.all_routes = storage.load_routes()
+        _, activities = storage.load_index()
+        self.grouped = display.grouped_routes(self.all_routes, activities)
+        fill_table(self.table, [display.route_row(r, n) for r, n in self.grouped])
+        self.status.setText(f"{len(self.grouped)} routes with 2+ activities")
+
+    def rename(self) -> None:
+        row = self.table.currentRow()
+        if not 0 <= row < len(self.grouped):
+            return
+        new_name = self.rename_input.text().strip()
+        if not new_name:
+            self.notify("Enter a new name", "warning")
+            return
+        self.grouped[row][0].name = new_name
+        storage.save_routes(self.all_routes)
+        self.rename_input.clear()
+        self._refresh()
+
+    def _open(self, row: int) -> None:
+        if 0 <= row < len(self.grouped):
+            self.window_.push(RouteActivitiesPage(self.window_, self.grouped[row][0], self.client))
+
+
+class RouteActivitiesPage(Page):
+    def __init__(self, window, route, client) -> None:
+        super().__init__(window)
+        self.title = f"Route: {route.name}"
+        self.client = client
+        _, activities = storage.load_index()
+        self.activities = sorted((a for a in activities if a.route_id == route.route_id), key=lambda a: a.start_time_local, reverse=True)
+        self.table = make_table(display.ACTIVITY_COLUMNS, stretch_column=1)
+        self.table.cellActivated.connect(lambda row, _: self.window_.push(LapsPage(self.window_, self.activities[row], client)))
+        self.layout_.addWidget(label(f"Route: {route.name}  |  {len(self.activities)} activities", "status"))
+        self.layout_.addWidget(self.table, 1)
+        fill_table(
+            self.table, [display.activity_row(a, route.name) for a in self.activities], activity_styles(self.activities),
+            right_aligned={display.ACTIVITY_DURATION_COLUMN},
+        )
+        self.bind_back()
+
+    def focus_widget(self):
+        return self.table
+
+
+# --- Workouts ------------------------------------------------------------------------
+
+
+class WorkoutsPage(Page):
+    title = "Workouts"
+
+    def __init__(self, window, client) -> None:
+        super().__init__(window)
+        self.client = client
+        self.library = WorkoutLibrary()
+        self.status = label("", "status")
+        self.table = make_table(workout_library.COLUMNS, stretch_column=2)
+        self.table.currentCellChanged.connect(lambda *_: self._show_preview())
+        self.preview = QPlainTextEdit(readOnly=True)
+        self.preview.setObjectName("card")
+        self.layout_.addWidget(self.status)
+        self.layout_.addWidget(self.table, 3)
+        self.layout_.addWidget(self.preview, 2)
+        self.bind_back()
+        self.bind("u", "Upload workout", self.upload)
+        self.bind("Shift+U", "Upload week", self.upload_week, display_key="U")
+        self.bind("r", "Refresh", self.refresh)
+        self.refresh()
+
+    def focus_widget(self):
+        return self.table
+
+    def _selected_key(self) -> str | None:
+        row = self.table.currentRow()
+        return self.library.rows[row].key if 0 <= row < len(self.library.rows) else None
+
+    def refresh(self) -> None:
+        previous = self._selected_key()
+        for message in self.library.refresh():
+            self.notify(message, "information" if message.startswith("Unpacked") else "error")
+        styles = []
+        for row in self.library.rows:
+            if row.kind == "week":
+                styles.append({"bold": True, "color": COLORS["accent"], "color_columns": {4: COLORS["red"]} if row.values[4] != "OK" else {}})
+            elif row.kind == "invalid":
+                styles.append({"color_columns": {4: COLORS["red"]}})
+            else:
+                styles.append({"color_columns": {4: COLORS["green"]}})
+        fill_table(self.table, [r.values for r in self.library.rows], styles)
+        keys = [r.key for r in self.library.rows]
+        if previous in keys:
+            self.table.selectRow(keys.index(previous))
+        self.status.setText(self.library.status_text)
+        self._show_preview()
+
+    def _show_preview(self) -> None:
+        text, is_error = self.library.preview(self._selected_key())
+        self.preview.setStyleSheet(f"color: {COLORS['red']};" if is_error else "")
+        self.preview.setPlainText(text)
+
+    def upload(self) -> None:
+        try:
+            items, warning = self.library.single_upload(self._selected_key())
+        except LibraryError as e:
+            self.notify(str(e), e.severity)
+            return
+        if warning:
+            self.notify(warning, "warning")
+        self._upload(items)
+
+    def upload_week(self) -> None:
+        try:
+            items, prompt = self.library.week_upload(self._selected_key())
+        except LibraryError as e:
+            self.notify(str(e), e.severity)
+            return
+        answer = QMessageBox.question(self, "Upload week to Garmin Connect", prompt)
+        if answer == QMessageBox.StandardButton.Yes:
+            self._upload(items)
+
+    def _upload(self, items) -> None:
+        if self.client is None:
+            self.notify("Not logged in to Garmin", "warning")
+            return
+
+        def done(notes) -> None:
+            for severity, message in notes:
+                self.notify(message, severity)
+            self.refresh()
+
+        run_background(
+            lambda: workout_library.upload_many(self.client, items, progress=lambda m: on_ui(self.status.setText, m)),
+            done,
+            lambda e: self.notify(f"Upload failed: {e}", "error"),
+        )
+
+
+# --- Training week -------------------------------------------------------------------
+
+
+class TrainingWeekPage(Page):
+    title = "Calendar & training load"
+
+    def __init__(self, window, client) -> None:
+        super().__init__(window)
+        self.client = client
+        self.week = training_load.week_start(date.today())
+        self.view = None
+        self.week_title = label("", "pageTitle")
+        self.summary = label("", "card")
+        self.table = make_table(display.WEEK_COLUMNS, stretch_column=4)
+        self.notes = label("", "notes", wrap=True)
+        chart_view, self.chart = make_chart_view()
+        chart_view.setMinimumHeight(240)
+        self.layout_.addLayout(row_layout(
+            button("◀ Previous ([)", self.prev_week), self.week_title, button("Next (]) ▶", self.next_week),
+            button("This week (t)", self.this_week), button("Refresh (r)", self.refresh), stretch_index=1,
+        ))
+        self.layout_.addWidget(self.summary)
+        self.layout_.addWidget(self.table, 2)
+        self.layout_.addWidget(self.notes)
+        self.layout_.addWidget(chart_view, 2)
+        self.bind_back()
+        self.bind("[", "Prev week", self.prev_week)
+        self.bind("]", "Next week", self.next_week)
+        self.bind("t", "This week", self.this_week)
+        self.bind("r", "Refresh from Garmin", self.refresh)
+        self.bind("y", "Copy table", self.copy)
+        self._load_view()
+        self.refresh()
+
+    def focus_widget(self):
+        return self.table
+
+    def _load_view(self) -> None:
+        self.view = services.load_training_week(self.week)
+        today = date.today()
+        self.week_title.setText(display.week_title(self.week))
+        self.summary.setText(display.week_summary_text(self.view))
+        rows, styles = [], []
+        for item in self.view.week.items:
+            cells, color = display.week_item_cells(item, today)
+            rows.append(cells)
+            styles.append({
+                "bold": item.day == today,
+                "color_columns": {2: COLORS.get(color, COLORS["fg"]) if color else COLORS["fg"], 3: SPORT_COLORS.get(item.sport, COLORS["fg"])},
+            })
+        if not rows:
+            rows, styles = [("", "", "", "", "Nothing planned or done this week", "", "", "", "")], None
+        fill_table(self.table, rows, styles, right_aligned={5, 7}, keep_row=False)
+        notes = list(self.view.notes)
+        if not self.view.calendar_cached:
+            notes.insert(0, "This week's calendar isn't downloaded yet — refreshing...")
+        self.notes.setText("\n".join(notes))
+        self.notes.setVisible(bool(notes))
+        points = self.view.pmc
+        markers = [(today, COLORS["comment"])]
+        if self.week != training_load.week_start(today):
+            markers.append((self.week, COLORS["cyan"]))
+        plot_dated_lines(
+            self.chart,
+            "Fitness (CTL) / fatigue (ATL) / form (TSB) — dashed: today; after it: planned",
+            [p.day for p in points],
+            [
+                ("CTL fitness", [p.ctl for p in points], COLORS["accent"]),
+                ("ATL fatigue", [p.atl for p in points], COLORS["magenta"]),
+                ("TSB form", [p.tsb for p in points], COLORS["yellow"]),
+            ],
+            markers,
+            dashed_after=today,
+        )
+
+    def _change_week(self, week: date) -> None:
+        self.week = week
+        self._load_view()
+        if not self.view.calendar_cached:
+            self.refresh()
+
+    def prev_week(self) -> None:
+        self._change_week(self.week - timedelta(days=7))
+
+    def next_week(self) -> None:
+        self._change_week(self.week + timedelta(days=7))
+
+    def this_week(self) -> None:
+        self._change_week(training_load.week_start(date.today()))
+
+    def refresh(self) -> None:
+        if self.client is None:
+            self.notify("Not logged in to Garmin — showing cached data", "warning")
+            return
+        week = self.week
+
+        def done(warnings) -> None:
+            for message in warnings:
+                self.notify(message, "warning")
+            self._load_view()
+
+        def failed(error) -> None:
+            self.notify(f"Refresh failed: {error}", "error")
+            self._load_view()
+
+        run_background(
+            lambda: services.refresh_training_data(self.client, week, progress=lambda m: on_ui(self.week_title.setText, m)),
+            done,
+            failed,
+        )
+
+    def copy(self) -> None:
+        copy_text(self, display.week_summary_text(self.view) + "\n\n" + table_as_tsv(self.table), f"week {self.week:%d.%m}")
