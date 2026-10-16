@@ -9,12 +9,9 @@ OpenStreetMap (with the attribution Leaflet shows).
 """
 
 import argparse
-import inspect
-import json
-from collections.abc import Callable
 from datetime import date, timedelta
 
-from nicegui import app, run, ui
+from nicegui import app, background_tasks, run, ui
 
 import display
 import fit_parser
@@ -24,193 +21,33 @@ import storage
 import training_load
 import workout_library
 from theme import COLORS, SERIES_COLORS, SPORT_COLORS
-from laps_session import LapsError, LapsSession
-from models import PACE_SPORTS, SWIM_SPORTS, format_distance, format_speed_or_pace
+from laps_session import MAP_METRICS, LapsError, LapsSession
+from models import format_distance
+from web_common import (
+    APP_TITLE,
+    ECHART_BASE,
+    Frame,
+    State,
+    axis_style,
+    copy,
+    draw_track,
+    escape,
+    grid,
+    grid_rows,
+    layers_payload,
+    legend_html,
+    notify,
+    on_row_change,
+    run_with_progress,
+    select_row,
+    selected_row,
+    set_selected,
+    stat_tiles,
+    track_payload,
+)
 from workout_library import LibraryError, WorkoutLibrary
 
-APP_TITLE = "Training Analyze"
 ALL_SPORTS = "__all__"
-
-
-class State:
-    client = None  # logged-in Garmin client, shared by all browser tabs (single-user app)
-
-
-CSS = f"""
-body {{ background: {COLORS['bg']}; color: {COLORS['fg']}; }}
-.q-header {{ background: {COLORS['bg_dark']} !important; border-bottom: 1px solid {COLORS['border']}; }}
-.q-footer {{ background: {COLORS['bg_dark']} !important; border-top: 1px solid {COLORS['border']}; }}
-.ta-title {{ color: {COLORS['accent']}; font-weight: 600; font-size: 1.15rem; }}
-.ta-status {{ color: {COLORS['comment']}; }}
-.ta-notes {{ color: {COLORS['yellow']}; white-space: pre-line; }}
-.ta-card {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 12px; }}
-.ta-tile {{ background: {COLORS['surface']}; border: 1px solid {COLORS['border']}; border-radius: 12px;
-            padding: 10px 16px; min-width: 120px; flex: 1; }}
-.ta-tile .cap {{ color: {COLORS['comment']}; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }}
-.ta-tile .val {{ font-size: 1.7rem; font-weight: 600; line-height: 1.2; }}
-.ta-tile .unit {{ color: {COLORS['comment']}; font-size: 0.85rem; margin-left: 4px; }}
-.ta-tile .hint {{ color: {COLORS['comment']}; font-size: 0.75rem; }}
-.ta-chip {{ color: {COLORS['comment']} !important; }}
-.ta-chip .cap {{ background: {COLORS['surface2']}; color: {COLORS['accent']}; font-weight: 600; border-radius: 4px;
-                 padding: 1px 7px; margin-right: 6px; }}
-.ta-pre {{ font-family: 'JetBrains Mono', 'DejaVu Sans Mono', monospace; font-size: 0.85rem; white-space: pre-wrap; }}
-.ta-bar {{ display: flex; height: 28px; border-radius: 8px; overflow: hidden; background: {COLORS['surface']}; }}
-.ta-bar div {{ display: flex; align-items: center; justify-content: center; color: {COLORS['bg']};
-               font-weight: 600; font-size: 0.85rem; white-space: nowrap; overflow: hidden; }}
-.leaflet-tile-pane {{ filter: brightness(0.82) saturate(0.85); }}
-.leaflet-tooltip.lap-label {{ background: {COLORS['fg']}; color: {COLORS['bg_dark']}; border: none; border-radius: 9px;
-              font-weight: 700; font-size: 10px; padding: 0 5px; box-shadow: none; }}
-[data-ag-theme-mode="dark"] {{
-    --ag-background-color: {COLORS['bg_dark']}; --ag-odd-row-background-color: {COLORS['surface']};
-    --ag-header-background-color: {COLORS['surface2']}; --ag-header-text-color: {COLORS['accent']};
-    --ag-foreground-color: {COLORS['fg']}; --ag-border-color: {COLORS['border']};
-    --ag-row-hover-color: #2f3549; --ag-selected-row-background-color: {COLORS['selection']};
-}}
-"""
-
-
-# --- Page frame: header, footer key chips, keyboard ---------------------------------
-
-
-class Frame:
-    """The common page frame. `bind()` registers a TUI-style single-key binding: it's shown as
-    a clickable chip in the footer and triggered by the key itself."""
-
-    def __init__(self, title: str) -> None:
-        ui.dark_mode(True)
-        ui.colors(primary=COLORS["accent"], positive=COLORS["green"], negative=COLORS["red"], warning=COLORS["yellow"])
-        ui.add_css(CSS)
-        ui.page_title(f"{title} · {APP_TITLE}")
-        with ui.header().classes("items-center px-4 py-2"):
-            ui.label(APP_TITLE).classes("ta-title")
-            ui.label("·").classes("ta-status")
-            self.title = ui.label(title).classes("text-lg font-semibold")
-        with ui.footer().classes("px-3 py-1"):
-            self.footer = ui.row().classes("gap-1 items-center")
-        self.keys: dict[str, Callable] = {}
-        ui.keyboard(on_key=self._on_key)
-
-    def bind(self, key: str, label: str, action: Callable, shown_key: str | None = None) -> None:
-        self.keys[key] = action
-        with self.footer:
-            with ui.button(on_click=lambda: _call(action)).props("flat dense no-caps").classes("ta-chip"):
-                ui.html(f"<span class='cap'>{shown_key or key}</span>{label}")
-
-    def bind_back(self, action: Callable | None = None) -> None:
-        self.bind("Escape", "Back", action or ui.navigate.back, shown_key="esc")
-
-    async def _on_key(self, e) -> None:
-        if not e.action.keydown or e.action.repeat:
-            return
-        action = self.keys.get(str(e.key.name))
-        if action is not None:
-            await _call(action)
-
-
-async def _call(action: Callable) -> None:
-    result = action()
-    if inspect.isawaitable(result):
-        await result
-
-
-def notify(message: str, severity: str = "information") -> None:
-    ui.notify(message, type={"information": "positive", "warning": "warning", "error": "negative"}.get(severity, "info"),
-              position="bottom-right")
-
-
-def stat_tiles(stats) -> None:
-    with ui.row().classes("w-full gap-3 no-wrap"):
-        for stat in stats:
-            color = COLORS.get(stat.color, COLORS["fg"]) if stat.color else COLORS["fg"]
-            hint = f"<div class='hint'>{stat.hint}</div>" if stat.hint else ""
-            ui.html(
-                f"<div class='cap'>{stat.label}</div>"
-                f"<div><span class='val' style='color:{color}'>{stat.value}</span><span class='unit'>{stat.unit}</span></div>{hint}"
-            ).classes("ta-tile")
-
-
-def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_style: str | None = None, **options):
-    """An AG Grid table; each row dict holds the column values plus hidden helper fields."""
-    # cellDataType False: every value is already display text. Without it AG Grid infers a type
-    # from the first row — e.g. "2026-10-05_Z2.json" makes a column "dateString", and every
-    # value that then fails to parse as a date renders blank.
-    column_defs = [
-        {"field": f"c{i}", "headerName": name, "sortable": False, "resizable": True, "cellDataType": False}
-        for i, name in enumerate(columns)
-    ]
-    opts = {
-        "columnDefs": column_defs,
-        "rowData": rows,
-        "rowSelection": {"mode": "singleRow", "checkboxes": False, "enableClickSelection": True},
-        ":getRowId": "params => String(params.data._row)",
-        "suppressCellFocus": False,
-        "autoSizeStrategy": {"type": "fitCellContents"},
-        **options,
-    }
-    if row_style:
-        opts[":getRowStyle"] = row_style  # a JavaScript function (NiceGUI's ":" prefix on the option name)
-    table = ui.aggrid(opts, theme="quartz").classes("w-full").style(f"height: {height}")
-    # Keyboard navigation (arrow keys move the focused cell) also selects the row, so the
-    # "current row" works like the TUI's cursor whether you click or use the keyboard.
-    table.on("cellFocused", lambda e: table.run_row_method(str(e.args["rowIndex"]), "setSelected", True)
-             if e.args.get("rowIndex") is not None else None)
-    return table
-
-
-def on_row_change(table, callback: Callable[[int], object]) -> None:
-    """Call `callback(row)` whenever the selected row changes. AG Grid also fires a selection
-    event for the row being *de*selected, and its event no longer says which kind it is, so
-    ask the grid for the current selection instead of trusting the event's row."""
-    state = {"row": None}
-
-    async def changed(_) -> None:
-        row = await selected_row(table)
-        if row is not None and row != state["row"]:
-            state["row"] = row
-            await _call(lambda: callback(row))
-
-    table.on("rowSelected", changed)
-
-
-def grid_rows(rows: list[tuple[str, ...]], extra: list[dict] | None = None) -> list[dict]:
-    return [{**{f"c{i}": v for i, v in enumerate(values)}, "_row": n, **(extra[n] if extra else {})} for n, values in enumerate(rows)]
-
-
-async def selected_row(table) -> int | None:
-    row = await table.get_selected_row()
-    return row["_row"] if row else None
-
-
-def select_row(table, row: int | None) -> None:
-    if row is not None:
-        table.run_row_method(str(row), "setSelected", True)
-        table.run_grid_method("ensureIndexVisible", row)
-
-
-def tsv(columns: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
-    return "\n".join(["\t".join(columns), *("\t".join(str(v).strip() for v in r) for r in rows)])
-
-
-def copy(text: str, what: str) -> None:
-    ui.clipboard.write(text)
-    notify(f"Copied {what}")
-
-
-ECHART_BASE = {
-    "backgroundColor": "transparent",
-    "textStyle": {"color": COLORS["fg"]},
-    "grid": {"left": 50, "right": 20, "top": 40, "bottom": 40},
-    "tooltip": {"trigger": "axis"},
-}
-
-
-def axis_style(**extra) -> dict:
-    return {
-        "axisLine": {"lineStyle": {"color": COLORS["border2"]}},
-        "axisLabel": {"color": COLORS["comment"]},
-        "splitLine": {"lineStyle": {"color": COLORS["border"]}},
-        **extra,
-    }
 
 
 # --- Login ---------------------------------------------------------------------------
@@ -258,25 +95,6 @@ def login_page() -> None:
 
 
 # --- Activities ----------------------------------------------------------------------
-
-
-class Progress:
-    """Collects progress messages from a worker thread; a ui.timer shows the latest one."""
-
-    def __init__(self) -> None:
-        self.text = ""
-
-    def __call__(self, message: str) -> None:
-        self.text = message
-
-
-async def run_with_progress(label, job: Callable, *args):
-    progress = Progress()
-    timer = ui.timer(0.3, lambda: label.set_text(progress.text) if progress.text else None)
-    try:
-        return await run.io_bound(job, *args, progress=progress)
-    finally:
-        timer.cancel()
 
 
 @ui.page("/")
@@ -351,7 +169,7 @@ def main_page() -> None:
     frame.bind("w", "Workouts", lambda: ui.navigate.to("/workouts"))
     frame.bind("c", "Calendar & load", lambda: ui.navigate.to("/calendar"))
     frame.bind("Enter", "Open", open_selected, shown_key="enter")
-    frame.bind("y", "Copy table", lambda: copy(tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"))
+    frame.bind("y", "Copy table", lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"))
     render()
 
 
@@ -361,101 +179,7 @@ LAP_ROW_STYLE = (
     "params => params.data._kind === 'interval' ? {fontWeight: 600}"
     f" : params.data._kind === 'phase' ? {{color: '{COLORS['comment']}', fontStyle: 'italic'}} : {{}}"
 )
-MAP_MODES = (("1", "Speed / pace", "speed_mps"), ("2", "Heart rate", "heart_rate"), ("3", "Power", "power"), ("4", "Elevation", "altitude_m"))
-RAMP = ["#7aa2f7", "#7dcfff", "#9ece6a", "#e0af68", "#f7768e"]
-COLOR_BUCKETS = 16
-
-
-def _ramp(t: float) -> str:
-    t = min(max(t, 0.0), 1.0) * (len(RAMP) - 1)
-    i = min(int(t), len(RAMP) - 2)
-    f = t - i
-    a, b = RAMP[i], RAMP[i + 1]
-    channels = [round(int(a[k:k + 2], 16) + (int(b[k:k + 2], 16) - int(a[k:k + 2], 16)) * f) for k in (1, 3, 5)]
-    return "#" + "".join(f"{c:02x}" for c in channels)
-
-
-MAX_TRACK_POINTS = 8000  # Leaflet simplifies per zoom itself; this just bounds the payload
-
-
-def track_payload(points, values, highlights=(), selected=(), markers=()) -> dict:
-    """Everything needed to draw a track, as plain data: the casing line, one multi-polyline
-    per colour bucket, outlines, lap markers and the colour range. Pure Python — run it off
-    the event loop for long activities."""
-    step = max(1, len(points) // MAX_TRACK_POINTS)
-    points, values = points[::step], list(values)[::step]
-    present = sorted(v for v in values if v is not None)
-    value_range = None
-    buckets: dict[int, list] = {}
-    if present:
-        low, high = present[len(present) // 20], present[-1 - len(present) // 20]
-        high = high if high > low else low + 1
-        value_range = (low, high)
-        run, run_bucket = [points[0]], None
-        for point, value in zip(points[1:], values[1:]):
-            bucket = run_bucket if value is None else min(COLOR_BUCKETS - 1, max(0, int((value - low) / (high - low) * COLOR_BUCKETS)))
-            if run_bucket is not None and bucket != run_bucket:
-                buckets.setdefault(run_bucket, []).append(run)
-                run = [run[-1]]
-            run.append(point)
-            run_bucket = bucket
-        if run_bucket is not None and len(run) > 1:
-            buckets.setdefault(run_bucket, []).append(run)
-
-    def thin(path):
-        return path[::max(1, len(path) // 1500)]
-
-    return {
-        "casing": points,
-        "colored": [{"color": _ramp((b + 0.5) / COLOR_BUCKETS), "lines": lines} for b, lines in buckets.items()],
-        "plain_color": COLORS["accent"],
-        "highlights": [thin(h) for h in highlights if len(h) > 1],
-        "selected": thin(selected) if len(selected) > 1 else [],
-        "markers": [[lat, lon, text] for lat, lon, text in markers],
-        "range": value_range,
-        "colors": {"casing": COLORS["bg_dark"], "highlight": "#ffffff", "selected": COLORS["cyan"],
-                   "marker": COLORS["fg"], "start": COLORS["green"], "end": COLORS["red"]},
-    }
-
-
-DRAW_TRACK_JS = """
-(() => {
-  const el = getElement(%(id)s); const map = el.map; const d = %(data)s;
-  if (el._track) { el._track.remove(); map.off('zoomend', el._relayout); }
-  const group = L.layerGroup().addTo(map); el._track = group;
-  const line = (latlngs, color, weight, opacity) => L.polyline(latlngs, {color, weight, opacity, interactive: false}).addTo(group);
-  if (d.selected.length) line(d.selected, d.colors.selected, 13, 0.6);
-  for (const h of d.highlights) line(h, d.colors.highlight, 10, 0.6);
-  line(d.casing, d.colors.casing, 7, 0.9);
-  if (d.colored.length) { for (const c of d.colored) line(c.lines, c.color, 4, 1); }
-  else line(d.casing, d.plain_color, 4, 1);
-  const marks = L.layerGroup().addTo(group);
-  // Lap markers that would overlap at the current zoom are skipped; zooming in reveals them.
-  el._relayout = () => {
-    marks.clearLayers(); let last = null;
-    for (const [lat, lon, text] of d.markers) {
-      const p = map.latLngToLayerPoint([lat, lon]);
-      if (last && p.distanceTo(last) < 24) continue;
-      last = p;
-      L.circleMarker([lat, lon], {radius: 8, color: d.colors.casing, fillColor: d.colors.marker, fillOpacity: 1, weight: 1})
-        .bindTooltip(text, {permanent: true, direction: 'center', className: 'lap-label'}).addTo(marks);
-    }
-  };
-  map.on('zoomend', el._relayout);
-  const first = d.casing[0], end = d.casing[d.casing.length - 1];
-  for (const [p, color] of [[first, d.colors.start], [end, d.colors.end]])
-    L.circleMarker(p, {radius: 7, color: '#ffffff', fillColor: color, fillOpacity: 1, weight: 2.5}).addTo(group);
-  map.fitBounds(L.polyline(d.casing).getBounds(), {padding: [30, 30]});
-  el._relayout();
-})()
-"""
-
-
-async def draw_track(leaflet, payload: dict) -> None:
-    """Draw a track payload (see track_payload) on a ui.leaflet in a single round trip —
-    one message, instead of one per polyline/marker/tooltip."""
-    await leaflet.initialized()
-    ui.run_javascript(DRAW_TRACK_JS % {"id": leaflet.id, "data": json.dumps(payload)})
+MAP_MODES = [(str(key), text, metric) for key, (metric, text) in enumerate(MAP_METRICS.items(), start=1)]
 
 
 @ui.page("/activity/{activity_id}")
@@ -496,7 +220,11 @@ def laps_page(activity_id: str) -> None:
                 ui.button("Split intervals (i)", on_click=lambda: split_intervals()).props("outline")
                 filter_button = ui.button("Interval only (f)", on_click=lambda: toggle_filter()).props("outline")
                 ui.button("Reset", on_click=lambda: run_op(session.reset)).props("outline")
-            table = grid(session.columns, [], height="calc(100vh - 470px)", row_style=LAP_ROW_STYLE)
+            # The table only needs part of the width: the rest shows the track, with the selected
+            # row's lap highlighted (g opens the big map tab).
+            with ui.row().classes("w-full no-wrap gap-3"):
+                table = grid(session.columns, [], height="calc(100vh - 470px)", row_style=LAP_ROW_STYLE).style("flex: 3 1 0")
+                side_map = ui.leaflet(center=(52.0, 19.0), zoom=13).style("flex: 2 1 0; height: calc(100vh - 470px)")
             interval_area = ui.column().classes("w-full")
         with ui.tab_panel(map_tab).classes("p-0 gap-2"):
             with ui.row().classes("items-center gap-2"):
@@ -515,9 +243,12 @@ def laps_page(activity_id: str) -> None:
     def rebuild(keep_row: int | None = None) -> None:
         state["rows"] = session.rows()
         table.options["rowData"] = grid_rows([r.values for r in state["rows"]], [{"_kind": r.kind} for r in state["rows"]])
-        table.options["columnDefs"][session.duration_column]["cellStyle"] = {"textAlign": "right"}
+        for column in session.right_aligned_columns:
+            table.options["columnDefs"][column]["cellStyle"] = {"textAlign": "right"}
         table.update()
         select_row(table, keep_row)
+        if session.records is not None:  # laps/marks changed: redraw the side map's highlights
+            background_tasks.create(refresh_side_map(keep_row))
         interval_area.clear()
         stats = display.interval_stats(session.current_laps, activity.sport)
         with interval_area:
@@ -563,6 +294,16 @@ def laps_page(activity_id: str) -> None:
         laps = await run.io_bound(session.detect_physical_laps, radius)
         run_op(lambda: session.apply_physical_laps(laps))
 
+    async def refresh_side_map(row: int | None = None, fit: bool = False) -> None:
+        selected = session.row_lap(row) if row is not None else None
+        try:
+            # First open of a long activity parses its FIT file (seconds): off the event loop.
+            layers = await run.io_bound(session.map_layers, "speed_mps", selected)
+        except LapsError:
+            return
+        if layers is not None:
+            await draw_track(side_map, await run.io_bound(layers_payload, layers), fit=fit)
+
     async def draw_map(attr: str | None = None) -> None:
         tabs.set_value(map_tab)
         state["map_mode"] = attr or state["map_mode"]
@@ -573,46 +314,17 @@ def laps_page(activity_id: str) -> None:
         mode = state["map_mode"]
         if session.records is None:
             map_legend.set_content("<span class='ta-status'>Loading track...</span>")
-
-        def build() -> dict | None:
-            # FIT load (first time only, then cached) and per-lap slicing can take seconds on
-            # a long activity — done in a worker thread so the server stays responsive.
-            records = [r for r in session.ensure_records() if r.lat is not None and r.lon is not None]
-            if len(records) < 2:
-                return None
-
-            def coords(lap):
-                return [[r.lat, r.lon] for r in fit_parser.lap_record_slice(session.records, lap, session.utc_offset) if r.lat is not None]
-
-            return track_payload(
-                [[r.lat, r.lon] for r in records], [getattr(r, mode) for r in records],
-                highlights=[coords(lap) for lap in session.marked_laps()],
-                selected=coords(selected_lap) if selected_lap else [],
-                markers=[(*c[0], str(lap.lap_index)) for lap in session.current_laps if (c := coords(lap))],
-            )
-
         try:
-            payload = await run.io_bound(build)
+            layers = await run.io_bound(session.map_layers, mode, selected_lap)
         except LapsError as e:
             notify(str(e), "warning")
             return
-        if payload is None:
+        if layers is None:
             map_legend.set_content("<span class='ta-status'>No GPS track for this activity</span>")
             return
+        payload = await run.io_bound(layers_payload, layers)
         await draw_track(leaflet, payload)
-        value_range = payload["range"]
-        map_legend.set_content("")
-        if value_range:
-            fmt = {
-                "speed_mps": lambda v: format_speed_or_pace(activity.sport, v),
-                "heart_rate": lambda v: f"{v:.0f} bpm", "power": lambda v: f"{v:.0f} W", "altitude_m": lambda v: f"{v:.0f} m",
-            }[mode]
-            name = next(text for _, text, a in MAP_MODES if a == mode)
-            map_legend.set_content(
-                f"<div class='ta-tile' style='width:340px'><div class='cap'>{name}</div>"
-                f"<div style='height:10px; border-radius:5px; background: linear-gradient(90deg, {', '.join(RAMP)})'></div>"
-                f"<div style='display:flex; justify-content:space-between' class='hint'><span>{fmt(value_range[0])}</span><span>{fmt(value_range[1])}</span></div></div>"
-            )
+        map_legend.set_content(legend_html(mode, activity.sport, payload["range"]))
 
     def show_phases() -> None:
         try:
@@ -701,8 +413,10 @@ def laps_page(activity_id: str) -> None:
     frame.bind("g", "Map", draw_map)
     for key, text, attr in MAP_MODES:
         frame.keys[key] = lambda a=attr: draw_map(a) if tabs.value in (map_tab, "Map (g)") else None
-    frame.bind("y", "Copy table", lambda: copy(tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"))
+    frame.bind("y", "Copy table", lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"))
+    on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
     rebuild(0)
+    ui.timer(0.2, lambda: refresh_side_map(0, fit=True), once=True)
 
 
 # --- Routes --------------------------------------------------------------------------
@@ -822,7 +536,7 @@ def workouts_page() -> None:
     def show_preview(key: str | None) -> None:
         text, is_error = library.preview(key)
         color = COLORS["red"] if is_error else COLORS["fg"]
-        preview.set_content(f"<span style='color:{color}'>{_escape(text)}</span>")
+        preview.set_content(f"<span style='color:{color}'>{escape(text)}</span>")
 
     def toggle(key: str | None) -> None:
         if key is None or not library.toggle_week(key):
@@ -856,7 +570,7 @@ def workouts_page() -> None:
             notify(str(e), e.severity)
             return
         with ui.dialog() as dialog, ui.card().classes("ta-card p-6"):
-            ui.html(_escape(prompt)).classes("ta-pre")
+            ui.html(escape(prompt)).classes("ta-pre")
             with ui.row().classes("gap-2 justify-end w-full"):
                 ui.button("Cancel (n)", on_click=lambda: dialog.submit(False)).props("outline")
                 ui.button("Upload (y)", on_click=lambda: dialog.submit(True))
@@ -877,10 +591,6 @@ def workouts_page() -> None:
     frame.bind("r", "Refresh", refresh)
     refresh()
     show_preview(None)
-
-
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --- Training week -------------------------------------------------------------------
@@ -997,7 +707,7 @@ def calendar_page() -> None:
     frame.bind("]", "Next week", lambda: change(7))
     frame.bind("t", "This week", this_week)
     frame.bind("r", "Refresh from Garmin", refresh)
-    frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + tsv(
+    frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
         display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].week.items]), "week"))
     load()
     ui.timer(0.1, refresh, once=True)

@@ -4,7 +4,7 @@ like its Textual counterpart."""
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -45,8 +45,8 @@ from gui_common import (
     table_as_tsv,
 )
 from gui_map import TrackData, TrackMap
-from laps_session import LapsError, LapsSession
-from models import PACE_SPORTS, SWIM_SPORTS, ActivitySummary, format_distance, format_speed_or_pace
+from laps_session import MAP_METRICS, LapsError, LapsSession
+from models import ActivitySummary, format_distance
 from workout_library import LibraryError, WorkoutLibrary
 
 ALL_SPORTS = "__all__"
@@ -292,7 +292,18 @@ class LapsPage(Page):
             button("Reset", lambda: self._run(self.session.reset)),
             stretch_index=0,
         ))
-        self.layout_.addWidget(self.table, 1)
+        # The table only needs part of the width: the rest shows the track, with the selected
+        # row's lap highlighted (g still opens the full map page).
+        self.side_map = TrackMap()
+        self.side_map.setMinimumHeight(200)
+        self.side_map.set_placeholder("Loading track...")
+        self.splitter = splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.table)
+        splitter.addWidget(self.side_map)
+        splitter.setStretchFactor(1, 1)
+        self.table.currentCellChanged.connect(lambda row, *_: self.side_map.set_selected(self.session.lap_coords(self.session.row_lap(row))))
+        self.layout_.addWidget(splitter, 1)
+        QTimer.singleShot(0, self._fit_table_width)
         self.layout_.addWidget(self.interval_tiles)
         self.layout_.addWidget(self.interval_hint)
         self.bind_back()
@@ -306,16 +317,35 @@ class LapsPage(Page):
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         self._rebuild()
+        # First open of a long activity parses its FIT file (seconds): load off the UI thread.
+        run_background(self.session.map_layers, lambda _: self._refresh_side_map(refit=True),
+                       lambda e: self.side_map.set_placeholder(str(e)))
 
     def focus_widget(self):
         return self.table
+
+    def _fit_table_width(self) -> None:
+        """Give the table exactly the width its columns need; the map takes the rest."""
+        needed = self.table.horizontalHeader().length() + self.table.verticalScrollBar().sizeHint().width() + 6
+        total = self.splitter.width()
+        self.splitter.setSizes([min(needed, total - 320), max(320, total - needed)])
+
+    def _refresh_side_map(self, refit: bool = False) -> None:
+        if self.session.records is None:
+            return
+        layers = self.session.map_layers(selected_lap=self.session.row_lap(self.table.currentRow()))
+        if layers is None:
+            self.side_map.set_placeholder("No GPS track for this activity")
+            return
+        self.side_map.set_track(track_data(layers, "speed_mps", self.activity.sport), refit=refit)
 
     def _rebuild(self) -> None:
         rows = self.session.rows()
         fill_table(
             self.table, [r.values for r in rows], [self.STYLE_BY_KIND[r.kind] for r in rows],
-            right_aligned={self.session.duration_column},
+            right_aligned=self.session.right_aligned_columns,
         )
+        self._refresh_side_map()
         stats = display.interval_stats(self.session.current_laps, self.activity.sport)
         self.interval_tiles.set_stats(stats, "Marked\nintervals")
         self.interval_hint.setText("" if stats else self.session.interval_summary())
@@ -396,44 +426,35 @@ class LapsPage(Page):
         self.window_.push(PhaseMetricsPage(self.window_, self.activity, phases))
 
 
+def track_data(layers, metric: str, sport: str) -> TrackData:
+    label_text, fmt = display.metric_legend(metric, sport)
+    return TrackData(
+        points=layers.points, values=layers.values, value_label=label_text, value_format=fmt,
+        highlights=layers.highlights, selected=layers.selected, lap_markers=layers.markers,
+    )
+
+
 class MapPage(Page):
     """GUI-only: the activity's GPS track on a map (see gui_map), coloured by a metric, with
     marked intervals outlined and the lap selected on the laps page highlighted."""
-
-    MODES = (
-        ("1", "Speed / pace", "speed_mps"),
-        ("2", "Heart rate", "heart_rate"),
-        ("3", "Power", "power"),
-        ("4", "Elevation", "altitude_m"),
-    )
 
     def __init__(self, window, session: LapsSession, selected_lap) -> None:
         super().__init__(window)
         self.title = f"Map — {session.activity.name}"
         self.session = session
-        records = session.ensure_records()  # raises LapsError when there's nothing to draw
-        self.records = [r for r in records if r.lat is not None and r.lon is not None]
-        if len(self.records) < 2:
+        self.selected_lap = selected_lap
+        if session.map_layers() is None:  # records are already loaded by the laps page
             raise LapsError("No GPS track for this activity (e.g. a pool swim or indoor session)")
-        self.sport = session.activity.sport
-        self.mode = "speed_mps"
-        self.highlights = [self._coords(lap) for lap in session.marked_laps()]
-        self.selected = self._coords(selected_lap) if selected_lap is not None else []
-        self.lap_markers = []
-        for lap in session.current_laps:
-            coords = self._coords(lap)
-            if coords:
-                self.lap_markers.append((*coords[0], str(lap.lap_index)))
-
-        caption = f"{session.activity.name}  ·  {len(self.highlights)} marked interval(s) outlined"
+        caption = f"{session.activity.name}  ·  {len(session.marked_laps())} marked interval(s) outlined"
         if selected_lap is not None:
             caption += "  ·  selected lap highlighted in cyan"
         self.mode_buttons = {}
         group = QButtonGroup(self)
-        for key, text, attr in self.MODES:
-            b = button(f"{text} ({key})", lambda _=False, a=attr: self.set_mode(a), checkable=True)
+        modes = list(enumerate(MAP_METRICS.items(), start=1))
+        for key, (metric, text) in modes:
+            b = button(f"{text} ({key})", lambda _=False, m=metric: self.set_mode(m), checkable=True)
             group.addButton(b)
-            self.mode_buttons[attr] = b
+            self.mode_buttons[metric] = b
         self.map = TrackMap()
         self.layout_.addWidget(label(caption, "status"))
         self.layout_.addLayout(row_layout(
@@ -441,50 +462,17 @@ class MapPage(Page):
         ))
         self.layout_.addWidget(self.map, 1)
         self.bind_back()
-        for key, text, attr in self.MODES:
-            self.bind(key, text, lambda a=attr: self.set_mode(a))
+        for key, (metric, text) in modes:
+            self.bind(str(key), text, lambda m=metric: self.set_mode(m))
         self.bind("0", "Fit track", self.map.fit)
         self.bind("+", "Zoom in", self.map.zoom_in)
         self.bind("-", "Zoom out", self.map.zoom_out)
-        self.set_mode(self.mode, refit=True)
+        self.set_mode("speed_mps", refit=True)
 
-    def _coords(self, lap) -> list[tuple[float, float]]:
-        lap_records = fit_parser.lap_record_slice(self.session.records, lap, self.session.utc_offset)
-        return [(r.lat, r.lon) for r in lap_records if r.lat is not None and r.lon is not None]
-
-    def set_mode(self, attr: str, refit: bool = False) -> None:
-        self.mode = attr
-        self.mode_buttons[attr].setChecked(True)
-        label_text, fmt = {
-            "speed_mps": ("Pace" if self.sport in PACE_SPORTS | SWIM_SPORTS else "Speed",
-                          lambda v: format_speed_or_pace(self.sport, v)),
-            "heart_rate": ("Heart rate", lambda v: f"{v:.0f} bpm"),
-            "power": ("Power", lambda v: f"{v:.0f} W"),
-            "altitude_m": ("Elevation", lambda v: f"{v:.0f} m"),
-        }[attr]
-        values = [getattr(r, attr) for r in self.records]
-        if attr == "speed_mps" and not any(v is not None for v in values):
-            values = self._speed_from_distance()
-        self.map.set_track(TrackData(
-            points=[(r.lat, r.lon) for r in self.records],
-            values=values,
-            value_label=label_text,
-            value_format=fmt,
-            highlights=self.highlights,
-            selected=self.selected,
-            lap_markers=self.lap_markers,
-        ), refit=refit)
-
-    def _speed_from_distance(self) -> list[float | None]:
-        """Speed from cumulative distance when the device recorded no speed channel."""
-        values: list[float | None] = [None]
-        for a, b in zip(self.records, self.records[1:]):
-            seconds = (b.timestamp_utc - a.timestamp_utc).total_seconds()
-            if seconds > 0 and a.distance_m is not None and b.distance_m is not None:
-                values.append((b.distance_m - a.distance_m) / seconds)
-            else:
-                values.append(None)
-        return values
+    def set_mode(self, metric: str, refit: bool = False) -> None:
+        self.mode_buttons[metric].setChecked(True)
+        layers = self.session.map_layers(metric, self.selected_lap)
+        self.map.set_track(track_data(layers, metric, self.session.activity.sport), refit=refit)
 
     def focus_widget(self):
         return self.map

@@ -28,6 +28,26 @@ class LapRow:
     lap: Lap  # the lap (or phase split) this row shows
 
 
+# Metrics a track can be coloured by: record attribute -> label.
+MAP_METRICS = {"speed_mps": "Speed / pace", "heart_rate": "Heart rate", "power": "Power", "altitude_m": "Elevation"}
+
+LatLon = tuple[float, float]
+
+
+@dataclass
+class MapLayers:
+    """What a map of the current laps view shows, as plain data for any front end."""
+    points: list[LatLon]
+    values: list[float | None]  # the colouring metric per point (None = no data there)
+    highlights: list[list[LatLon]]  # marked intervals
+    selected: list[LatLon]  # the selected lap / phase
+    markers: list[tuple[float, float, str]]  # (lat, lon, lap number) at each lap start
+
+
+def _gps(records) -> list[LatLon]:
+    return [(r.lat, r.lon) for r in records if r.lat is not None and r.lon is not None]
+
+
 class LapsSession:
     def __init__(self, activity: ActivitySummary) -> None:
         self.activity = activity
@@ -50,8 +70,8 @@ class LapsSession:
         return display.lap_columns(self.multisport)
 
     @property
-    def duration_column(self) -> int:
-        return display.lap_duration_column(self.multisport)
+    def right_aligned_columns(self) -> set[int]:
+        return display.lap_right_aligned_columns(self.multisport)
 
     def summary_text(self) -> str:
         device_laps = storage.load_laps(self.activity.activity_id) if self.multisport else []
@@ -61,19 +81,27 @@ class LapsSession:
         return display.interval_summary_text(self.current_laps, self.activity.sport)
 
     def rows(self) -> list[LapRow]:
+        """The displayed rows. The Total column is the running time at the end of each row —
+        of all laps, or, with the interval-only filter on, of the marked intervals alone.
+        Phase rows continue the running total from their interval's start."""
         rows = []
+        total = 0.0
         for position, lap in enumerate(self.current_laps):
             if self.show_intervals_only and not lap.is_interval:
                 continue
+            lap_start_total = total
+            total += lap.duration_s
             rows.append(LapRow(
-                display.lap_row(lap, str(lap.lap_index), self.activity.sport, self.multisport, precise=lap.is_interval),
+                display.lap_row(lap, str(lap.lap_index), self.activity.sport, self.multisport, lap.is_interval, total),
                 "interval" if lap.is_interval else "plain",
                 position,
                 lap,
             ))
+            phase_total = lap_start_total
             for phase_number, phase in enumerate(self.interval_splits.get(lap.lap_index, []), start=1):
+                phase_total += phase.duration_s
                 rows.append(LapRow(
-                    display.lap_row(phase, f"  {lap.lap_index}.{phase_number}", self.activity.sport, self.multisport, precise=True),
+                    display.lap_row(phase, f"  {lap.lap_index}.{phase_number}", self.activity.sport, self.multisport, True, phase_total),
                     "phase",
                     None,
                     phase,
@@ -192,8 +220,48 @@ class LapsSession:
             raise LapsError("No laps to show a histogram for")
         return phases
 
+    def lap_coords(self, lap: Lap | None) -> list[LatLon]:
+        """GPS points of one lap (or phase split); records must be loaded."""
+        if lap is None or self.records is None:
+            return []
+        return _gps(fit_parser.lap_record_slice(self.records, lap, self.utc_offset))
+
+    def map_layers(self, metric: str = "speed_mps", selected_lap: Lap | None = None) -> MapLayers | None:
+        """Map data for the current view (loads records — slow the first time for a long
+        activity, so call it off the UI thread). None when the activity has no GPS track."""
+        records = [r for r in self.ensure_records() if r.lat is not None and r.lon is not None]
+        if len(records) < 2:
+            return None
+        values = [getattr(r, metric) for r in records]
+        if metric == "speed_mps" and all(v is None for v in values):
+            values = _speed_from_distance(records)
+        markers = []
+        for lap in self.current_laps:
+            coords = self.lap_coords(lap)
+            if coords:
+                markers.append((*coords[0], str(lap.lap_index)))
+        return MapLayers(
+            points=_gps(records),
+            values=values,
+            highlights=[c for c in (self.lap_coords(lap) for lap in self.marked_laps()) if len(c) > 1],
+            selected=self.lap_coords(selected_lap),
+            markers=markers,
+        )
+
     def compare_inputs(self) -> tuple[list[Lap], list[fit_parser.RecordPoint], timedelta]:
         marked = self.marked_laps()
         if len(marked) < 2:
             raise LapsError("Mark at least 2 intervals to compare")
         return marked, self.ensure_records(), self.utc_offset
+
+
+def _speed_from_distance(records) -> list[float | None]:
+    """Speed from cumulative distance, for devices that record no speed channel."""
+    values: list[float | None] = [None]
+    for a, b in zip(records, records[1:]):
+        seconds = (b.timestamp_utc - a.timestamp_utc).total_seconds()
+        if seconds > 0 and a.distance_m is not None and b.distance_m is not None:
+            values.append((b.distance_m - a.distance_m) / seconds)
+        else:
+            values.append(None)
+    return values

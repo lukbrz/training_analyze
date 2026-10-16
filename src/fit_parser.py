@@ -1,5 +1,6 @@
 import math
 from array import array
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 
 import fitparse
@@ -219,14 +220,6 @@ def _merge_autolap_splits(raw_laps: list[dict]) -> list[dict]:
     return merged
 
 
-def session_utc_offset(fit_bytes: bytes, start_time_local: str) -> timedelta:
-    """UTC->local offset for this FIT file, for use with parse_records()/split_by_*()."""
-    fitfile = fitparse.FitFile(fit_bytes)
-    session = next(fitfile.get_messages("session"), None)
-    utc_start = session.get_value("start_time") if session is not None else None
-    return _utc_offset(utc_start, datetime.fromisoformat(start_time_local))
-
-
 def _pool_length_distance_points(fitfile) -> list[tuple[datetime, float]]:
     """(utc_time, cumulative_distance_m) breakpoints built from a pool swim's `length`
     messages — the only place a pool swim stores distance (its `record` messages have none,
@@ -380,7 +373,8 @@ def load_records(activity_id: str, fit_bytes: bytes | None = None) -> list[Recor
 
 
 def load_utc_offset(activity_id: str, start_time_local: str) -> timedelta:
-    """Same as session_utc_offset(), but from the records cache instead of a full re-parse."""
+    """The FIT session's UTC->local offset (for translating record timestamps to the local
+    lap times), from the records cache rather than a full re-parse of the FIT file."""
     start = _load_stream(activity_id)[1]
     return _utc_offset(start, datetime.fromisoformat(start_time_local))
 
@@ -688,15 +682,11 @@ def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) ->
     utc_start = datetime.fromisoformat(lap.start_time_local) - offset
     utc_end = utc_start + timedelta(seconds=lap.duration_s)
 
-    start_idx = end_idx = None
-    for i, rec in enumerate(records):
-        if start_idx is None and rec.timestamp_utc >= utc_start:
-            start_idx = i
-        if rec.timestamp_utc <= utc_end:
-            end_idx = i
-        elif start_idx is not None:
-            break
-    if start_idx is None or end_idx is None or end_idx < start_idx:
+    # Records are in time order: binary search the window (the map slices every lap on each
+    # change, so a linear scan per lap gets slow on long activities).
+    start_idx = bisect_left(records, utc_start, key=lambda r: r.timestamp_utc)
+    end_idx = bisect_right(records, utc_end, key=lambda r: r.timestamp_utc) - 1
+    if start_idx >= len(records) or end_idx < start_idx:
         return []
 
     result = list(records[start_idx : end_idx + 1])

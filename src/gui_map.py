@@ -103,8 +103,24 @@ class TrackMap(QWidget):
         self._world: list[tuple[float, float]] = []
         self._buckets: list[int | None] = []  # colour bucket per point (None = no value)
         self._paths: dict[int, dict] = {}
+        self.placeholder = "No GPS track for this activity"
 
     # --- data ---------------------------------------------------------------------
+
+    def set_placeholder(self, text: str) -> None:
+        self.data = None
+        self.placeholder = text
+        self.update()
+
+    def set_selected(self, points: list[tuple[float, float]]) -> None:
+        """Change only the highlighted lap — rebuilds that one path, not the whole track."""
+        if self.data is None:
+            return
+        self.data.selected = points
+        world = [world_xy(lat, lon, 0) for lat, lon in points]
+        for zoom, paths in self._paths.items():
+            paths["selected"] = self._simplified_path(world, 2**zoom) if len(points) > 1 else None
+        self.update()
 
     def set_track(self, data: TrackData, refit: bool) -> None:
         self.data = data
@@ -159,7 +175,7 @@ class TrackMap(QWidget):
         painter.fillRect(self.rect(), QColor(COLORS["bg_dark"]))
         if not self.data or not self.data.points:
             painter.setPen(QColor(COLORS["comment"]))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No GPS track for this activity")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.placeholder)
             return
         self._draw_tiles(painter)
         # Dim the (bright) map a little so the coloured track stands out in the dark theme.

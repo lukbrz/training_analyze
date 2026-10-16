@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import display
 from theme import COLORS, SERIES_COLORS, SPORT_COLORS
 
 MONO_FONT = "JetBrains Mono, DejaVu Sans Mono, Consolas, monospace"
@@ -246,11 +247,12 @@ def fill_table(
 
 
 def table_as_tsv(table: QTableWidget) -> str:
-    header = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
-    lines = ["\t".join(header)]
-    for r in range(table.rowCount()):
-        lines.append("\t".join((table.item(r, c).text() if table.item(r, c) else "").strip() for c in range(table.columnCount())))
-    return "\n".join(lines)
+    """The table exactly as displayed, as tab-separated text (see display.tsv)."""
+    columns = range(table.columnCount())
+    return display.tsv(
+        [table.horizontalHeaderItem(c).text() for c in columns],
+        [[table.item(r, c).text() if table.item(r, c) else "" for c in columns] for r in range(table.rowCount())],
+    )
 
 
 # --- Charts ---------------------------------------------------------------------------

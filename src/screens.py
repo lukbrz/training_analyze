@@ -22,9 +22,16 @@ import training_load
 import workout_library
 from laps_session import LapsError, LapsSession
 from models import ActivitySummary, Lap, Route, ZoneTime
+from theme import COLORS
 from workout_library import LibraryError, WorkoutLibrary
 
 ALL_SPORTS = "__all__"
+
+
+def _rgb(name: str) -> tuple[int, int, int]:
+    """A theme palette colour as the (r, g, b) tuple plotext accepts."""
+    value = COLORS[name].lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def _activity_cells(activity: ActivitySummary, route_name: str) -> tuple:
@@ -43,10 +50,10 @@ def _cell_text(cell) -> str:
 def _table_as_tsv(table: DataTable) -> str:
     """The table exactly as displayed (current filter, phase-split rows and all) as
     tab-separated text, which pastes into a spreadsheet as cells."""
-    lines = ["\t".join(_cell_text(col.label) for col in table.columns.values())]
-    for row in range(table.row_count):
-        lines.append("\t".join(_cell_text(cell) for cell in table.get_row_at(row)))
-    return "\n".join(lines)
+    return display.tsv(
+        [_cell_text(col.label) for col in table.columns.values()],
+        [[_cell_text(cell) for cell in table.get_row_at(row)] for row in range(table.row_count)],
+    )
 
 
 def _copy_to_clipboard(screen: Screen, text: str, what: str) -> None:
@@ -329,7 +336,25 @@ class LapsScreen(Screen):
     #split_value_input {
         width: 1fr;
     }
+
+    #laps_body {
+        height: 1fr;
+    }
+
+    #laps_table {
+        width: auto;
+        max-width: 3fr;
+    }
+
+    #track_plot {
+        width: 1fr;
+        min-width: 30;
+    }
     """
+
+    # Below this terminal width the track outline is hidden so the table keeps its columns.
+    MIN_WIDTH_FOR_TRACK = 150
+    TRACK_POINTS = 1500  # braille resolution doesn't need more
 
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
@@ -350,6 +375,8 @@ class LapsScreen(Screen):
         self.activity = activity
         self.client = client
         self.session = LapsSession(activity)
+        self.track_layers = None  # laps_session.MapLayers once records are loaded (None: no GPS)
+        self._redraw_timer = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -362,7 +389,7 @@ class LapsScreen(Screen):
             Button("Reset", id="reset_button"),
             id="split_bar",
         )
-        yield DataTable(id="laps_table")
+        yield Horizontal(DataTable(id="laps_table"), PlotextPlot(id="track_plot"), id="laps_body")
         yield Static("", id="interval_summary")
         yield Footer()
 
@@ -374,22 +401,82 @@ class LapsScreen(Screen):
         # Without this, Textual auto-focuses the split-by-distance Input, and every
         # single-letter binding (m/z/c/p) silently types into it instead of firing.
         table.focus()
+        self._load_track()
+
+    @work(thread=True)
+    def _load_track(self) -> None:
+        # First open of a long activity parses its FIT file (seconds) — keep the UI live.
+        try:
+            layers = self.session.map_layers()
+        except LapsError:
+            layers = None
+        self.app.call_from_thread(self._track_loaded, layers)
+
+    def _track_loaded(self, layers) -> None:
+        self.track_layers = layers
+        self._draw_track()
+
+    def on_resize(self, event) -> None:
+        self.query_one("#track_plot", PlotextPlot).display = self.size.width >= self.MIN_WIDTH_FOR_TRACK
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Debounced: holding an arrow key shouldn't redraw the outline for every row passed.
+        if self._redraw_timer is not None:
+            self._redraw_timer.stop()
+        self._redraw_timer = self.set_timer(0.15, self._draw_track)
+
+    def _draw_track(self) -> None:
+        """Braille outline of the GPS track: marked intervals yellow, the selected lap cyan."""
+        plot = self.query_one("#track_plot", PlotextPlot)
+        plt = plot.plt
+        plt.clear_data()
+        plt.clear_figure()
+        if self.track_layers is None:
+            plt.title("No GPS track" if self.session.records is not None else "Loading track...")
+            plot.refresh()
+            return
+        lats = [lat for lat, _ in self.track_layers.points]
+        # Scale longitude by cos(latitude) so the outline isn't stretched east-west.
+        scale = math.cos(math.radians(sum(lats) / len(lats)))
+
+        def xy(points):
+            step = max(1, len(points) // self.TRACK_POINTS)
+            sampled = points[::step]
+            return [lon * scale for _, lon in sampled], [lat for lat, _ in sampled]
+
+        # Exact RGB colours: textual-plotext's theme remaps named ones ("yellow" draws red).
+        plt.plot(*xy(self.track_layers.points), marker="braille", color=_rgb("comment"))
+        for highlight in self.track_layers.highlights:
+            plt.plot(*xy(highlight), marker="braille", color=_rgb("yellow"))
+        selected = self.session.lap_coords(self.session.row_lap(self.query_one(DataTable).cursor_row or 0))
+        if len(selected) > 1:
+            plt.plot(*xy(selected), marker="braille", color=_rgb("cyan"))
+        start, end = xy([self.track_layers.points[0]]), xy([self.track_layers.points[-1]])
+        plt.scatter(*start, marker="●", color=_rgb("green"))
+        plt.scatter(*end, marker="●", color=_rgb("red"))
+        plt.xticks([])
+        plt.yticks([])
+        plt.title("Track — intervals yellow, selected lap cyan")
+        plot.refresh()
 
     def _rebuild_table(self) -> None:
         table = self.query_one(DataTable)
         cursor_row = table.cursor_row
         table.clear()
-        duration_col = self.session.duration_column
+        right = self.session.right_aligned_columns
         for row in self.session.rows():
             style = self.STYLE_BY_KIND[row.kind]
             table.add_row(*(
-                Text(v, style=style, justify="right" if i == duration_col else "left")
+                Text(v, style=style, justify="right" if i in right else "left")
                 for i, v in enumerate(row.values)
             ))
         # Stay on the same row (e.g. when marking several laps in a row with m).
         if table.row_count:
             table.move_cursor(row=min(cursor_row or 0, table.row_count - 1))
         self.query_one("#interval_summary", Static).update(self.session.interval_summary())
+        if self.session.records is not None:  # laps/marks changed: refresh the outline's highlights
+            self.track_layers = self.session.map_layers()
+            self._draw_track()
 
     def _split_text(self) -> str:
         return self.query_one("#split_value_input", Input).value

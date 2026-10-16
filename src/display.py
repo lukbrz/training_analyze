@@ -24,6 +24,12 @@ from models import (
     format_speed_or_pace,
 )
 
+def tsv(columns, rows) -> str:
+    """Rows as tab-separated text (header first), which pastes into a spreadsheet as cells.
+    Used by every front end's "copy table"."""
+    return "\n".join(["\t".join(columns), *("\t".join(str(v).strip() for v in row) for row in rows)])
+
+
 # --- Activities -----------------------------------------------------------------
 
 ACTIVITY_COLUMNS = (
@@ -125,7 +131,7 @@ def activity_summary_text(activity: ActivitySummary, device_laps: list[Lap]) -> 
 # --- Laps -----------------------------------------------------------------------
 
 LAP_COLUMNS = (
-    "#", "Start", "Duration", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Ascent", "Descent", "Int"
+    "#", "Start", "Duration", "Total", "Distance", "Pace/Speed", "Avg HR", "Avg Power", "Ascent", "Descent", "Int"
 )
 
 
@@ -133,22 +139,28 @@ def lap_columns(multisport: bool) -> tuple[str, ...]:
     return LAP_COLUMNS[:1] + ("Sport",) + LAP_COLUMNS[1:] if multisport else LAP_COLUMNS
 
 
-def lap_duration_column(multisport: bool) -> int:
-    return lap_columns(multisport).index("Duration")
+def lap_right_aligned_columns(multisport: bool) -> set[int]:
+    columns = lap_columns(multisport)
+    return {columns.index("Duration"), columns.index("Total")}
 
 
-def lap_row(lap: Lap, index_label: str, activity_sport: str, multisport: bool, precise: bool) -> tuple[str, ...]:
-    """One laps-table row. Interval laps and their phase splits (`precise`) get tenths of a
-    second — it's the only way a rep's phase durations visibly sum back to the rep's own
-    duration (see fit_parser._interpolate_at_distance/_interpolate_at_time)."""
+def lap_row(
+    lap: Lap, index_label: str, activity_sport: str, multisport: bool, precise: bool, total_s: float
+) -> tuple[str, ...]:
+    """One laps-table row; `total_s` is the cumulative time at the end of this lap. Interval
+    laps and their phase splits (`precise`) get tenths of a second — it's the only way a
+    rep's phase durations visibly sum back to the rep's own duration (see
+    fit_parser._interpolate_at_distance/_interpolate_at_time)."""
     sport = lap.sport or activity_sport
-    duration = format_duration_tenths(lap.duration_s) if precise else format_duration(lap.duration_s)
+    fmt = format_duration_tenths if precise else format_duration
+    duration, total = fmt(lap.duration_s), fmt(total_s)
     sport_cells = (LEG_NAMES.get(sport, sport),) if multisport else ()
     return (
         index_label,
         *sport_cells,
         lap.start_time_local[11:19] if lap.start_time_local else "–",
         duration,
+        total,
         format_lap_distance(sport, lap.distance_m),
         format_speed_or_pace(sport, lap.avg_speed_mps),
         format_hr(lap.avg_hr),
@@ -507,3 +519,15 @@ def week_tss_parts(view: services.TrainingWeekView) -> dict[str, int]:
     """Rounded TSS done / remaining / missed, for a stacked progress bar."""
     w = view.week
     return {"done": round_tss(w.done_tss), "remaining": round_tss(w.remaining_tss), "missed": round_tss(w.missed_tss)}
+
+
+def metric_legend(metric: str, sport: str):
+    """(label, value formatter) for a map colouring metric (see laps_session.MAP_METRICS)."""
+    if metric == "speed_mps":
+        pace = sport in ("running", "walking", "hiking") or sport in SWIM_SPORTS
+        return ("Pace" if pace else "Speed"), (lambda v: format_speed_or_pace(sport, v))
+    return {
+        "heart_rate": ("Heart rate", lambda v: f"{v:.0f} bpm"),
+        "power": ("Power", lambda v: f"{v:.0f} W"),
+        "altitude_m": ("Elevation", lambda v: f"{v:.0f} m"),
+    }[metric]
