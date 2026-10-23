@@ -67,6 +67,7 @@ def parse(
             avg_hr=session.get_value("avg_heart_rate"),
             avg_power=session.get_value("avg_power"),
             total_ascent_m=session.get_value("total_ascent"),
+            virtual=session.get_value("sub_sport") == "virtual_activity",
         )
 
     raw_laps = []
@@ -695,6 +696,21 @@ def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) ->
     if end_idx + 1 < len(records) and result[-1].timestamp_utc < utc_end:
         result.append(_interpolate_at_time(result[-1], records[end_idx + 1], utc_end))
     return result
+
+
+def restate_lap_geo(laps: list[Lap], records: list[RecordPoint], offset: timedelta) -> None:
+    """Mutates `laps` in place, recomputing each lap's distance, speed, ascent and descent
+    from `records` over the lap's own time window — for device laps whose FIT-reported
+    distance is worse than the record stream's (a trainer-estimated distance on a bike
+    computer, once merged with a virtual-ride recording of the same session; see
+    dedupe.merge_records). Duration, HR, power and interval marks are left as they are."""
+    for lap in laps:
+        bucket = lap_record_slice(records, lap, offset)
+        if len(bucket) < 2 or bucket[0].distance_m is None or bucket[-1].distance_m is None:
+            continue
+        lap.distance_m = bucket[-1].distance_m - bucket[0].distance_m
+        lap.avg_speed_mps = lap.distance_m / lap.duration_s if lap.duration_s else None
+        lap.total_ascent_m, lap.total_descent_m = _ascent_descent(bucket)
 
 
 def lap_x_values(lap_records: list[RecordPoint], lap: Lap, mode: str) -> list[float]:

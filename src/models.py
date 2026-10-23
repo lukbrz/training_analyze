@@ -19,6 +19,10 @@ class ActivitySummary:
     avg_power: float | None = None
     total_ascent_m: float | None = None
     route_id: str | None = None
+    # Recorded by virtual-riding software (TrainingPeaks Virtual, Zwift... — FIT sub_sport
+    # 'virtual_activity'): its distance, speed and elevation describe the virtual course, which
+    # beats a trainer-estimated distance when the same ride is also recorded on a bike computer.
+    virtual: bool = False
 
 
 @dataclass

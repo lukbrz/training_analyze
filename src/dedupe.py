@@ -12,7 +12,10 @@ def is_duplicate(a: ActivitySummary, b: ActivitySummary) -> bool:
     """Two activities are the same physical session recorded by separate devices if
     they're the same sport, start within START_TIME_TOLERANCE_S of each other, and their
     distance and duration each agree within tolerance (different devices commonly disagree
-    slightly on GPS-derived distance and on exactly when recording started/stopped)."""
+    slightly on GPS-derived distance and on exactly when recording started/stopped).
+
+    Distance isn't compared when exactly one of them is a virtual ride: a bike computer's
+    trainer-estimated distance and the virtual course's distance routinely differ by 20%+."""
     if a.sport != b.sport:
         return False
     try:
@@ -22,7 +25,7 @@ def is_duplicate(a: ActivitySummary, b: ActivitySummary) -> bool:
         return False
     if abs((ta - tb).total_seconds()) > START_TIME_TOLERANCE_S:
         return False
-    if not _within_tolerance(a.distance_m, b.distance_m, DISTANCE_TOLERANCE):
+    if a.virtual == b.virtual and not _within_tolerance(a.distance_m, b.distance_m, DISTANCE_TOLERANCE):
         return False
     if not _within_tolerance(a.duration_s, b.duration_s, DURATION_TOLERANCE):
         return False
@@ -48,7 +51,12 @@ def find_duplicate_pairs(
 
 def choose_primary(a: ActivitySummary, b: ActivitySummary) -> tuple[ActivitySummary, ActivitySummary]:
     """Pick which of two duplicate activities to treat as primary: the one with more
-    optional fields populated wins (richer sensor data), tie-broken by longer duration."""
+    optional fields populated wins (richer sensor data), tie-broken by longer duration.
+    Against a virtual ride the real device always wins — its laps follow the structured
+    workout and its name is the workout's; the virtual ride still supplies distance and
+    elevation (see merge_summary/merge_records)."""
+    if a.virtual != b.virtual:
+        return (b, a) if a.virtual else (a, b)
 
     def completeness(s: ActivitySummary) -> tuple[int, float]:
         fields = (s.avg_hr, s.avg_power, s.total_ascent_m, s.avg_speed_mps)
@@ -60,8 +68,15 @@ def choose_primary(a: ActivitySummary, b: ActivitySummary) -> tuple[ActivitySumm
 def merge_summary(primary: ActivitySummary, secondaries: list[ActivitySummary]) -> ActivitySummary:
     """A copy of `primary` with any null optional field filled from the first secondary
     that has it. Distance/duration/sport/name/start_time stay primary's own — they're
-    already a full, self-consistent session measurement from its own device."""
+    already a full, self-consistent session measurement from its own device — except that
+    a virtual-ride secondary's distance, speed and ascent replace a non-virtual primary's
+    (its trainer-estimated figures)."""
     merged = dataclasses.replace(primary)
+    virtual = next((s for s in secondaries if s.virtual), None)
+    if virtual is not None and not primary.virtual:
+        merged.distance_m = virtual.distance_m
+        merged.avg_speed_mps = virtual.avg_speed_mps
+        merged.total_ascent_m = virtual.total_ascent_m
     for field in ("avg_hr", "avg_power", "total_ascent_m", "avg_speed_mps"):
         if getattr(merged, field) is not None:
             continue
@@ -73,7 +88,10 @@ def merge_summary(primary: ActivitySummary, secondaries: list[ActivitySummary]) 
     return merged
 
 
-def merge_records(streams: list[list[RecordPoint]]) -> list[RecordPoint]:
+GEO_FIELDS = ("distance_m", "speed_mps", "lat", "lon", "altitude_m")
+
+
+def merge_records(streams: list[list[RecordPoint]], geo_source: int | None = None) -> list[RecordPoint]:
     """Combine multiple record streams for the same physical session into one, keyed by
     wall-clock second (FIT timestamps are UTC regardless of device, so streams line up
     without any offset conversion). `streams[0]` is primary: at each shared timestamp its
@@ -85,27 +103,45 @@ def merge_records(streams: list[list[RecordPoint]]) -> list[RecordPoint]:
     so switching source at a gap can introduce a small jump rather than a perfectly smooth
     curve. Acceptable for a personal tool — the point is filling missing HR/power/GPS
     coverage, not producing a metrologically perfect distance trace.
+
+    `geo_source` (an index into `streams`, used for a virtual ride) makes that stream the
+    only source of GEO_FIELDS — mixing a virtual course's distance with a trainer's
+    estimate would make cumulative distance jump back and forth. Where that stream has no
+    sample, distance/position/altitude hold its nearest earlier value (its first value
+    before it starts) and speed is left empty.
     """
     if not streams:
         return []
     by_ts = [{r.timestamp_utc.replace(microsecond=0): r for r in stream} for stream in streams]
     all_ts = sorted(set().union(*by_ts))
 
+    geo = by_ts[geo_source] if geo_source is not None else None
+    # Last value seen per geo field, seeded with the stream's first so leading gaps hold it too.
+    held = {f: _first_non_null(streams[geo_source], f) for f in GEO_FIELDS} if geo is not None else {}
+
     merged = []
     for ts in all_ts:
         candidates = [d[ts] for d in by_ts if ts in d]
-        merged.append(
-            RecordPoint(
-                timestamp_utc=ts,
-                distance_m=_first_non_null(candidates, "distance_m"),
-                heart_rate=_first_non_null(candidates, "heart_rate"),
-                power=_first_non_null(candidates, "power"),
-                speed_mps=_first_non_null(candidates, "speed_mps"),
-                lat=_first_non_null(candidates, "lat"),
-                lon=_first_non_null(candidates, "lon"),
-                altitude_m=_first_non_null(candidates, "altitude_m"),
-            )
+        point = RecordPoint(
+            timestamp_utc=ts,
+            distance_m=_first_non_null(candidates, "distance_m"),
+            heart_rate=_first_non_null(candidates, "heart_rate"),
+            power=_first_non_null(candidates, "power"),
+            speed_mps=_first_non_null(candidates, "speed_mps"),
+            lat=_first_non_null(candidates, "lat"),
+            lon=_first_non_null(candidates, "lon"),
+            altitude_m=_first_non_null(candidates, "altitude_m"),
         )
+        if geo is not None:
+            source = geo.get(ts)
+            for field in GEO_FIELDS:
+                value = getattr(source, field) if source is not None else None
+                if value is not None:
+                    held[field] = value
+                elif field != "speed_mps":
+                    value = held[field]
+                setattr(point, field, value)
+        merged.append(point)
     return merged
 
 

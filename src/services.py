@@ -230,8 +230,13 @@ def merge_duplicates(
             continue
 
         streams = []
+        # Index of the virtual-ride stream, whose distance/position/elevation win (see
+        # dedupe.merge_records); None when no recording of the pair is virtual.
+        geo_source = None
         if storage.has_fit(primary_id):
             streams.append(fit_parser.parse_records(storage.fit_path(primary_id).read_bytes()))
+            if primary.virtual:
+                geo_source = 0
 
         secondary_summaries = []
         for secondary_id in secondary_ids:
@@ -246,9 +251,18 @@ def merge_duplicates(
                 secondary_fit_bytes, secondary_id, "", primary.start_time_local
             )
             secondary_summaries.append(secondary_summary)
+            if secondary_summary.virtual and geo_source is None:
+                geo_source = len(streams) - 1
 
         if len(streams) >= 2:
-            storage.save_merged_records(primary_id, dedupe.merge_records(streams))
+            merged_records = dedupe.merge_records(streams, geo_source)
+            storage.save_merged_records(primary_id, merged_records)
+            if geo_source not in (None, 0):
+                # The primary's device laps carry its own (trainer-estimated) distance.
+                laps = storage.load_laps(primary_id)
+                offset = fit_parser.load_utc_offset(primary_id, primary.start_time_local)
+                fit_parser.restate_lap_geo(laps, merged_records, offset)
+                storage.save_laps(primary_id, laps)
         if secondary_summaries:
             by_id[primary_id] = dedupe.merge_summary(primary, secondary_summaries)
 
