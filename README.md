@@ -111,7 +111,7 @@ The laps list has three sections:
 
 - **INTERVALS:** every lap you marked, from any section, in time order, with its phase splits. Laps from a split are prefixed `S` and physical laps `P`.
 - **LAPS:** your watch's own laps, or a whole-activity split once you type one (e.g. `1km`) and press Split. Reset brings back the watch laps.
-- **PHYSICAL:** laps of a repeated loop (track or park laps), found from GPS automatically when the activity opens.
+- **PHYSICAL:** laps of a repeated loop (track or park laps), found from GPS automatically when the activity opens. The loops are numbered; the way to the loop and the way back show as `in` and `out`.
 
 Marks on the watch's laps are saved. Marks on a split or on physical laps last until you leave the activity.
 

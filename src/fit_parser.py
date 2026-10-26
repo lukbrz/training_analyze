@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 
 import fitparse
 
-import routes
 import storage
 from models import ActivitySummary, Lap, RecordPoint
 
@@ -579,33 +578,80 @@ def split_by_time(records: list[RecordPoint], seconds: float, offset: timedelta)
 DEFAULT_CLOSE_RADIUS_M = 75.0
 DEFAULT_MIN_LAP_DISTANCE_M = 150.0
 MAX_ANCHOR_CANDIDATES = 400
+# A lap counts as a loop when its distance is within this fraction of the loop length.
+LOOP_LENGTH_TOLERANCE = 0.15
+# Once the loop length is known, two lap boundaries must be at least this fraction of it
+# apart — which ignores a second pass near the anchor within the same lap.
+MIN_LOOP_GAP_FRACTION = 0.7
+# Relative width of the window in which return distances are counted as "the same".
+LOOP_LENGTH_WINDOW = 0.06
+LEAD_IN_LABEL, WAY_BACK_LABEL, OTHER_LABEL = "in", "out", "other"
+
+_TrackPoint = tuple[int, float, float, float]  # (record index, x m, y m, cumulative distance m)
 
 
-def _boundaries_for_anchor(
-    records: list[RecordPoint], anchor_lat: float, anchor_lon: float,
-    close_radius_m: float, min_lap_distance_m: float,
-) -> list[int]:
-    """Record indices where `records` first comes within `close_radius_m` of (anchor_lat,
-    anchor_lon), each at least `min_lap_distance_m` (by cumulative distance) after the last —
-    i.e. how many times the track "closes a loop" back to this one point. Index 0 always
-    counts as the first boundary even though it isn't itself a return to the anchor."""
-    boundaries = [0]
-    last_boundary_distance = records[0].distance_m or 0.0
-    inside_radius = False
-    for i, rec in enumerate(records):
-        if rec.lat is None or rec.lon is None:
-            continue
-        dist_to_anchor = routes.haversine_m(anchor_lat, anchor_lon, rec.lat, rec.lon)
-        if dist_to_anchor <= close_radius_m:
-            if not inside_radius:
-                inside_radius = True
-                covered = (rec.distance_m or last_boundary_distance) - last_boundary_distance
-                if i != boundaries[-1] and covered >= min_lap_distance_m:
-                    boundaries.append(i)
-                    last_boundary_distance = rec.distance_m or last_boundary_distance
+def _track_points(records: list[RecordPoint]) -> list[_TrackPoint]:
+    """GPS records projected to local metres (equirectangular — plenty accurate over one
+    activity, and far cheaper than haversine in the anchor search's inner loop), with a
+    cumulative distance that carries forward over records missing one."""
+    first = next(r for r in records if r.lat is not None and r.lon is not None)
+    metres_per_deg = 6371000.0 * math.pi / 180.0
+    lon_scale = math.cos(math.radians(first.lat)) * metres_per_deg
+    points = []
+    distance = records[0].distance_m or 0.0
+    for i, r in enumerate(records):
+        if r.distance_m is not None:
+            distance = r.distance_m
+        if r.lat is not None and r.lon is not None:
+            points.append((i, (r.lon - first.lon) * lon_scale, (r.lat - first.lat) * metres_per_deg, distance))
+    return points
+
+
+def _anchor_visits(
+    points: list[_TrackPoint], anchor: _TrackPoint, radius_m: float, first_gap_m: float, gap_m: float,
+) -> list[tuple[int, float]]:
+    """(record index, distance) of each time the track enters `radius_m` of `anchor` — each
+    at least `first_gap_m` (by distance) after the start for the first visit, and `gap_m`
+    after the previous visit for the rest. Only entering counts, so lingering near the anchor
+    doesn't create extra visits."""
+    _, ax, ay, _ = anchor
+    r2 = radius_m * radius_m
+    visits: list[tuple[int, float]] = []
+    last_distance = points[0][3]
+    inside = False
+    for i, x, y, distance in points:
+        if (x - ax) * (x - ax) + (y - ay) * (y - ay) <= r2:
+            if not inside:
+                inside = True
+                if distance - last_distance >= (gap_m if visits else first_gap_m):
+                    visits.append((i, distance))
+                    last_distance = distance
         else:
-            inside_radius = False
-    return boundaries
+            inside = False
+    return visits
+
+
+def _loop_length(points: list[_TrackPoint], anchors: list[_TrackPoint], radius_m: float, min_lap_distance_m: float) -> float | None:
+    """The course's loop length: the distance after which the track most often comes back
+    to where it was. Every point on a loop returns after one loop length (and multiples),
+    while a spot the course merely passes twice per lap — a junction, a hairpin, the far
+    straight of a running track — only adds returns at a few anchors, so the loop length
+    is the most frequent return distance over all anchors."""
+    gaps = []
+    for anchor in anchors:
+        visits = _anchor_visits(points, anchor, radius_m, 0.0, min_lap_distance_m)
+        distances = [d for _, d in visits]  # entry to entry, so the radius cancels out
+        gaps += [b - a for k, a in enumerate(distances) for b in distances[k + 1:] if b - a >= min_lap_distance_m]
+    if not gaps:
+        return None
+    gaps.sort()
+    best_count, best_window = 0, (0, 0)
+    for k, gap in enumerate(gaps):
+        end = bisect_right(gaps, gap * (1 + LOOP_LENGTH_WINDOW))
+        if end - k > best_count:
+            best_count, best_window = end - k, (k, end)
+    window = gaps[best_window[0]:best_window[1]]
+    return window[len(window) // 2] if best_count >= 2 else None
 
 
 def detect_physical_laps(
@@ -617,61 +663,84 @@ def detect_physical_laps(
     """Detect repeated physical loops (e.g. laps around a park) from GPS position alone,
     independent of the device's own lap markers.
 
-    The loop's anchor point is searched for across the *whole* track, not assumed to be the
-    recording's start: a real workout commonly has a non-looping warmup/cooldown leg (e.g.
-    running from home to a park and back), so a loop that only exists partway through the
-    activity would never be found by anchoring on the first few GPS fixes. Every candidate
-    anchor (subsampled across the track — `MAX_ANCHOR_CANDIDATES` — since testing every single
-    point is unnecessary and slow) is scored by how many times the track returns within
-    `close_radius_m` of it, each such return at least `min_lap_distance_m` (by cumulative
-    distance) after the last (only the first point of each "visit" counts, so lingering near
-    a point doesn't create duplicate boundaries); the best-scoring anchor's boundaries become
-    the lap splits. Returns None if the best anchor still yields fewer than 2 segments — e.g.
-    an out-and-back or point-to-point course that never repeats any single point.
+    Two passes over candidate anchor points (subsampled across the whole track —
+    `MAX_ANCHOR_CANDIDATES` — since a real workout commonly has a non-looping lead-in and
+    way back, e.g. running from home to a park and back):
 
-    `close_radius_m` defaults generously (75m) because consumer GPS accuracy commonly runs
-    20-50m under tree cover or in urban canyons (e.g. park loops) — too tight a radius misses
-    real loops entirely, which is the failure mode that matters most (silently detecting
-    nothing beats a wrong split, but detecting nothing is worse than a caller-supplied
-    override). Both parameters are also exposed to the UI (`LapsScreen`'s split-value input)
-    so a miss on a real activity can be retried with a wider radius without a code change.
-    Known limitations: loops shorter than `min_lap_distance_m` won't be detected; a course
-    that happens to pass near some point mid-loop (not a real lap boundary) can produce a
-    false split, and the anchor search only ever picks one loop location per activity, so an
-    activity mixing two different loop courses only finds whichever recurs more. Acceptable
-    for a personal tool, not worth extra heuristics.
+    1. The loop length L is the most frequent distance after which the track returns within
+       `close_radius_m` of where it was (see `_loop_length`).
+    2. For each anchor, the lap boundaries are the track's visits to it, at least
+       `MIN_LOOP_GAP_FRACTION` x L apart — so a spot the course passes twice per lap (where a
+       lead-in joins the loop and the loop passes again 150 m later, a hairpin, the far
+       straight of a track) can't split a lap in two. The anchor yielding the most laps of
+       length L (within `LOOP_LENGTH_TOLERANCE`), then the least deviation from L, wins:
+       typically the junction where the lead-in meets the loop, which makes every pass a
+       complete loop.
+
+    A loop must start and end at the anchor, so the part before the first visit (after the
+    last) only counts as one when the recording starts (ends) there. Laps are numbered from
+    1 by `label` among the loops; the part before the first loop is
+    labelled "in" and the part after the last "out" (when they aren't loops themselves), any
+    other irregular part "other". `lap_index` just counts all parts from 1. Returns None
+    when nothing repeats (an out-and-back or point-to-point course).
+
+    `close_radius_m` defaults generously (75 m) because consumer GPS accuracy commonly runs
+    20-50 m under tree cover or in urban canyons; the UI lets the user retry with another
+    radius. Known limitation: only one loop course per activity is found (whichever recurs
+    most).
     """
-    fixed = [r for r in records if r.lat is not None and r.lon is not None]
-    if len(fixed) < 20:
+    if sum(1 for r in records if r.lat is not None and r.lon is not None) < 20:
+        return None
+    points = _track_points(records)
+    step = max(1, len(points) // MAX_ANCHOR_CANDIDATES)
+    anchors = points[::step]
+    loop_m = _loop_length(points, anchors, close_radius_m, min_lap_distance_m)
+    if loop_m is None:
         return None
 
-    step = max(1, len(records) // MAX_ANCHOR_CANDIDATES)
-    best_boundaries = [0]
-    for i in range(0, len(records), step):
-        rec = records[i]
-        if rec.lat is None or rec.lon is None:
-            continue
-        boundaries = _boundaries_for_anchor(records, rec.lat, rec.lon, close_radius_m, min_lap_distance_m)
-        if len(boundaries) > len(best_boundaries):
-            best_boundaries = boundaries
+    def is_loop(distance: float) -> bool:
+        return abs(distance - loop_m) <= loop_m * LOOP_LENGTH_TOLERANCE
 
-    if len(best_boundaries) < 2:
+    best_score, best_visits, best_anchor = None, [], None
+    gap = max(min_lap_distance_m, loop_m * MIN_LOOP_GAP_FRACTION)
+    for anchor in anchors:
+        visits = _anchor_visits(points, anchor, close_radius_m, min_lap_distance_m, gap)
+        laps = [b - a for (_, a), (_, b) in zip(visits, visits[1:])]
+        score = (sum(map(is_loop, laps)), -sum(abs(d - loop_m) for d in laps))
+        if best_score is None or score > best_score:
+            best_score, best_visits, best_anchor = score, visits, anchor
+    if best_score[0] < 2:
         return None
 
-    segments = []
-    for start, end in zip(best_boundaries, best_boundaries[1:] + [len(records)]):
-        segments.append(records[start:end])
-
-    # Every segment except the last is guaranteed >= min_lap_distance_m by construction
-    # (a boundary only gets added once that much has been covered). The last segment runs
-    # to the end of the recording with no such guarantee — without this, a run that simply
-    # *finishes* near where it started (extremely common) would masquerade as an extra lap.
+    boundaries = [0] + [i for i, _ in best_visits]
+    segments = [records[a:b] for a, b in zip(boundaries, boundaries[1:] + [len(records)]) if b - a > 1]
+    # A run that finishes near where it started would otherwise end in a sliver of a "lap".
     _fold_negligible_tail(segments, min_tail=min_lap_distance_m)
 
-    if len(segments) < 2:
-        return None
+    laps = [_bucket_to_lap(segment, i, offset) for i, segment in enumerate(segments, start=1)]
+    # A loop starts and ends at the anchor: the part before the first visit only counts as
+    # one when the recording starts there, the part after the last only when it ends there
+    # (otherwise e.g. part of a loop plus the way home could pass for a loop by its length).
+    _, ax, ay, _ = best_anchor
 
-    return [_bucket_to_lap(segment, i, offset) for i, segment in enumerate(segments, start=1)]
+    def at_anchor(point: _TrackPoint) -> bool:
+        return math.hypot(point[1] - ax, point[2] - ay) <= close_radius_m
+
+    loops = [is_loop(lap.distance_m) for lap in laps]
+    loops[0] = loops[0] and at_anchor(points[0])
+    loops[-1] = loops[-1] and at_anchor(points[-1])
+    number = 0
+    for k, lap in enumerate(laps):
+        if loops[k]:
+            number += 1
+            lap.label = str(number)
+        elif not any(loops[:k]):
+            lap.label = LEAD_IN_LABEL
+        elif not any(loops[k + 1:]):
+            lap.label = WAY_BACK_LABEL
+        else:
+            lap.label = OTHER_LABEL
+    return laps
 
 
 def lap_record_slice(records: list[RecordPoint], lap: Lap, offset: timedelta) -> list[RecordPoint]:

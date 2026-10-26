@@ -151,20 +151,25 @@ class LapsSession:
         interval-only filter on, only the INTERVALS section is shown."""
         marked = self._marked()
         rows = [self._header("intervals", "INTERVALS", f"{len(marked)} marked" if marked else "none — m marks a lap")]
-        rows += self._lap_rows("intervals", marked, lambda source, lap: f"{INTERVAL_LABEL_PREFIX[source]}{lap.lap_index}")
+        rows += self._lap_rows("intervals", marked, _interval_label)
         if not self.show_intervals_only:
-            plain = lambda source, lap: str(lap.lap_index)  # noqa: E731
             source = SPLIT if self.split_laps is not None else DEVICE
             rows.append(self._header("laps", "LAPS", self.split_name or "device"))
-            rows += self._lap_rows("laps", [(source, lap) for lap in self.current_laps], plain)
+            rows += self._lap_rows("laps", [(source, lap) for lap in self.current_laps], _plain_label)
             note = {
                 "pending": "detecting...", "none": "none found", "no GPS": "no GPS track",
-                "found": f"{len(self.physical_laps or [])} loops",
+                "found": self._physical_note(),
             }[self.physical_status]
             rows.append(self._header("physical", "PHYSICAL", note))
-            rows += self._lap_rows("physical", [(PHYSICAL, lap) for lap in self.physical_laps or []], plain)
+            rows += self._lap_rows("physical", [(PHYSICAL, lap) for lap in self.physical_laps or []], _plain_label)
         self._rows = rows
         return rows
+
+    def _physical_note(self) -> str:
+        laps = self.physical_laps or []
+        loops = sum(1 for lap in laps if (lap.label or "").isdigit())
+        extras = "/".join(lap.label for lap in laps if lap.label in (fit_parser.LEAD_IN_LABEL, fit_parser.WAY_BACK_LABEL))
+        return f"{loops} loops" + (f" + {extras}" if extras else "")
 
     def row_lap(self, row_index: int) -> Lap | None:
         """The lap (or phase split) shown in a displayed row; None for section headers."""
@@ -346,6 +351,18 @@ class LapsSession:
         if len(marked) < 2:
             raise LapsError("Mark at least 2 intervals to compare")
         return marked, self.ensure_records(), self.utc_offset
+
+
+def _plain_label(source: str, lap: Lap) -> str:
+    return lap.label or str(lap.lap_index)
+
+
+def _interval_label(source: str, lap: Lap) -> str:
+    """A marked lap's label among the intervals: its source's prefix, then its own label
+    ("P3", "S2"; "P:in" for a physical lap's lead-in)."""
+    label = _plain_label(source, lap)
+    prefix = INTERVAL_LABEL_PREFIX[source]
+    return f"{prefix}:{label}" if prefix and not label.isdigit() else f"{prefix}{label}"
 
 
 def _speed_from_distance(records) -> list[float | None]:

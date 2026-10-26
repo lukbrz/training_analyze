@@ -40,6 +40,9 @@ class Lap:
     # The lap's own sport, for multisport activities where it differs per leg; None on laps
     # saved before this existed and on custom splits, which fall back to the activity's sport.
     sport: str | None = None
+    # How the lap is shown instead of its number, e.g. physical laps' "in"/"out" for the
+    # lead-in and way back around the numbered loops; None shows lap_index.
+    label: str | None = None
 
 
 @dataclass
