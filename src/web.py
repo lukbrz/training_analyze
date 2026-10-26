@@ -177,7 +177,8 @@ def main_page() -> None:
 
 LAP_ROW_STYLE = (
     "params => params.data._kind === 'interval' ? {fontWeight: 600}"
-    f" : params.data._kind === 'phase' ? {{color: '{COLORS['comment']}', fontStyle: 'italic'}} : {{}}"
+    f" : params.data._kind === 'phase' ? {{color: '{COLORS['comment']}', fontStyle: 'italic'}}"
+    f" : params.data._kind === 'header' ? {{fontWeight: 700, color: '{COLORS['accent']}', background: '{COLORS['surface2']}'}} : {{}}"
 )
 MAP_MODES = [(str(key), text, metric) for key, (metric, text) in enumerate(MAP_METRICS.items(), start=1)]
 
@@ -246,11 +247,13 @@ def laps_page(activity_id: str) -> None:
         for column in session.right_aligned_columns:
             table.options["columnDefs"][column]["cellStyle"] = {"textAlign": "right"}
         table.update()
+        hint = session.take_cursor_hint()
+        keep_row = hint if hint is not None else keep_row
         select_row(table, keep_row)
         if session.records is not None:  # laps/marks changed: redraw the side map's highlights
             background_tasks.create(refresh_side_map(keep_row))
         interval_area.clear()
-        stats = display.interval_stats(session.current_laps, activity.sport)
+        stats = display.interval_stats(session.marked_laps(), activity.sport)
         with interval_area:
             if stats:
                 stat_tiles(stats)
@@ -293,6 +296,17 @@ def laps_page(activity_id: str) -> None:
         notify("Detecting course loops...")
         laps = await run.io_bound(session.detect_physical_laps, radius)
         run_op(lambda: session.apply_physical_laps(laps))
+
+    async def initial_load() -> None:
+        """Track on the side map, then the PHYSICAL section (seconds each on a long ride)."""
+        await refresh_side_map(0, fit=True)
+        try:
+            laps = await run.io_bound(session.detect_physical_laps)
+        except LapsError:
+            session.physical_laps_failed()
+            rebuild(await selected_row(table))
+            return
+        run_op(lambda: session.apply_physical_laps(laps, explicit=False), keep_row=await selected_row(table))
 
     async def refresh_side_map(row: int | None = None, fit: bool = False) -> None:
         selected = session.row_lap(row) if row is not None else None
@@ -409,7 +423,7 @@ def laps_page(activity_id: str) -> None:
     frame.bind("m", "Mark interval", toggle_interval)
     frame.bind("z", "Zones", show_zones)
     frame.bind("c", "Compare intervals", draw_compare)
-    frame.bind("p", "Physical laps", physical_laps)
+    frame.bind("p", "Re-detect loops", physical_laps)
     frame.bind("i", "Split intervals", split_intervals)
     frame.bind("f", "Interval-only", toggle_filter)
     frame.bind("h", "Phase time/pace/power", show_phases)
@@ -419,7 +433,7 @@ def laps_page(activity_id: str) -> None:
     frame.bind("y", "Copy table", lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"))
     on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
     rebuild(0)
-    ui.timer(0.2, lambda: refresh_side_map(0, fit=True), once=True)
+    ui.timer(0.2, initial_load, once=True)
 
 
 # --- Routes --------------------------------------------------------------------------
@@ -616,7 +630,7 @@ def calendar_page() -> None:
     notes = ui.label("").classes("ta-notes")
     chart = ui.echart({**ECHART_BASE}).classes("w-full").style("height: 30vh")
 
-    def load() -> None:
+    def load(keep_row: int | None = None) -> None:
         view = services.load_training_week(state["week"])
         state["view"] = view
         today = date.today()
@@ -648,6 +662,8 @@ def calendar_page() -> None:
         table.options["columnDefs"][3][":cellStyle"] = "params => ({color: params.data._sport_color})"
         table.options[":getRowStyle"] = "params => params.data._today ? {fontWeight: 600} : {}"
         table.update()
+        if keep_row is not None and rows:
+            select_row(table, min(keep_row, len(rows) - 1))
         note_lines = list(view.notes)
         if not view.calendar_cached:
             note_lines.insert(0, "This week's calendar isn't downloaded yet — refreshing...")
@@ -705,11 +721,117 @@ def calendar_page() -> None:
         state["week"] = training_load.week_start(date.today())
         load()
 
+    async def selected_item() -> training_load.WeekItem | None:
+        row = await selected_row(table)
+        items = state["view"].week.items
+        return items[row] if row is not None and row < len(items) else None
+
+    async def dialog_result(build) -> object:
+        """Show a dialog built by `build(dialog)`; single-key shortcuts pause while it's open."""
+        state["dialog"] = True
+        with ui.dialog() as dialog, ui.card().classes("ta-card p-6 gap-2").style("min-width: 480px"):
+            build(dialog)
+        try:
+            return await dialog
+        finally:
+            state["dialog"] = False
+            dialog.delete()
+
+    async def choose(prompt: str, options: list[str]) -> int | None:
+        def build(dialog) -> None:
+            ui.label(prompt).classes("font-semibold")
+            for n, text in enumerate(options):
+                ui.button(text, on_click=lambda n=n: dialog.submit(n)).props("flat no-caps align=left").classes("w-full")
+            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("outline")
+        return await dialog_result(build)
+
+    async def confirm(prompt: str, label: str) -> bool:
+        def build(dialog) -> None:
+            ui.html(escape(prompt)).classes("ta-pre")
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("outline")
+                ui.button(label, on_click=lambda: dialog.submit(True))
+        return bool(await dialog_result(build))
+
+    async def garmin_change(operation) -> None:
+        row = await selected_row(table)
+        try:
+            notify(await run.io_bound(operation))
+        except services.CalendarError as e:
+            notify(str(e), "warning")
+        except Exception as e:  # network/auth trouble: Garmin is unchanged or partly changed
+            notify(f"Garmin change failed: {e}", "error")
+        load(row)
+
+    async def local_change(operation) -> None:
+        row = await selected_row(table)
+        try:
+            notify(operation())
+        except services.CalendarError as e:
+            notify(str(e), "warning")
+        load(row)
+
+    def unless_dialog(action):
+        async def run_action() -> None:
+            if not state.get("dialog"):
+                await action()
+        return run_action
+
+    async def move_workout() -> None:
+        item = await selected_item()
+        try:
+            days = services.move_targets(item)
+        except services.CalendarError as e:
+            notify(str(e), "warning")
+            return
+        if State.client is None:
+            notify("Not logged in to Garmin", "warning")
+            return
+        index = await choose(services.move_prompt(item), [display.week_day_choice(d, state["view"].week.items) for d in days])
+        if index is not None:
+            await garmin_change(lambda: services.move_planned(State.client, item, days[index]))
+
+    async def cancel_workout() -> None:
+        item = await selected_item()
+        try:
+            prompt = services.cancel_prompt(item)
+        except services.CalendarError as e:
+            notify(str(e), "warning")
+            return
+        if State.client is None:
+            notify("Not logged in to Garmin", "warning")
+            return
+        if await confirm(prompt, "Remove from calendar"):
+            await garmin_change(lambda: services.cancel_planned(State.client, item))
+
+    async def link() -> None:
+        item = await selected_item()
+        if item is not None and item.status == "done (planned)":
+            try:
+                prompt = services.unlink_prompt(item)
+            except services.CalendarError as e:
+                notify(str(e), "warning")
+                return
+            if await confirm(prompt, "Unlink"):
+                await local_change(lambda: services.unlink(item))
+            return
+        try:
+            candidates = services.link_candidates(state["view"].week, item)
+        except services.CalendarError as e:
+            notify(str(e), "warning")
+            return
+        index = await choose(services.link_prompt(item), [display.week_item_choice(c) for c in candidates])
+        if index is not None:
+            await local_change(lambda: services.link(item, candidates[index]))
+
     frame.bind_back()
     frame.bind("[", "Prev week", lambda: change(-7))
     frame.bind("]", "Next week", lambda: change(7))
     frame.bind("t", "This week", this_week)
     frame.bind("r", "Refresh from Garmin", refresh)
+    frame.bind("m", "Move workout", unless_dialog(move_workout))
+    frame.bind("x", "Cancel workout", unless_dialog(cancel_workout))
+    frame.bind("l", "Link/unlink plan", unless_dialog(link))
     frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
         display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].week.items]), "week"))
     load()

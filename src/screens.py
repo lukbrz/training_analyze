@@ -10,7 +10,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Select, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, OptionList, Select, Static
 from textual_plotext import PlotextPlot
 
 import display
@@ -361,14 +361,17 @@ class LapsScreen(Screen):
         Binding("m", "toggle_interval", "Mark interval"),
         Binding("z", "zones", "Zones"),
         Binding("c", "compare", "Compare intervals"),
-        Binding("p", "physical_laps", "Physical laps"),
+        Binding("p", "physical_laps", "Re-detect loops"),
         Binding("i", "split_intervals", "Split intervals"),
         Binding("f", "toggle_interval_filter", "Interval-only"),
         Binding("h", "phase_metrics", "Phase time/pace/power"),
         Binding("y", "copy", "Copy table"),
     ]
 
-    STYLE_BY_KIND = {"interval": "bold", "phase": "dim", "plain": ""}
+    STYLE_BY_KIND = {
+        "interval": "bold", "phase": "dim", "plain": "",
+        "header": f"bold {COLORS['accent']} on {COLORS['surface2']}",
+    }
 
     def __init__(self, activity: ActivitySummary, client) -> None:
         super().__init__()
@@ -409,8 +412,14 @@ class LapsScreen(Screen):
         try:
             layers = self.session.map_layers()
         except LapsError:
-            layers = None
+            self.session.physical_laps_failed()
+            self.app.call_from_thread(self._track_loaded, None)
+            self.app.call_from_thread(self._rebuild_table)
+            return
         self.app.call_from_thread(self._track_loaded, layers)
+        # Then fill the PHYSICAL section (seconds again on a long ride).
+        laps = self.session.detect_physical_laps()
+        self.app.call_from_thread(self._run, lambda: self.session.apply_physical_laps(laps, explicit=False))
 
     def _track_loaded(self, layers) -> None:
         self.track_layers = layers
@@ -470,9 +479,11 @@ class LapsScreen(Screen):
                 Text(v, style=style, justify="right" if i in right else "left")
                 for i, v in enumerate(row.values)
             ))
-        # Stay on the same row (e.g. when marking several laps in a row with m).
+        # Stay on the same row (e.g. when marking several laps in a row with m), or follow
+        # the row an operation moved.
+        hint = self.session.take_cursor_hint()
         if table.row_count:
-            table.move_cursor(row=min(cursor_row or 0, table.row_count - 1))
+            table.move_cursor(row=min(hint if hint is not None else cursor_row or 0, table.row_count - 1))
         self.query_one("#interval_summary", Static).update(self.session.interval_summary())
         if self.session.records is not None:  # laps/marks changed: refresh the outline's highlights
             self.track_layers = self.session.map_layers()
@@ -965,6 +976,56 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ChoiceScreen(ModalScreen[int | None]):
+    """Pick one of several options; dismisses with the chosen index, or None on cancel."""
+
+    CSS = """
+    ChoiceScreen {
+        align: center middle;
+    }
+
+    #choice_box {
+        width: 90;
+        max-width: 95%;
+        height: auto;
+        max-height: 90%;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    #choice_list {
+        height: auto;
+        max-height: 20;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, prompt_text: str, options: list[str]) -> None:
+        super().__init__()
+        self.prompt_text = prompt_text
+        self.options = options
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static(self.prompt_text),
+            OptionList(*self.options, id="choice_list"),
+            Static("enter choose · esc cancel", classes="hint"),
+            id="choice_box",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option_index)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class WorkoutsScreen(Screen):
     """Workout JSON files and week-plan zips in storage.WORKOUTS_DIR — a Textual shell around
     workout_library.WorkoutLibrary (shared with the Qt GUI): validate, preview, upload one
@@ -1130,6 +1191,9 @@ class TrainingWeekScreen(Screen):
         Binding("right_square_bracket", "next_week", "Next week"),
         Binding("t", "this_week", "This week"),
         Binding("r", "refresh", "Refresh from Garmin"),
+        Binding("m", "move_workout", "Move workout"),
+        Binding("x", "cancel_workout", "Cancel workout"),
+        Binding("l", "link", "Link/unlink plan"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -1156,11 +1220,11 @@ class TrainingWeekScreen(Screen):
         self._load_view()
         self.action_refresh()
 
-    def _load_view(self) -> None:
+    def _load_view(self, keep_row: bool = False) -> None:
         self.view = services.load_training_week(self.week)
-        self._render_view()
+        self._render_view(keep_row)
 
-    def _render_view(self) -> None:
+    def _render_view(self, keep_row: bool = False) -> None:
         view = self.view
         today = date.today()
         self.query_one("#week_title", Static).update(Text(
@@ -1168,6 +1232,7 @@ class TrainingWeekScreen(Screen):
         ))
         self.query_one("#week_summary", Static).update(display.week_summary_text(view))
         table = self.query_one(DataTable)
+        cursor_row = table.cursor_row
         table.clear()
         for item in view.week.items:
             cells, color = display.week_item_cells(item, today)
@@ -1175,6 +1240,8 @@ class TrainingWeekScreen(Screen):
             table.add_row(*(Text(str(c), style=style) for c in cells))
         if not view.week.items:
             table.add_row("", "", "", "", "Nothing planned or done this week", "", "", "", "")
+        if keep_row and cursor_row:  # after changing a row, stay on it (or near it)
+            table.move_cursor(row=min(cursor_row, table.row_count - 1))
         notes = list(view.notes)
         if not view.calendar_cached:
             notes.insert(0, "This week's calendar isn't downloaded yet — refreshing...")
@@ -1237,6 +1304,89 @@ class TrainingWeekScreen(Screen):
         for message in warnings:
             self.app.call_from_thread(self.notify, message, severity="warning")
         self.app.call_from_thread(self._load_view)
+
+    def _selected_item(self) -> training_load.WeekItem | None:
+        row = self.query_one(DataTable).cursor_row
+        items = self.view.week.items if self.view else []
+        return items[row] if row is not None and 0 <= row < len(items) else None
+
+    def action_move_workout(self) -> None:
+        item = self._selected_item()
+        try:
+            days = services.move_targets(item)
+        except services.CalendarError as e:
+            self.notify(str(e), severity="warning")
+            return
+        if self.client is None:
+            self.notify("Not logged in to Garmin", severity="warning")
+            return
+
+        def chosen(index: int | None) -> None:
+            if index is not None:
+                self._garmin_change(lambda: services.move_planned(self.client, item, days[index]))
+
+        options = [display.week_day_choice(day, self.view.week.items) for day in days]
+        self.app.push_screen(ChoiceScreen(services.move_prompt(item), options), chosen)
+
+    def action_cancel_workout(self) -> None:
+        item = self._selected_item()
+        try:
+            prompt = services.cancel_prompt(item)
+        except services.CalendarError as e:
+            self.notify(str(e), severity="warning")
+            return
+        if self.client is None:
+            self.notify("Not logged in to Garmin", severity="warning")
+            return
+
+        def confirmed(yes: bool) -> None:
+            if yes:
+                self._garmin_change(lambda: services.cancel_planned(self.client, item))
+
+        self.app.push_screen(ConfirmScreen(prompt, "Remove from calendar"), confirmed)
+
+    @work(thread=True, group="calendar_change")
+    def _garmin_change(self, operation) -> None:
+        try:
+            self.app.call_from_thread(self.notify, operation())
+        except services.CalendarError as e:
+            self.app.call_from_thread(self.notify, str(e), severity="warning")
+        except Exception as e:  # network/auth trouble: Garmin is unchanged or partly changed
+            self.app.call_from_thread(self.notify, f"Garmin change failed: {e}", severity="error")
+        self.app.call_from_thread(self._load_view, True)
+
+    def _local_change(self, operation) -> None:
+        try:
+            self.notify(operation())
+        except services.CalendarError as e:
+            self.notify(str(e), severity="warning")
+        self._load_view(keep_row=True)
+
+    def action_link(self) -> None:
+        item = self._selected_item()
+        if item is not None and item.status == "done (planned)":
+            try:
+                prompt = services.unlink_prompt(item)
+            except services.CalendarError as e:
+                self.notify(str(e), severity="warning")
+                return
+            self.app.push_screen(
+                ConfirmScreen(prompt, "Unlink"),
+                lambda yes: self._local_change(lambda: services.unlink(item)) if yes else None,
+            )
+            return
+        try:
+            candidates = services.link_candidates(self.view.week, item)
+        except services.CalendarError as e:
+            self.notify(str(e), severity="warning")
+            return
+
+        def chosen(index: int | None) -> None:
+            if index is not None:
+                self._local_change(lambda: services.link(item, candidates[index]))
+
+        options = [display.week_item_choice(c) for c in candidates]
+        self.app.push_screen(ChoiceScreen(services.link_prompt(item), options), chosen)
 
     def action_copy(self) -> None:
         table = self.query_one(DataTable)

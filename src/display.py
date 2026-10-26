@@ -391,12 +391,36 @@ def week_item_cells(item: training_load.WeekItem, today: date) -> tuple[tuple[st
         item.day.strftime("%d.%m"),
         status,
         item.sport,
-        item.title,
+        week_item_title(item),
         format_duration(item.duration_s) if item.duration_s else "–",
         format_lap_distance(item.sport, item.distance_m) if item.distance_m else "–",
         str(round_tss(item.tss)),
         tss_how(item),
     ), color
+
+
+def week_item_title(item: training_load.WeekItem) -> str:
+    """The Workout column; a row pairing a plan with an activity also names the plan when
+    that adds something — the activity's name doesn't already contain it (Garmin names an
+    activity after its workout, prefixed with the place), or it was planned for another day."""
+    same_day = item.plan_day is None or item.plan_day == item.day
+    if not item.plan_title or item.plan_title.casefold() in item.title.casefold() and same_day:
+        return item.title
+    day = f" ({item.plan_day:%a})" if item.plan_day and item.plan_day != item.day else ""
+    return f"{item.title}  ← {item.plan_title}{day}"
+
+
+def week_item_choice(item: training_load.WeekItem) -> str:
+    """One line describing a week row, for pick-one dialogs (link to...)."""
+    status = WEEK_STATUS_STYLES.get(item.status, (item.status, ""))[0]
+    duration = f" · {format_duration(item.duration_s)}" if item.duration_s else ""
+    return f"{item.day:%a %d.%m} · {status} · {item.sport} · {item.title}{duration}"
+
+
+def week_day_choice(day: date, items: list[training_load.WeekItem]) -> str:
+    """One move-to target: the day and what's already on it."""
+    on_day = [i.title for i in items if i.day == day]
+    return f"{day:%a %d.%m}" + (f"  —  {', '.join(on_day)}" if on_day else "")
 
 
 def week_title(start: date) -> str:

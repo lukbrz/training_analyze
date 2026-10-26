@@ -25,6 +25,7 @@ THRESHOLDS_OVERRIDE_PATH = DATA_DIR / "thresholds_override.json"
 ACTIVITY_STATS_PATH = DATA_DIR / "activity_stats.json"
 CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
+PLAN_LINKS_PATH = DATA_DIR / "plan_links.json"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -228,6 +229,17 @@ def load_calendar_month(year: int, month: int, calendar_dir: Path = CALENDAR_DIR
 
 def save_calendar_month(year: int, month: int, items: list[dict], calendar_dir: Path = CALENDAR_DIR) -> None:
     _write_json(calendar_dir / f"{year:04d}-{month:02d}.json", items)
+
+
+def load_plan_links(path: Path = PLAN_LINKS_PATH) -> dict[str, str | None]:
+    """Hand-made pairings of planned workouts with completed activities, keyed by the
+    calendar item id of the plan (its schedule id, as a string): an activity id links the
+    two whatever their day or sport; None means "never pair this plan automatically"."""
+    return _read_json(path, {})
+
+
+def save_plan_links(links: dict[str, str | None], path: Path = PLAN_LINKS_PATH) -> None:
+    _write_json(path, links)
 
 
 def load_cached_workout(workout_id: int, cache_dir: Path = WORKOUT_CACHE_DIR) -> dict | None:

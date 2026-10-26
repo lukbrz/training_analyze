@@ -107,10 +107,18 @@ Use the sport drop-down to show only running, cycling, swimming and so on.
 
 ### Activity laps
 
+The laps list has three sections:
+
+- **INTERVALS:** every lap you marked, from any section, in time order, with its phase splits. Laps from a split are prefixed `S` and physical laps `P`.
+- **LAPS:** your watch's own laps, or a whole-activity split once you type one (e.g. `1km`) and press Split. Reset brings back the watch laps.
+- **PHYSICAL:** laps of a repeated loop (track or park laps), found from GPS automatically when the activity opens.
+
+Marks on the watch's laps are saved. Marks on a split or on physical laps last until you leave the activity.
+
 | Key | Action |
 | --- | --- |
 | `m` | Mark or unmark the selected lap as an interval |
-| `p` | Physical laps: detect laps of a loop (e.g. track or park laps) from GPS |
+| `p` | Detect physical laps again, using the loop radius typed in the split box (e.g. `100`) |
 | `i` | Split intervals into phases (shown as 2.1, 2.2, …) |
 | `f` | Show interval laps only |
 | `h` | Phase time/pace/power histograms |
@@ -119,7 +127,7 @@ Use the sport drop-down to show only running, cycling, swimming and so on.
 | `g` | Full-size map (desktop and web apps) |
 | `y` | Copy the table |
 
-The split length is typed as a plain number for **metres** (`300`) or with a time unit for **time** (`60s`, `1m`, `1:30`). The **Total** column shows the running time after each lap. With "interval only" (`f`) on, it adds up the intervals only.
+The split length is typed as a plain number for **metres** (`300`) or with a time unit for **time** (`60s`, `1m`, `1:30`). The **Total** column shows the running time after each lap. It restarts in each section. "Interval only" (`f`) hides the other two sections.
 
 A multisport activity (e.g. a triathlon) shows one section per leg. You can split pool swims the same way as runs and rides. If an activity varies in intensity (a structured workout), the app joins splits that your watch's Auto Lap cut in the middle of a planned interval.
 
@@ -132,7 +140,16 @@ The calendar shows one week of your Garmin Connect calendar: done, planned and m
 - **ATL (fatigue):** 7-day average of daily TSS.
 - **TSB (form):** yesterday's CTL minus ATL.
 
-`[` and `]` move between weeks, `t` jumps to this week and `r` refreshes from Garmin.
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Previous / next week |
+| `t` | This week |
+| `r` | Refresh from Garmin |
+| `m` | Move the selected planned workout to another day of its week, in Garmin Connect (your watch gets it on its next sync) |
+| `x` | Cancel the selected planned workout: removes it from the Garmin Connect calendar but keeps it in your workout library (asks first) |
+| `l` | Link a planned workout with the activity that carried it out, e.g. Saturday's run done on Sunday, or an activity recorded without the workout on the watch. On a linked row, `l` unlinks them |
+
+A planned workout counts as done when an activity of the same sport is on the same day. Links override this. They are stored only in this app (`data/plan_links.json`), because Garmin has no such link.
 
 ### Workouts
 

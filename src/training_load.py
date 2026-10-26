@@ -276,7 +276,7 @@ def activity_date(activity: ActivitySummary) -> date:
 @dataclass
 class WeekItem:
     """One row of the week view: a completed activity, a planned workout, or both when the
-    plan was carried out (matched by date and sport family)."""
+    plan was carried out (matched by date and sport family, or linked by hand)."""
     day: date
     sport: str
     title: str
@@ -289,6 +289,10 @@ class WeekItem:
     workout_id: int | None = None
     planned_tss: float | None = None  # the plan's estimate, when a planned workout is involved
     plan_assumed: bool = False  # the plan estimate guessed some lap-button step lengths
+    schedule_id: int | None = None  # the plan's Garmin calendar item id (what moving/cancelling acts on)
+    plan_title: str | None = None  # the plan's own title and day, on rows that pair it with an activity
+    plan_day: date | None = None
+    linked: bool = False  # paired by hand (see storage.load_plan_links), not by day and sport
 
 
 @dataclass
@@ -314,36 +318,56 @@ def build_week(
     today: date,
     activities: list[tuple[ActivitySummary, TssEstimate]],
     planned: list[tuple[dict, PlannedEstimate]],
+    links: dict[str, str | None] | None = None,
 ) -> WeekSummary:
     """Combine a week's completed activities and planned workouts (calendar items with
-    their estimate) into rows. A planned workout counts as done when an activity of the same
+    their estimate) into rows. `links` (see storage.load_plan_links) pairs plans with
+    activities by hand first — any day of the week, any sport; a plan linked to None is never
+    paired automatically. Every other plan counts as done when an activity of the same
     sport family happened on its day; each activity satisfies at most one plan."""
+    links = links or {}
     end = start + timedelta(days=6)
     week = WeekSummary(start)
     unmatched = [(a, est) for a, est in activities if start <= activity_date(a) <= end]
-    for item, estimate in sorted(planned, key=lambda p: p[0]["date"]):
+    plans = [
+        (item, estimate) for item, estimate in sorted(planned, key=lambda p: p[0]["date"])
+        if start <= date.fromisoformat(item["date"]) <= end
+    ]
+
+    def done_row(item, estimate, match, linked: bool) -> None:
+        unmatched.remove(match)
+        activity, est = match
+        week.items.append(WeekItem(
+            activity_date(activity), activity.sport, activity.name, "done (planned)", est.tss, est.method,
+            activity.duration_s, activity.distance_m, activity.activity_id, item.get("workoutId"),
+            estimate.tss, bool(estimate.assumed_s), item.get("id"), item.get("title") or "",
+            date.fromisoformat(item["date"]), linked,
+        ))
+
+    remaining = []
+    for item, estimate in plans:
+        linked_id = links.get(str(item.get("id")))
+        match = next(((a, e) for a, e in unmatched if a.activity_id == linked_id), None) if linked_id else None
+        if match:
+            done_row(item, estimate, match, linked=True)
+        else:
+            remaining.append((item, estimate))
+    for item, estimate in remaining:
         day = date.fromisoformat(item["date"])
-        if not start <= day <= end:
-            continue
         family = sport_family(item.get("sportTypeKey"))
+        auto = str(item.get("id")) not in links
         match = next(
             ((a, e) for a, e in unmatched if activity_date(a) == day and sport_family(a.sport) == family),
             None,
-        )
-        assumed = bool(estimate.assumed_s)
+        ) if auto else None
         if match:
-            unmatched.remove(match)
-            activity, est = match
-            week.items.append(WeekItem(
-                day, activity.sport, activity.name, "done (planned)", est.tss, est.method,
-                activity.duration_s, activity.distance_m, activity.activity_id, item.get("workoutId"),
-                estimate.tss, assumed,
-            ))
+            done_row(item, estimate, match, linked=False)
         else:
             status = "missed" if day < today else "planned"
             week.items.append(WeekItem(
                 day, item.get("sportTypeKey") or "", item.get("title") or "", status, estimate.tss,
-                None, estimate.duration_s, None, None, item.get("workoutId"), estimate.tss, assumed,
+                None, estimate.duration_s, None, None, item.get("workoutId"), estimate.tss,
+                bool(estimate.assumed_s), item.get("id"),
             ))
     for activity, est in unmatched:
         week.items.append(WeekItem(

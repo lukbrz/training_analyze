@@ -199,6 +199,20 @@ def schedule_workout(garmin: Garmin, workout_id: int, date_str: str) -> None:
     garmin.schedule_workout(workout_id, date_str)
 
 
+def workout_exists(garmin: Garmin, workout_id: int) -> bool:
+    """Whether a workout is still in the user's Garmin workout library (False once deleted)."""
+    try:
+        garmin.get_workout_by_id(workout_id)
+    except GarminConnectNotFoundError:
+        return False
+    return True
+
+
+def unschedule_workout(garmin: Garmin, schedule_id: int) -> None:
+    """Remove one calendar entry (a calendar item's "id"); the workout itself is kept."""
+    garmin.unschedule_workout(schedule_id)
+
+
 __all__ = [
     "MfaRequired",
     "try_cached_login",
@@ -210,6 +224,8 @@ __all__ = [
     "get_power_zones",
     "upload_workout",
     "schedule_workout",
+    "unschedule_workout",
+    "workout_exists",
     "activity_stats",
     "get_thresholds",
     "get_calendar_month",

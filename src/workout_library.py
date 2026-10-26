@@ -178,7 +178,7 @@ class WorkoutLibrary:
             raise LibraryError("Select a valid workout to upload")
         warning = ""
         if key in storage.load_uploaded_workouts():
-            warning = "Already uploaded — uploading again creates a second copy in Garmin"
+            warning = "Already uploaded — it's put back on the calendar if missing there (no second copy)"
         return [(key, entry)], warning
 
     def week_upload(self, key: str | None) -> tuple[list[tuple[str, dict]], str]:
@@ -194,21 +194,29 @@ class WorkoutLibrary:
                 + ", ".join(k.split("/", 1)[1] for k in invalid),
                 severity="error",
             )
+        # Already-uploaded workouts are included too: upload_many checks each against Garmin
+        # and only puts it back on the calendar if its entry there was removed.
         uploaded = storage.load_uploaded_workouts()
-        pending = [k for k in keys if k not in uploaded]
-        if not pending:
-            raise LibraryError(f"Everything in {week} is already uploaded", severity="information")
-
+        new = [k for k in keys if k not in uploaded]
         today = date.today().isoformat()
-        lines = [f"Upload {len(pending)} workout(s) from {week} to Garmin Connect and schedule them?", ""]
+        if new:
+            lines = [f"Upload {len(new)} new workout(s) from {week} to Garmin Connect and schedule them?"]
+        else:
+            lines = [f"Every workout of {week} is already in Garmin Connect. Check the calendar and schedule each one that's missing from it?"]
+        if new and len(new) < len(keys):
+            lines.append(
+                f"The other {len(keys) - len(new)} are already in Garmin: each one missing from "
+                "the calendar is scheduled again (no second copy is made)."
+            )
+        lines.append("")
         for key in keys:
             entry = self.entries[key]
             when = entry.get("schedule_date") or "not scheduled"
-            note = "  (already uploaded — skipped)" if key in uploaded else ""
-            if key not in uploaded and entry.get("schedule_date") and entry["schedule_date"] < today:
-                note = "  ⚠ date is in the past"
+            note = "  (already uploaded)" if key in uploaded else ""
+            if entry.get("schedule_date") and entry["schedule_date"] < today:
+                note += "  ⚠ date is in the past"
             lines.append(f"  {when:<13} {entry['name']} [{entry['sport']}]{note}")
-        return [(k, self.entries[k]) for k in pending], "\n".join(lines)
+        return [(k, self.entries[k]) for k in keys], "\n".join(lines)
 
 
 def upload_many(
@@ -216,17 +224,24 @@ def upload_many(
 ) -> list[tuple[str, str]]:
     """Upload (and schedule) each workout, carrying on past failures. Returns
     (severity, message) notifications to show the user."""
-    notes, done = [], 0
+    notes = []
+    counts = {"uploaded": 0, "rescheduled": 0, "unchanged": 0}
+    months: dict = {}  # Garmin calendar months fetched during this run
     for i, (key, entry) in enumerate(items, start=1):
         progress(f"Uploading {i}/{len(items)}: {entry['name']}...")
         try:
-            warning = services.upload_and_record(client, key, entry)
+            outcome, warning = services.upload_and_record(client, key, entry, months)
         except Exception as e:  # surface any API rejection (e.g. a malformed DTO) and carry on
             notes.append(("error", f"Upload failed — {entry['name']}: {e}"))
             continue
-        done += 1
+        counts[outcome] += 1
         if warning:
             notes.append(("warning", warning))
-    if done:
-        notes.append(("information", f"Uploaded {done} of {len(items)} workout(s) to Garmin Connect"))
+    parts = [
+        f"{counts['uploaded']} uploaded" if counts["uploaded"] else "",
+        f"{counts['rescheduled']} put back on the calendar" if counts["rescheduled"] else "",
+        f"{counts['unchanged']} already on the calendar" if counts["unchanged"] else "",
+    ]
+    if any(parts):
+        notes.append(("information", "Garmin Connect: " + ", ".join(p for p in parts if p)))
     return notes

@@ -74,11 +74,16 @@ def refresh_training_data(client, week: date, progress: Progress = lambda _: Non
 
 
 def _calendar_items(week: date) -> list[dict]:
+    """The cached calendar items of one week. Garmin's month response also covers the
+    neighbouring months' days shown in its month grid (October's includes the end of
+    September), so a week spanning two months finds the same item in both files: keep one."""
     end = week + timedelta(days=6)
-    items = []
+    items, seen = [], set()
     for year, month in _months_of_week(week):
         for item in storage.load_calendar_month(year, month) or []:
-            if week.isoformat() <= item.get("date", "") <= end.isoformat():
+            key = (item.get("itemType"), item.get("id"))
+            if week.isoformat() <= item.get("date", "") <= end.isoformat() and key not in seen:
+                seen.add(key)
                 items.append(item)
     return items
 
@@ -124,7 +129,7 @@ def load_training_week(week: date, today: date | None = None) -> TrainingWeekVie
         dto = storage.load_cached_workout(item["workoutId"]) if item.get("workoutId") else None
         estimate = tl.workout_tss(dto, thresholds) if dto else tl.PlannedEstimate(0.0, 0.0)
         planned.append((item, estimate))
-    summary = tl.build_week(week, today, estimates, planned)
+    summary = tl.build_week(week, today, estimates, planned, storage.load_plan_links())
 
     notes = []
     known_ids = {a.activity_id for a, _ in estimates} | set(storage.load_merge_ledger())
@@ -163,6 +168,129 @@ def load_training_week(week: date, today: date | None = None) -> TrainingWeekVie
         notes=notes,
         calendar_cached=calendar_cached,
     )
+
+
+# --- Planned-workout changes (move / cancel in Garmin, link to an activity locally) ----
+
+
+class CalendarError(Exception):
+    """Something the user should be told (wrong kind of row, nothing to act on) — not a bug."""
+
+
+PLAN_STATUSES = ("planned", "missed")
+
+
+def _require_plan(item: tl.WeekItem | None, verb: str) -> tl.WeekItem:
+    if item is None or item.status not in PLAN_STATUSES or not item.schedule_id:
+        raise CalendarError(f"Select a planned (or missed) workout to {verb}")
+    return item
+
+
+def move_targets(item: tl.WeekItem | None) -> list[date]:
+    """The days a planned workout can move to: the other days of its own week."""
+    item = _require_plan(item, "move")
+    start = tl.week_start(item.day)
+    return [start + timedelta(days=n) for n in range(7) if start + timedelta(days=n) != item.day]
+
+
+def cancel_prompt(item: tl.WeekItem | None) -> str:
+    item = _require_plan(item, "cancel")
+    return (
+        f"Remove '{item.title}' ({item.day:%a %d.%m}) from the Garmin Connect calendar?\n\n"
+        "The watch drops it at its next sync. The workout itself stays in your Garmin workout "
+        "library, so it can be scheduled again."
+    )
+
+
+def _refetch_calendar(client, day: date) -> None:
+    for year, month in _months_of_week(tl.week_start(day)):
+        storage.save_calendar_month(year, month, garmin_client.get_calendar_month(client, year, month))
+
+
+def _drop_link(schedule_id: int) -> None:
+    links = storage.load_plan_links()
+    if links.pop(str(schedule_id), "absent") != "absent":
+        storage.save_plan_links(links)
+
+
+def move_planned(client, item: tl.WeekItem, day: date) -> str:
+    """Reschedule a planned workout in Garmin Connect to `day` (within its week). The new
+    calendar entry is created before the old one is removed, so a failure part-way leaves the
+    workout on both days rather than on neither. Returns a status message."""
+    if day not in move_targets(item):
+        raise CalendarError("A workout can only move to another day of its own week")
+    garmin_client.schedule_workout(client, item.workout_id, day.isoformat())
+    try:
+        garmin_client.unschedule_workout(client, item.schedule_id)
+    except Exception as e:
+        _refetch_calendar(client, item.day)
+        return f"'{item.title}' added on {day:%a %d.%m}, but removing it from {item.day:%a} failed: {e}"
+    _drop_link(item.schedule_id)  # the old calendar entry no longer exists
+    _refetch_calendar(client, item.day)
+    return f"Moved '{item.title}' to {day:%a %d.%m}"
+
+
+def cancel_planned(client, item: tl.WeekItem) -> str:
+    _require_plan(item, "cancel")
+    garmin_client.unschedule_workout(client, item.schedule_id)
+    _drop_link(item.schedule_id)
+    _refetch_calendar(client, item.day)
+    return f"Cancelled '{item.title}' ({item.day:%a %d.%m})"
+
+
+def link_candidates(week: tl.WeekSummary, item: tl.WeekItem | None) -> list[tl.WeekItem]:
+    """What the selected row can be paired with: a plan with the week's unplanned
+    activities, an unplanned activity with the week's open (planned or missed) plans."""
+    if item is not None and item.status in PLAN_STATUSES and item.schedule_id:
+        candidates = [i for i in week.items if i.status == "unplanned"]
+        what = "unplanned activities"
+    elif item is not None and item.status == "unplanned":
+        candidates = [i for i in week.items if i.status in PLAN_STATUSES and i.schedule_id]
+        what = "open planned workouts"
+    else:
+        raise CalendarError("Select a planned workout or an unplanned activity to link")
+    if not candidates:
+        raise CalendarError(f"No {what} this week to link it with")
+    return candidates
+
+
+def move_prompt(item: tl.WeekItem) -> str:
+    return f"Move '{item.title}' ({item.day:%a %d.%m}) in Garmin Connect to:"
+
+
+def link_prompt(item: tl.WeekItem) -> str:
+    what = "the activity that carried out this plan" if item.schedule_id else "the plan this activity carried out"
+    return f"Link '{item.title}' ({item.day:%a %d.%m}) with {what}:"
+
+
+def unlink_prompt(item: tl.WeekItem | None) -> str:
+    if item is None or item.status != "done (planned)" or not item.schedule_id:
+        raise CalendarError("Select a done (planned) row to unlink")
+    return (
+        f"Unlink '{item.title}' ({item.day:%a}) from the plan '{item.plan_title}' "
+        f"({item.plan_day:%a})?\n\nThey'll show as separate rows, and this plan won't be "
+        "matched to an activity automatically again (l links it by hand)."
+    )
+
+
+def link(a: tl.WeekItem, b: tl.WeekItem) -> str:
+    """Pair a planned workout with a completed activity (either order), e.g. Saturday's
+    planned run that was done on Sunday. Local only — Garmin has no such link."""
+    plan, activity = (a, b) if a.schedule_id else (b, a)
+    links = storage.load_plan_links()
+    links[str(plan.schedule_id)] = activity.activity_id
+    storage.save_plan_links(links)
+    return f"Linked '{plan.title}' ({plan.day:%a}) with '{activity.title}' ({activity.day:%a})"
+
+
+def unlink(item: tl.WeekItem | None) -> str:
+    """Split a done (planned) row back into the plan and the activity; the plan then stays
+    unpaired (no automatic same-day match) until linked again."""
+    unlink_prompt(item)
+    links = storage.load_plan_links()
+    links[str(item.schedule_id)] = None
+    storage.save_plan_links(links)
+    return f"Unlinked '{item.plan_title}' from '{item.title}'"
 
 
 # --- Activity sync / reprocess -------------------------------------------------
@@ -395,18 +523,46 @@ def reprocess_activities(progress: Progress = lambda _: None) -> str:
 # --- Workout upload -------------------------------------------------------------
 
 
-def upload_and_record(client, key: str, entry: dict) -> str:
-    """Create one workout in Garmin, record it in the ledger, then schedule it. Returns a
-    warning when the workout was created but scheduling failed. The ledger is written
-    before scheduling on purpose: an unrecorded upload would get uploaded again on retry,
-    leaving a duplicate workout in Garmin."""
+def _is_scheduled(client, workout_id: int, day: str, months: dict) -> bool:
+    """Whether Garmin's calendar has `workout_id` on `day` (YYYY-MM-DD); `months` caches the
+    month responses fetched during one upload run."""
+    year, month = int(day[:4]), int(day[5:7])
+    if (year, month) not in months:
+        months[(year, month)] = garmin_client.get_calendar_month(client, year, month)
+    return any(
+        i.get("itemType") == "workout" and i.get("workoutId") == workout_id and i.get("date") == day
+        for i in months[(year, month)]
+    )
+
+
+def upload_and_record(client, key: str, entry: dict, months: dict | None = None) -> tuple[str, str]:
+    """Put one workout file into Garmin: (outcome, warning), outcome "uploaded",
+    "rescheduled" or "unchanged".
+
+    A file the ledger says was uploaded is checked against Garmin first: while that workout
+    is still in the Garmin library it's reused — put back on the calendar when its date has
+    no entry for it (e.g. the calendar entry was removed), left alone when it does — and
+    only a workout deleted from Garmin is uploaded again. So no step here ever leaves two
+    copies of a workout in Garmin.
+
+    A new upload is recorded in the ledger before scheduling on purpose: an unrecorded
+    upload would get uploaded again on retry, leaving a duplicate workout in Garmin."""
+    months = {} if months is None else months
+    day = entry.get("schedule_date")
+    workout_id = storage.load_uploaded_workouts().get(key)
+    if workout_id is not None and garmin_client.workout_exists(client, workout_id):
+        if not day or _is_scheduled(client, workout_id, day, months):
+            return "unchanged", ""
+        garmin_client.schedule_workout(client, workout_id, day)
+        return "rescheduled", ""
+
     workout_id = garmin_client.upload_workout(client, workouts.to_garmin(entry))
     uploaded = storage.load_uploaded_workouts()
     uploaded[key] = workout_id
     storage.save_uploaded_workouts(uploaded)
-    if entry.get("schedule_date"):
+    if day:
         try:
-            garmin_client.schedule_workout(client, workout_id, entry["schedule_date"])
+            garmin_client.schedule_workout(client, workout_id, day)
         except Exception as e:  # the workout exists; only the calendar entry is missing
-            return f"{entry['name']} uploaded but not scheduled: {e}"
-    return ""
+            return "uploaded", f"{entry['name']} uploaded but not scheduled: {e}"
+    return "uploaded", ""

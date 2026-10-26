@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QHBoxLayout,
+    QInputDialog,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
@@ -255,7 +256,10 @@ class MainPage(Page):
 
 
 class LapsPage(Page):
-    STYLE_BY_KIND = {"interval": {"bold": True}, "phase": {"dim": True, "italic": True}, "plain": {}}
+    STYLE_BY_KIND = {
+        "interval": {"bold": True}, "phase": {"dim": True, "italic": True}, "plain": {},
+        "header": {"bold": True, "color": COLORS["accent"], "background": COLORS["surface2"]},
+    }
 
     def __init__(self, window, activity: ActivitySummary, client) -> None:
         super().__init__(window)
@@ -310,16 +314,29 @@ class LapsPage(Page):
         self.bind("m", "Mark interval", self.toggle_interval)
         self.bind("z", "Zones", lambda: self.window_.push(ZonesPage(self.window_, activity, client)))
         self.bind("c", "Compare intervals", self.compare)
-        self.bind("p", "Physical laps", self.physical_laps)
+        self.bind("p", "Re-detect loops", self.physical_laps)
         self.bind("i", "Split intervals", self.split_intervals)
         self.bind("f", "Interval-only", self.toggle_filter)
         self.bind("h", "Phase time/pace/power", self.histograms)
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         self._rebuild()
-        # First open of a long activity parses its FIT file (seconds): load off the UI thread.
-        run_background(self.session.map_layers, lambda _: self._refresh_side_map(refit=True),
-                       lambda e: self.side_map.set_placeholder(str(e)))
+        # First open of a long activity parses its FIT file (seconds): load off the UI thread,
+        # then fill the PHYSICAL section (seconds again on a long ride).
+        run_background(self.session.map_layers, self._track_loaded, self._track_failed)
+
+    def _track_loaded(self, _) -> None:
+        self._refresh_side_map(refit=True)
+        run_background(
+            self.session.detect_physical_laps,
+            lambda laps: self._run(lambda: self.session.apply_physical_laps(laps, explicit=False)),
+            lambda e: self.notify(f"Loop detection failed: {e}", "error"),
+        )
+
+    def _track_failed(self, error) -> None:
+        self.side_map.set_placeholder(str(error))
+        self.session.physical_laps_failed()
+        self._rebuild()
 
     def focus_widget(self):
         return self.table
@@ -345,8 +362,11 @@ class LapsPage(Page):
             self.table, [r.values for r in rows], [self.STYLE_BY_KIND[r.kind] for r in rows],
             right_aligned=self.session.right_aligned_columns,
         )
+        hint = self.session.take_cursor_hint()
+        if hint is not None and rows:
+            self.table.selectRow(min(hint, len(rows) - 1))
         self._refresh_side_map()
-        stats = display.interval_stats(self.session.current_laps, self.activity.sport)
+        stats = display.interval_stats(self.session.marked_laps(), self.activity.sport)
         self.interval_tiles.set_stats(stats, "Marked\nintervals")
         self.interval_hint.setText("" if stats else self.session.interval_summary())
         self.interval_hint.setVisible(not stats)
@@ -839,6 +859,9 @@ class TrainingWeekPage(Page):
         self.bind("]", "Next week", self.next_week)
         self.bind("t", "This week", self.this_week)
         self.bind("r", "Refresh from Garmin", self.refresh)
+        self.bind("m", "Move workout", self.move_workout)
+        self.bind("x", "Cancel workout", self.cancel_workout)
+        self.bind("l", "Link/unlink plan", self.link)
         self.bind("y", "Copy table", self.copy)
         self._load_view()
         self.refresh()
@@ -846,7 +869,7 @@ class TrainingWeekPage(Page):
     def focus_widget(self):
         return self.table
 
-    def _load_view(self) -> None:
+    def _load_view(self, keep_row: bool = False) -> None:
         self.view = services.load_training_week(self.week)
         today = date.today()
         self.week_title.setText(display.week_title(self.week))
@@ -869,7 +892,7 @@ class TrainingWeekPage(Page):
             })
         if not rows:
             rows, styles = [("", "", "", "", "Nothing planned or done this week", "", "", "", "")], None
-        fill_table(self.table, rows, styles, right_aligned={5, 7}, keep_row=False)
+        fill_table(self.table, rows, styles, right_aligned={5, 7}, keep_row=keep_row)
         notes = list(self.view.notes)
         if not self.view.calendar_cached:
             notes.insert(0, "This week's calendar isn't downloaded yet — refreshing...")
@@ -927,6 +950,87 @@ class TrainingWeekPage(Page):
             done,
             failed,
         )
+
+    def _selected_item(self) -> training_load.WeekItem | None:
+        row = self.table.currentRow()
+        items = self.view.week.items if self.view else []
+        return items[row] if 0 <= row < len(items) else None
+
+    def _choose(self, title: str, prompt: str, options: list[str]) -> int | None:
+        text, ok = QInputDialog.getItem(self, title, prompt, options, 0, False)
+        return options.index(text) if ok and text in options else None
+
+    def _confirm(self, title: str, prompt: str) -> bool:
+        return QMessageBox.question(self, title, prompt) == QMessageBox.StandardButton.Yes
+
+    def _garmin_change(self, operation) -> None:
+        def failed(error) -> None:
+            if isinstance(error, services.CalendarError):
+                self.notify(str(error), "warning")
+            else:
+                self.notify(f"Garmin change failed: {error}", "error")
+            self._load_view(keep_row=True)
+
+        def done(message) -> None:
+            self.notify(message)
+            self._load_view(keep_row=True)
+
+        run_background(operation, done, failed)
+
+    def _local_change(self, operation) -> None:
+        try:
+            self.notify(operation())
+        except services.CalendarError as e:
+            self.notify(str(e), "warning")
+        self._load_view(keep_row=True)
+
+    def move_workout(self) -> None:
+        item = self._selected_item()
+        try:
+            days = services.move_targets(item)
+        except services.CalendarError as e:
+            self.notify(str(e), "warning")
+            return
+        if self.client is None:
+            self.notify("Not logged in to Garmin", "warning")
+            return
+        options = [display.week_day_choice(day, self.view.week.items) for day in days]
+        index = self._choose("Move workout", services.move_prompt(item), options)
+        if index is not None:
+            self._garmin_change(lambda: services.move_planned(self.client, item, days[index]))
+
+    def cancel_workout(self) -> None:
+        item = self._selected_item()
+        try:
+            prompt = services.cancel_prompt(item)
+        except services.CalendarError as e:
+            self.notify(str(e), "warning")
+            return
+        if self.client is None:
+            self.notify("Not logged in to Garmin", "warning")
+            return
+        if self._confirm("Cancel workout", prompt):
+            self._garmin_change(lambda: services.cancel_planned(self.client, item))
+
+    def link(self) -> None:
+        item = self._selected_item()
+        if item is not None and item.status == "done (planned)":
+            try:
+                prompt = services.unlink_prompt(item)
+            except services.CalendarError as e:
+                self.notify(str(e), "warning")
+                return
+            if self._confirm("Unlink plan", prompt):
+                self._local_change(lambda: services.unlink(item))
+            return
+        try:
+            candidates = services.link_candidates(self.view.week, item)
+        except services.CalendarError as e:
+            self.notify(str(e), "warning")
+            return
+        index = self._choose("Link plan and activity", services.link_prompt(item), [display.week_item_choice(c) for c in candidates])
+        if index is not None:
+            self._local_change(lambda: services.link(item, candidates[index]))
 
     def copy(self) -> None:
         copy_text(self, display.week_summary_text(self.view) + "\n\n" + table_as_tsv(self.table), f"week {self.week:%d.%m}")

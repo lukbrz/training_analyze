@@ -219,7 +219,8 @@ def fill_table(
     right_aligned: set[int] = frozenset(),
     keep_row: bool = True,
 ) -> None:
-    """Replace a table's rows. Each style dict may hold bold/italic/dim/color/color_columns."""
+    """Replace a table's rows. Each style dict may hold bold/italic/dim/color/color_columns/
+    background."""
     current = table.currentRow()
     table.setUpdatesEnabled(False)
     table.setRowCount(len(rows))
@@ -237,6 +238,8 @@ def fill_table(
             color = style.get("color_columns", {}).get(c) or style.get("color") or (COLORS["muted"] if style.get("dim") else None)
             if color:
                 item.setForeground(QBrush(QColor(color)))
+            if style.get("background"):
+                item.setBackground(QBrush(QColor(style["background"])))
             table.setItem(r, c, item)
     table.setUpdatesEnabled(True)
     table.resizeColumnsToContents()
