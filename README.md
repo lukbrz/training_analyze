@@ -148,8 +148,16 @@ The calendar shows one week of your Garmin Connect calendar: done, planned and m
 | `m` | Move the selected planned workout to another day of its week, in Garmin Connect (your watch gets it on its next sync) |
 | `x` | Cancel the selected planned workout: removes it from the Garmin Connect calendar but keeps it in your workout library (asks first) |
 | `l` | Link a planned workout with the activity that carried it out, e.g. Saturday's run done on Sunday, or an activity recorded without the workout on the watch. On a linked row, `l` unlinks them |
+| `e` | Export 1, 4, 12 or 24 weeks, ending with the week shown, to one JSON file in `exports/` (for another AI agent to analyse) |
 
 A planned workout counts as done when an activity of the same sport is on the same day. Links override this. They are stored only in this app (`data/plan_links.json`), because Garmin has no such link.
+
+**Export (`e`):** if you're logged in, the app first downloads whatever the period is missing from Garmin: older calendar months and planned workouts. The file lists every week as the calendar shows it:
+- **Planned workouts** with their steps, in the same format as `src/workout_schema.json` plus reps, exercise and weight for strength.
+- **Activities** with summary, laps (a table with your interval marks), TSS and time in zones.
+- **Load:** weekly TSS, daily TSS/CTL/ATL/TSB, and your thresholds.
+
+Values are in seconds, metres, m/s, W and bpm, with paces also as text. The file is compact JSON: about 50 KB for 4 weeks and 250 KB for 24.
 
 ### Workouts
 

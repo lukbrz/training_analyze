@@ -18,6 +18,7 @@ import fit_parser
 import garmin_client
 import services
 import storage
+import training_export
 import training_load
 import workout_library
 from theme import COLORS, SERIES_COLORS, SPORT_COLORS
@@ -824,6 +825,24 @@ def calendar_page() -> None:
         if index is not None:
             await local_change(lambda: services.link(item, candidates[index]))
 
+    async def export() -> None:
+        week = state["week"]
+        index = await choose(training_export.export_prompt(week), training_export.week_choices(week))
+        if index is None:
+            return
+        weeks = training_export.WEEK_CHOICES[index]
+        try:
+            path, warnings = await run_with_progress(week_title, services.export_training, State.client, week, weeks)
+        except Exception as e:
+            notify(f"Export failed: {e}", "error")
+            load()
+            return
+        for message in warnings:
+            notify(message, "warning")
+        notify(f"Exported {weeks} week(s) to {path}")
+        ui.download(path)  # a copy in the browser's downloads too
+        load()
+
     frame.bind_back()
     frame.bind("[", "Prev week", lambda: change(-7))
     frame.bind("]", "Next week", lambda: change(7))
@@ -832,6 +851,7 @@ def calendar_page() -> None:
     frame.bind("m", "Move workout", unless_dialog(move_workout))
     frame.bind("x", "Cancel workout", unless_dialog(cancel_workout))
     frame.bind("l", "Link/unlink plan", unless_dialog(link))
+    frame.bind("e", "Export weeks", unless_dialog(export))
     frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
         display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].week.items]), "week"))
     load()

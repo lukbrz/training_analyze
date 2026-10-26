@@ -49,6 +49,13 @@ STEP_TYPE_IF = {
     "other": 0.70, "main": 0.75,
 }
 STRENGTH_IF = 0.60
+# Strength steps end on a rep count or the lap button, not a time: size a set from its reps
+# (plus getting into position) and a lap-button rest or set as typical gym values. Checked
+# on the user's "Hantle 15min" dumbbell sessions: ~19 min, against 15-25 min done.
+STRENGTH_SECONDS_PER_REP = 3.0
+STRENGTH_SET_SETUP_S = 10.0
+STRENGTH_REST_S = 45.0
+STRENGTH_LAP_BUTTON_SET_S = 45.0
 # Assumed length of a step that ends on the lap button, when the workout carries no
 # estimated duration to size it from. Deliberately modest; such estimates are flagged.
 LAP_BUTTON_DEFAULT_S = {
@@ -197,17 +204,40 @@ def _assumed_lap_button_s(step_type: str, intensity: float) -> float:
     return LAP_BUTTON_DEFAULT_S.get(step_type, LAP_BUTTON_FALLBACK_S)
 
 
+def _strength_step_s(step: dict) -> float:
+    """Seconds of one strength step (one set or rest, before repeats)."""
+    condition = (step.get("endCondition") or {}).get("conditionTypeKey")
+    value = step.get("endConditionValue") or 0.0
+    if condition == "time" and value:
+        return value
+    if condition == "reps" and value:
+        return value * STRENGTH_SECONDS_PER_REP + STRENGTH_SET_SETUP_S
+    step_type = (step.get("stepType") or {}).get("stepTypeKey")
+    return STRENGTH_REST_S if step_type in ("rest", "recovery") else STRENGTH_LAP_BUTTON_SET_S
+
+
+def _strength_tss(dto: dict) -> PlannedEstimate:
+    """A strength workout: Garmin's own duration estimate when it has one, else the sum of
+    its sets and rests sized by `_strength_step_s`, all at STRENGTH_IF."""
+    seconds = float(dto.get("estimatedDurationInSecs") or 0.0) or sum(
+        _strength_step_s(step) * repeat
+        for segment in dto.get("workoutSegments") or []
+        for step, repeat in _flatten_steps(segment.get("workoutSteps") or [])
+    )
+    return PlannedEstimate(_tss(seconds, STRENGTH_IF), seconds)
+
+
 def workout_tss(dto: dict, th: Thresholds) -> PlannedEstimate:
     """Estimated TSS and duration of a planned Garmin workout (DTO from the workout service,
     or workouts.to_garmin output)."""
     family = sport_family((dto.get("sportType") or {}).get("sportTypeKey"))
+    if family == "strength":
+        return _strength_tss(dto)
     known: list[tuple[float, float]] = []  # (seconds, intensity) of steps with a length
     open_steps: list[tuple[str, float, int]] = []  # (step type, intensity, repeats) ending on lap button
     for segment in dto.get("workoutSegments") or []:
         for step, repeat in _flatten_steps(segment.get("workoutSteps") or []):
             intensity, speed = _step_intensity(step, family, th)
-            if family == "strength":
-                intensity = STRENGTH_IF
             condition = (step.get("endCondition") or {}).get("conditionTypeKey")
             value = step.get("endConditionValue") or 0.0
             if condition == "time" and value:
@@ -235,8 +265,7 @@ def workout_tss(dto: dict, th: Thresholds) -> PlannedEstimate:
             known_s += seconds
     elif not known and dto.get("estimatedDurationInSecs"):
         seconds = float(dto["estimatedDurationInSecs"])
-        intensity = STRENGTH_IF if family == "strength" else 0.7
-        return PlannedEstimate(_tss(seconds, intensity), seconds)
+        return PlannedEstimate(_tss(seconds, 0.7), seconds)
     return PlannedEstimate(tss, known_s, assumed_s)
 
 

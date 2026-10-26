@@ -25,6 +25,7 @@ import fit_parser
 import garmin_client
 import services
 import storage
+import training_export
 import training_load
 import workout_library
 from gui_common import (
@@ -862,6 +863,7 @@ class TrainingWeekPage(Page):
         self.bind("m", "Move workout", self.move_workout)
         self.bind("x", "Cancel workout", self.cancel_workout)
         self.bind("l", "Link/unlink plan", self.link)
+        self.bind("e", "Export weeks", self.export)
         self.bind("y", "Copy table", self.copy)
         self._load_view()
         self.refresh()
@@ -1031,6 +1033,29 @@ class TrainingWeekPage(Page):
         index = self._choose("Link plan and activity", services.link_prompt(item), [display.week_item_choice(c) for c in candidates])
         if index is not None:
             self._local_change(lambda: services.link(item, candidates[index]))
+
+    def export(self) -> None:
+        index = self._choose("Export weeks", training_export.export_prompt(self.week), training_export.week_choices(self.week))
+        if index is None:
+            return
+        week, weeks = self.week, training_export.WEEK_CHOICES[index]
+
+        def done(result) -> None:
+            path, warnings = result
+            for message in warnings:
+                self.notify(message, "warning")
+            self.notify(f"Exported {weeks} week(s) to {path}")
+            self._load_view(keep_row=True)
+
+        def failed(error) -> None:
+            self.notify(f"Export failed: {error}", "error")
+            self._load_view(keep_row=True)
+
+        run_background(
+            lambda: services.export_training(self.client, week, weeks, progress=lambda m: on_ui(self.week_title.setText, m)),
+            done,
+            failed,
+        )
 
     def copy(self) -> None:
         copy_text(self, display.week_summary_text(self.view) + "\n\n" + table_as_tsv(self.table), f"week {self.week:%d.%m}")

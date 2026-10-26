@@ -18,6 +18,7 @@ import fit_parser
 import garmin_client
 import services
 import storage
+import training_export
 import training_load
 import workout_library
 from laps_session import LapsError, LapsSession
@@ -1194,6 +1195,7 @@ class TrainingWeekScreen(Screen):
         Binding("m", "move_workout", "Move workout"),
         Binding("x", "cancel_workout", "Cancel workout"),
         Binding("l", "link", "Link/unlink plan"),
+        Binding("e", "export", "Export weeks"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -1387,6 +1389,31 @@ class TrainingWeekScreen(Screen):
 
         options = [display.week_item_choice(c) for c in candidates]
         self.app.push_screen(ChoiceScreen(services.link_prompt(item), options), chosen)
+
+    def action_export(self) -> None:
+        def chosen(index: int | None) -> None:
+            if index is not None:
+                self._export(self.week, training_export.WEEK_CHOICES[index])
+
+        self.app.push_screen(
+            ChoiceScreen(training_export.export_prompt(self.week), training_export.week_choices(self.week)), chosen,
+        )
+
+    @work(thread=True, group="calendar_change")
+    def _export(self, end_week: date, weeks: int) -> None:
+        title = self.query_one("#week_title", Static)
+        try:
+            path, warnings = services.export_training(
+                self.client, end_week, weeks, progress=lambda m: self.app.call_from_thread(title.update, Text(m, style="italic")),
+            )
+        except Exception as e:
+            self.app.call_from_thread(self.notify, f"Export failed: {e}", severity="error")
+            self.app.call_from_thread(self._load_view, True)
+            return
+        for message in warnings:
+            self.app.call_from_thread(self.notify, message, severity="warning")
+        self.app.call_from_thread(self.notify, f"Exported {weeks} week(s) to {path}", timeout=15)
+        self.app.call_from_thread(self._load_view, True)
 
     def action_copy(self) -> None:
         table = self.query_one(DataTable)

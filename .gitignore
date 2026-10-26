@@ -8,3 +8,6 @@ data.bak_before_reprocess
 # only the example workouts are part of the repo.
 workouts/*
 !workouts/example_*.json
+
+# Training exports for other agents (personal data)
+exports/

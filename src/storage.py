@@ -26,6 +26,7 @@ ACTIVITY_STATS_PATH = DATA_DIR / "activity_stats.json"
 CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
 PLAN_LINKS_PATH = DATA_DIR / "plan_links.json"
+EXPORTS_DIR = BASE_DIR / "exports"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -240,6 +241,14 @@ def load_plan_links(path: Path = PLAN_LINKS_PATH) -> dict[str, str | None]:
 
 def save_plan_links(links: dict[str, str | None], path: Path = PLAN_LINKS_PATH) -> None:
     _write_json(path, links)
+
+
+def save_export(name: str, document: dict, exports_dir: Path = EXPORTS_DIR) -> Path:
+    """Write an export document (see training_export) and return its path."""
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    path = exports_dir / name
+    path.write_text(json.dumps(document, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    return path
 
 
 def load_cached_workout(workout_id: int, cache_dir: Path = WORKOUT_CACHE_DIR) -> dict | None:

@@ -5,6 +5,7 @@ code lives here and no front end re-implements them."""
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
 
 import uuid
 
@@ -114,8 +115,9 @@ class TrainingWeekView:
     calendar_cached: bool = True
 
 
-def load_training_week(week: date, today: date | None = None) -> TrainingWeekView:
-    """Assemble the week view from local data only (synced activities + cached Garmin data)."""
+def load_training_week(week: date, today: date | None = None, history_days: int = PMC_CHART_DAYS) -> TrainingWeekView:
+    """Assemble the week view from local data only (synced activities + cached Garmin data).
+    `history_days`: how far before the week (or today) the fitness series reaches."""
     today = today or date.today()
     thresholds = load_thresholds()
     estimates = activity_estimates(thresholds)
@@ -158,7 +160,7 @@ def load_training_week(week: date, today: date | None = None) -> TrainingWeekVie
     projected_points = {p.day: p for p in tl.pmc(projected, history_start, end)}
     # Up to and including today the chart shows what was done; after today, the plan.
     points = [actual_points[d] if d <= today else projected_points[d] for d in sorted(actual_points)]
-    chart_start = min(week, today) - timedelta(days=PMC_CHART_DAYS)
+    chart_start = min(week, today) - timedelta(days=history_days)
     return TrainingWeekView(
         week=summary,
         thresholds=thresholds,
@@ -168,6 +170,52 @@ def load_training_week(week: date, today: date | None = None) -> TrainingWeekVie
         notes=notes,
         calendar_cached=calendar_cached,
     )
+
+
+# --- Export ------------------------------------------------------------------------
+
+
+def export_training(client, end_week: date, weeks: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
+    """Write `weeks` weeks ending with the week starting `end_week` to one JSON file in
+    exports/ (see training_export) and return (its path, warnings). Logged in, it first
+    fetches from Garmin what the period is missing locally: thresholds and load stats, every
+    calendar month the period touches, and planned workouts not downloaded yet."""
+    import training_export  # imports services itself
+
+    warnings: list[str] = []
+    start = end_week - timedelta(days=7 * (weeks - 1))
+    if client is not None:
+        warnings += refresh_training_data(client, end_week, progress)
+        months = sorted({m for n in range(weeks) for m in _months_of_week(start + timedelta(days=7 * n))})
+        for year, month in months:
+            if (year, month) in _months_of_week(end_week):
+                continue  # refresh_training_data just fetched it
+            progress(f"Fetching calendar {year}-{month:02d}...")
+            try:
+                storage.save_calendar_month(year, month, garmin_client.get_calendar_month(client, year, month))
+            except Exception as e:  # export what's cached; the file notes the gap
+                warnings.append(f"Couldn't fetch calendar {year}-{month:02d}: {e}")
+        missing = []
+        for n in range(weeks):
+            for item in _calendar_items(start + timedelta(days=7 * n)):
+                workout_id = item.get("workoutId")
+                if item.get("itemType") == "workout" and workout_id and workout_id not in missing \
+                        and storage.load_cached_workout(workout_id) is None:
+                    missing.append(workout_id)
+        for k, workout_id in enumerate(missing, start=1):
+            progress(f"Fetching planned workout {k}/{len(missing)}...")
+            try:
+                storage.save_cached_workout(workout_id, garmin_client.get_workout(client, workout_id))
+            except Exception as e:
+                warnings.append(f"Couldn't fetch planned workout {workout_id}: {e}")
+    else:
+        warnings.append("Not logged in to Garmin — exported from cached data only")
+
+    progress("Writing export...")
+    document = training_export.build(end_week, weeks, notes=list(warnings))
+    end = end_week + timedelta(days=6)
+    path = storage.save_export(f"training_{start:%Y-%m-%d}_{end:%Y-%m-%d}_{weeks}w.json", document)
+    return path, warnings
 
 
 # --- Planned-workout changes (move / cancel in Garmin, link to an activity locally) ----
