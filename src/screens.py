@@ -10,13 +10,14 @@ from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalGroup, Vertical
 from textual.coordinate import Coordinate
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, OptionList, Select, Static
+from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, OptionList, Select, Static
 from textual_plotext import PlotextPlot
 
 import display
 import fit_parser
 import garmin_client
 import services
+import settings
 import storage
 import training_export
 import training_load
@@ -198,12 +199,15 @@ class MainScreen(Screen):
         Binding("o", "routes", "Routes"),
         Binding("w", "workouts", "Workouts"),
         Binding("c", "calendar", "Calendar & load"),
+        Binding("p", "settings", "Settings"),
+        Binding("H", "sync_history", "Sync full history"),
         Binding("y", "copy", "Copy table"),
     ]
 
     def __init__(self, client) -> None:
         super().__init__()
         self.client = client
+        self.hidden_count = 0
         self.activities_by_id: dict[str, ActivitySummary] = {}
         self.all_activities: list[ActivitySummary] = []
         self.routes_by_id: dict[str, Route] = {}
@@ -230,7 +234,7 @@ class MainScreen(Screen):
         self._refresh_table()
 
     def _refresh_table(self) -> None:
-        _, self.all_activities = storage.load_index()
+        self.all_activities, self.hidden_count = services.listed_activities()
         self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
         self._update_sport_options()
         self._render_table()
@@ -255,9 +259,7 @@ class MainScreen(Screen):
             table.add_row(
                 *_activity_cells(activity, route.name if route else "–"), key=activity.activity_id
             )
-        total = len(self.all_activities)
-        shown = len(activities)
-        status = f"{shown} activities synced" if shown == total else f"{shown} of {total} activities"
+        status = display.activities_status(len(activities), len(self.all_activities), self.hidden_count)
         self.query_one("#status", Static).update(status)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -280,11 +282,26 @@ class MainScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
         if activity is not None:
-            self.app.push_screen(LapsScreen(activity, self.client))
+            self.app.push_screen(activity_screen(activity, self.client))
 
     def action_sync(self) -> None:
         self._set_buttons_disabled(True)
         self._sync()
+
+    def action_sync_history(self) -> None:
+        if self.client is None:
+            self.notify("Not logged in to Garmin", severity="warning")
+            return
+
+        def confirmed(yes: bool) -> None:
+            if yes:
+                self._set_buttons_disabled(True)
+                self._sync(full_history=True)
+
+        self.app.push_screen(ConfirmScreen(services.FULL_HISTORY_PROMPT, "Sync full history"), confirmed)
+
+    def action_settings(self) -> None:
+        self.app.push_screen(SettingsScreen(), lambda saved: self._refresh_table() if saved else None)
 
     def action_reprocess(self) -> None:
         self._set_buttons_disabled(True)
@@ -311,9 +328,9 @@ class MainScreen(Screen):
         self.query_one("#status", Static).update(text)
 
     @work(thread=True)
-    def _sync(self) -> None:
+    def _sync(self, full_history: bool = False) -> None:
         message = services.sync_activities(
-            self.client, progress=lambda m: self.app.call_from_thread(self._set_status, m)
+            self.client, progress=lambda m: self.app.call_from_thread(self._set_status, m), full_history=full_history,
         )
         self.app.call_from_thread(self._sync_done, message)
 
@@ -327,6 +344,24 @@ class MainScreen(Screen):
     def _reprocess(self) -> None:
         message = services.reprocess_activities(progress=lambda m: self.app.call_from_thread(self._set_status, m))
         self.app.call_from_thread(self._sync_done, message)
+
+
+def activity_screen(activity: ActivitySummary, client) -> Screen:
+    """The screen an activity opens on: its strength sets for a gym session (the laps view
+    is one key away), its laps otherwise."""
+    if services.is_strength(activity):
+        return StrengthSetsScreen(activity, client)
+    return LapsScreen(activity, client)
+
+
+def _switch_screen(screen: Screen, other_type: type, make) -> None:
+    """Show the other view of the same activity: back to it when it's the screen below
+    (so sets <-> laps toggles instead of stacking), else pushed on top."""
+    stack = screen.app.screen_stack
+    if len(stack) > 1 and isinstance(stack[-2], other_type) and stack[-2].activity.activity_id == screen.activity.activity_id:
+        screen.app.pop_screen()
+    else:
+        screen.app.push_screen(make())
 
 
 class LapsScreen(Screen):
@@ -366,6 +401,7 @@ class LapsScreen(Screen):
         Binding("i", "split_intervals", "Split intervals"),
         Binding("f", "toggle_interval_filter", "Interval-only"),
         Binding("h", "phase_metrics", "Phase time/pace/power"),
+        Binding("t", "strength_sets", "Strength sets"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -418,6 +454,8 @@ class LapsScreen(Screen):
             self.app.call_from_thread(self._rebuild_table)
             return
         self.app.call_from_thread(self._track_loaded, layers)
+        if not self.session.auto_detect:
+            return
         # Then fill the PHYSICAL section (seconds again on a long ride).
         laps = self.session.detect_physical_laps()
         self.app.call_from_thread(self._run, lambda: self.session.apply_physical_laps(laps, explicit=False))
@@ -425,6 +463,10 @@ class LapsScreen(Screen):
     def _track_loaded(self, layers) -> None:
         self.track_layers = layers
         self._draw_track()
+        if self.session.records is not None:
+            extra = display.activity_metrics_text(self.session.advanced_metrics())
+            if extra:
+                self.query_one("#activity_summary", Static).update(f"{self.session.summary_text()}\n{extra}")
 
     def on_resize(self, event) -> None:
         self.query_one("#track_plot", PlotextPlot).display = self.size.width >= self.MIN_WIDTH_FOR_TRACK
@@ -551,6 +593,12 @@ class LapsScreen(Screen):
 
     def action_zones(self) -> None:
         self.app.push_screen(ZonesScreen(self.activity, self.client))
+
+    def action_strength_sets(self) -> None:
+        if not services.is_strength(self.activity):
+            self.notify("Not a strength activity", severity="warning")
+            return
+        _switch_screen(self, StrengthSetsScreen, lambda: StrengthSetsScreen(self.activity, self.client))
 
     def action_compare(self) -> None:
         try:
@@ -707,6 +755,82 @@ class CompareScreen(Screen):
             plt.title(title if series else f"{title} — no data")
             plt.xlabel(display.COMPARE_X_AXIS_LABELS[self.x_mode])
             plot.refresh()
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class StrengthSetsScreen(Screen):
+    """A strength activity's sets (exercise, reps, weight) as recorded by the watch."""
+
+    CSS = """
+    #sets_summary {
+        padding: 0 1;
+        border: round $primary;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("l", "laps", "Laps & HR"),
+        Binding("z", "zones", "Zones"),
+        Binding("y", "copy", "Copy table"),
+    ]
+
+    def __init__(self, activity: ActivitySummary, client) -> None:
+        super().__init__()
+        self.activity = activity
+        self.client = client
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(display.activity_summary_text(self.activity, []), id="sets_activity")
+        yield Static(f"Strength sets — {self.activity.name}", id="sets_status")
+        yield Static("", id="sets_summary")
+        yield DataTable(id="sets_table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns(*display.SET_COLUMNS)
+        table.focus()
+        cached = storage.load_exercise_sets(self.activity.activity_id)
+        if cached is not None:
+            self._render_sets(cached)
+        elif self.client is None:
+            self.query_one("#sets_status", Static).update("Not logged in — sets aren't downloaded for this activity")
+        else:
+            self.query_one("#sets_status", Static).update("Fetching sets from Garmin Connect...")
+            self._fetch()
+
+    @work(thread=True)
+    def _fetch(self) -> None:
+        try:
+            sets = services.exercise_sets(self.client, self.activity.activity_id)
+        except Exception as e:
+            self.app.call_from_thread(self.notify, f"Couldn't fetch sets: {e}", severity="error")
+            return
+        self.app.call_from_thread(self._render_sets, sets)
+
+    def _render_sets(self, sets: list[dict]) -> None:
+        self.query_one("#sets_status", Static).update(f"Strength sets — {self.activity.name}")
+        self.query_one("#sets_summary", Static).update(display.strength_summary(sets))
+        table = self.query_one(DataTable)
+        table.clear()
+        for row in display.strength_rows(sets):
+            table.add_row(*row)
+
+    def action_laps(self) -> None:
+        _switch_screen(self, LapsScreen, lambda: LapsScreen(self.activity, self.client))
+
+    def action_zones(self) -> None:
+        self.app.push_screen(ZonesScreen(self.activity, self.client))
+
+    def action_copy(self) -> None:
+        table = self.query_one(DataTable)
+        _copy_to_clipboard(self, _table_as_tsv(table), f"{table.row_count} sets")
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -916,7 +1040,7 @@ class RouteActivitiesScreen(Screen):
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
         if activity is not None:
-            self.app.push_screen(LapsScreen(activity, self.client))
+            self.app.push_screen(activity_screen(activity, self.client))
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -974,6 +1098,82 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(True)
 
     def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class SettingsScreen(Screen[bool]):
+    """The settings in settings.FIELDS as a form; dismisses with True when saved."""
+
+    CSS = """
+    #settings_body {
+        padding: 1 2;
+        height: 1fr;
+    }
+
+    .setting_label {
+        text-style: bold;
+        margin-top: 1;
+    }
+
+    .setting_help {
+        color: $text-muted;
+    }
+
+    #sports_row {
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("ctrl+s", "save", "Save", priority=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        values = settings.load()
+        yield Header()
+        widgets = []
+        for field in settings.FIELDS:
+            if field.kind == "bool":
+                widgets.append(Checkbox(field.label, values[field.key], id=f"setting_{field.key}"))
+            else:
+                widgets.append(Static(field.label, classes="setting_label"))
+                widgets.append(HorizontalGroup(*(
+                    Checkbox(sport, sport in values[field.key], id=f"setting_{field.key}__{sport}")
+                    for sport in settings.SPORT_GROUPS
+                ), id="sports_row"))
+            widgets.append(Static(field.help, classes="setting_help"))
+        widgets.append(HorizontalGroup(
+            Button("Save (ctrl+s)", id="settings_save", variant="primary"),
+            Button("Cancel (esc)", id="settings_cancel"),
+        ))
+        yield Vertical(*widgets, id="settings_body")
+        yield Footer()
+
+    def _values(self) -> dict:
+        values = {}
+        for field in settings.FIELDS:
+            if field.kind == "bool":
+                values[field.key] = self.query_one(f"#setting_{field.key}", Checkbox).value
+            else:
+                values[field.key] = [
+                    sport for sport in settings.SPORT_GROUPS
+                    if self.query_one(f"#setting_{field.key}__{sport}", Checkbox).value
+                ]
+        return values
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "settings_save":
+            self.action_save()
+        elif event.button.id == "settings_cancel":
+            self.action_back()
+
+    def action_save(self) -> None:
+        settings.save(self._values())
+        self.notify(f"Settings saved to {storage.SETTINGS_PATH}")
+        self.dismiss(True)
+
+    def action_back(self) -> None:
         self.dismiss(False)
 
 
@@ -1236,11 +1436,11 @@ class TrainingWeekScreen(Screen):
         table = self.query_one(DataTable)
         cursor_row = table.cursor_row
         table.clear()
-        for item in view.week.items:
+        for item in view.visible_items:
             cells, color = display.week_item_cells(item, today)
             style = f"{color} bold".strip() if item.day == today else color
             table.add_row(*(Text(str(c), style=style) for c in cells))
-        if not view.week.items:
+        if not view.visible_items:
             table.add_row("", "", "", "", "Nothing planned or done this week", "", "", "", "")
         if keep_row and cursor_row:  # after changing a row, stay on it (or near it)
             table.move_cursor(row=min(cursor_row, table.row_count - 1))
@@ -1309,7 +1509,7 @@ class TrainingWeekScreen(Screen):
 
     def _selected_item(self) -> training_load.WeekItem | None:
         row = self.query_one(DataTable).cursor_row
-        items = self.view.week.items if self.view else []
+        items = self.view.visible_items if self.view else []
         return items[row] if row is not None and 0 <= row < len(items) else None
 
     def action_move_workout(self) -> None:
@@ -1393,18 +1593,17 @@ class TrainingWeekScreen(Screen):
     def action_export(self) -> None:
         def chosen(index: int | None) -> None:
             if index is not None:
-                self._export(self.week, training_export.WEEK_CHOICES[index])
+                self._export(training_export.CHOICES[index])
 
-        self.app.push_screen(
-            ChoiceScreen(training_export.export_prompt(self.week), training_export.week_choices(self.week)), chosen,
-        )
+        labels = training_export.choice_labels(date.today())
+        self.app.push_screen(ChoiceScreen(training_export.EXPORT_PROMPT, labels), chosen)
 
     @work(thread=True, group="calendar_change")
-    def _export(self, end_week: date, weeks: int) -> None:
+    def _export(self, choice: int) -> None:
         title = self.query_one("#week_title", Static)
         try:
             path, warnings = services.export_training(
-                self.client, end_week, weeks, progress=lambda m: self.app.call_from_thread(title.update, Text(m, style="italic")),
+                self.client, choice, progress=lambda m: self.app.call_from_thread(title.update, Text(m, style="italic")),
             )
         except Exception as e:
             self.app.call_from_thread(self.notify, f"Export failed: {e}", severity="error")
@@ -1412,7 +1611,7 @@ class TrainingWeekScreen(Screen):
             return
         for message in warnings:
             self.app.call_from_thread(self.notify, message, severity="warning")
-        self.app.call_from_thread(self.notify, f"Exported {weeks} week(s) to {path}", timeout=15)
+        self.app.call_from_thread(self.notify, f"Exported to {path}", timeout=15)
         self.app.call_from_thread(self._load_view, True)
 
     def action_copy(self) -> None:

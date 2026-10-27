@@ -100,10 +100,20 @@ Every screen lists its keys in the footer at the bottom. In the desktop and web 
 | `o` | Routes: activities grouped by the route you ran or rode |
 | `w` | Workouts: upload planned workouts to Garmin Connect |
 | `c` | Calendar & training load for the week |
+| `p` | Settings (see below) |
+| `H` | Sync your whole Garmin history, not just the last year (asks first; run it again to carry on if Garmin stops it part-way) |
 | `y` | Copy the table to the clipboard (tab-separated, pastes into a spreadsheet) |
 | `Enter` | Open the selected activity |
 
-Use the sport drop-down to show only running, cycling, swimming and so on.
+Use the sport drop-down to show only running, cycling, swimming and so on. Sync also imports the sets of strength sessions (exercise, reps, weight).
+
+### Settings (`p`)
+
+Stored in `data/settings.json`:
+- **Hidden sports:** e.g. strength. Hidden sports aren't listed among activities or as calendar rows, but their training load still counts.
+- **Archive past workouts:** moves week plans and workout files whose dates have all passed into `workouts/archive/`.
+- **Show archived workouts:** lists the archive on the Workouts screen again.
+- **Find physical laps automatically:** turn off to skip loop detection when an activity opens (`p` there still finds them).
 
 ### Activity laps
 
@@ -125,6 +135,7 @@ Marks on the watch's laps are saved. Marks on a split or on physical laps last u
 | `c` | Compare intervals |
 | `z` | HR and power zones |
 | `g` | Full-size map (desktop and web apps) |
+| `t` | Strength sets: exercise, reps, weight, volume and rest of each set (strength sessions) |
 | `y` | Copy the table |
 
 The split length is typed as a plain number for **metres** (`300`) or with a time unit for **time** (`60s`, `1m`, `1:30`). The **Total** column shows the running time after each lap. It restarts in each section. "Interval only" (`f`) hides the other two sections.
@@ -139,6 +150,12 @@ The calendar shows one week of your Garmin Connect calendar: done, planned and m
 - **CTL (fitness):** 42-day average of daily TSS.
 - **ATL (fatigue):** 7-day average of daily TSS.
 - **TSB (form):** yesterday's CTL minus ATL.
+- **Ramp rate:** CTL gained over the week; above about 5–8 is aggressive.
+- **ACWR:** ATL ÷ CTL; 0.8–1.3 is the sweet spot, above 1.5 injury risk rises.
+- **Monotony:** average daily TSS ÷ its spread; above 2 means too little variation between hard and easy days.
+- **Strain:** weekly TSS × monotony.
+
+Each run or ride also shows its **efficiency factor** (power or speed per heartbeat) and **aerobic decoupling** (how much that drops from the first half to the second; under 5% on a long steady session means good aerobic endurance).
 
 | Key | Action |
 | --- | --- |
@@ -148,14 +165,14 @@ The calendar shows one week of your Garmin Connect calendar: done, planned and m
 | `m` | Move the selected planned workout to another day of its week, in Garmin Connect (your watch gets it on its next sync) |
 | `x` | Cancel the selected planned workout: removes it from the Garmin Connect calendar but keeps it in your workout library (asks first) |
 | `l` | Link a planned workout with the activity that carried it out, e.g. Saturday's run done on Sunday, or an activity recorded without the workout on the watch. On a linked row, `l` unlinks them |
-| `e` | Export 1, 4, 12 or 24 weeks, ending with the week shown, to one JSON file in `exports/` (for another AI agent to analyse) |
+| `e` | Export this week so far (Monday to today), or the last 1, 4, 12 or 24 full weeks (Monday to Sunday, ending last Sunday), to one JSON file in `exports/` for another AI agent to analyse |
 
 A planned workout counts as done when an activity of the same sport is on the same day. Links override this. They are stored only in this app (`data/plan_links.json`), because Garmin has no such link.
 
 **Export (`e`):** if you're logged in, the app first downloads whatever the period is missing from Garmin: older calendar months and planned workouts. The file lists every week as the calendar shows it:
 - **Planned workouts** with their steps, in the same format as `src/workout_schema.json` plus reps, exercise and weight for strength.
-- **Activities** with summary, laps (a table with your interval marks), TSS and time in zones.
-- **Load:** weekly TSS, daily TSS/CTL/ATL/TSB, and your thresholds.
+- **Activities** with summary, laps (a table with your interval marks), TSS, efficiency factor, aerobic decoupling, time in zones and, for strength, every set.
+- **Load:** weekly TSS and load metrics, daily TSS/CTL/ATL/TSB, and your thresholds.
 
 Values are in seconds, metres, m/s, W and bpm, with paces also as text. The file is compact JSON: about 50 KB for 4 weeks and 250 KB for 24.
 
@@ -169,6 +186,8 @@ Put workout files in the `workouts/` folder. Each file describes one structured 
 | `U` | Upload the whole week of the selected archive (asks first) |
 | `x` / `Enter` | Expand or collapse a week |
 | `r` | Rescan the folder |
+
+Past plans move to `workouts/archive/` automatically (see Settings). Nothing is deleted, and the app still knows they were uploaded.
 
 **Planning with an AI assistant:** give an AI assistant (ChatGPT, Claude, …) the contents of `src/workout_schema.json` and ask it for workouts that follow it. A whole week can come as one `.zip` with one `.json` per workout. Drop the zip into `workouts/`; the app unpacks it and shows it as a collapsible week.
 
@@ -190,7 +209,8 @@ All data stays in the project folder, and git ignores it:
 | --- | --- |
 | `.garmin_session/` | Garmin login tokens (private) |
 | `data/` | Downloaded activity files, your lap marks and route names, caches (calendar, map tiles, …) |
-| `workouts/` | Your workout plans (only the `example_*` files are part of the repo) |
+| `workouts/` | Your workout plans (only the `example_*` files are part of the repo); past ones in `workouts/archive/` |
+| `exports/` | Training exports (`e` in the calendar) |
 
 To start over, delete `data/`; the next sync downloads everything again. Deleting `data/` also loses your interval marks and route names.
 

@@ -15,6 +15,8 @@ from datetime import timedelta
 
 import display
 import fit_parser
+import metrics
+import settings
 import storage
 from models import ActivitySummary, Lap, format_split_value, parse_split_value
 
@@ -70,8 +72,9 @@ class LapsSession:
         self.split_laps: list[Lap] | None = None  # the LAPS section's split, when one is set
         self.split_name = ""
         self.physical_laps: list[Lap] | None = None
-        # "pending" until detection has run, then "found", "none" or "no GPS"
-        self.physical_status = "pending"
+        # "pending" until detection has run, then "found", "none" or "no GPS"; "off" when
+        # it doesn't run on open (settings) until p is pressed
+        self.physical_status = "pending" if settings.get("auto_detect_physical_laps") else "off"
         # (source, lap_index) -> phase splits of that (marked) lap
         self.interval_splits: dict[tuple[str, int], list[Lap]] = {}
         self.show_intervals_only = False
@@ -157,7 +160,7 @@ class LapsSession:
             rows.append(self._header("laps", "LAPS", self.split_name or "device"))
             rows += self._lap_rows("laps", [(source, lap) for lap in self.current_laps], _plain_label)
             note = {
-                "pending": "detecting...", "none": "none found", "no GPS": "no GPS track",
+                "pending": "detecting...", "none": "none found", "no GPS": "no GPS track", "off": "p finds them",
                 "found": self._physical_note(),
             }[self.physical_status]
             rows.append(self._header("physical", "PHYSICAL", note))
@@ -301,6 +304,11 @@ class LapsSession:
             raise LapsError("No repeated course laps detected" if has_gps else "No GPS track to find loops in")
         return f"Found {len(laps)} physical laps"
 
+    @property
+    def auto_detect(self) -> bool:
+        """Whether front ends should run detection when the activity opens."""
+        return self.physical_status == "pending"
+
     def physical_laps_failed(self) -> None:
         """Automatic detection couldn't run (no FIT file or no records)."""
         self.physical_status = "no GPS"
@@ -345,6 +353,11 @@ class LapsSession:
             selected=self.lap_coords(selected_lap),
             markers=markers,
         )
+
+    def advanced_metrics(self) -> metrics.ActivityMetrics:
+        """Efficiency factor and aerobic decoupling; records must be loaded."""
+        _, stats = storage.load_activity_stats()
+        return metrics.activity_metrics(self.activity, stats.get(self.activity.activity_id), self.records or [])
 
     def compare_inputs(self) -> tuple[list[Lap], list[fit_parser.RecordPoint], timedelta]:
         marked = self.marked_laps()

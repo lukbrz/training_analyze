@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QInputDialog,
@@ -24,6 +25,7 @@ import display
 import fit_parser
 import garmin_client
 import services
+import settings
 import storage
 import training_export
 import training_load
@@ -173,6 +175,8 @@ class MainPage(Page):
         self.bind("o", "Routes", self.routes)
         self.bind("w", "Workouts", self.workouts)
         self.bind("c", "Calendar & load", self.calendar)
+        self.bind("p", "Settings", lambda: self.window_.push(SettingsPage(self.window_)))
+        self.bind("Shift+H", "Sync full history", self.sync_history, display_key="H")
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} activities"))
         self.refresh_table()
 
@@ -180,7 +184,7 @@ class MainPage(Page):
         return self.table
 
     def refresh_table(self) -> None:
-        _, self.all_activities = storage.load_index()
+        self.all_activities, self.hidden_count = services.listed_activities()
         self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
         current = self.sport_filter.currentData() or ALL_SPORTS
         sports = sorted({a.sport for a in self.all_activities})
@@ -205,12 +209,11 @@ class MainPage(Page):
             route = self.routes_by_id.get(activity.route_id)
             rows.append(display.activity_row(activity, route.name if route else "–"))
         fill_table(self.table, rows, activity_styles(self.shown), right_aligned={display.ACTIVITY_DURATION_COLUMN})
-        total, shown = len(self.all_activities), len(self.shown)
-        self.status.setText(f"{shown} activities synced" if shown == total else f"{shown} of {total} activities")
+        self.status.setText(display.activities_status(len(self.shown), len(self.all_activities), self.hidden_count))
 
     def _open(self, row: int) -> None:
         if 0 <= row < len(self.shown):
-            self.window_.push(LapsPage(self.window_, self.shown[row], self.client))
+            self.window_.push(activity_page(self.window_, self.shown[row], self.client))
 
     def _run_job(self, job) -> None:
         self.sync_button.setEnabled(False)
@@ -237,6 +240,13 @@ class MainPage(Page):
             return
         self._run_job(lambda: services.sync_activities(self.client, progress=self._progress))
 
+    def sync_history(self) -> None:
+        if self.client is None:
+            self.notify("Not logged in to Garmin", "warning")
+            return
+        if QMessageBox.question(self, "Sync full history", services.FULL_HISTORY_PROMPT) == QMessageBox.StandardButton.Yes:
+            self._run_job(lambda: services.sync_activities(self.client, progress=self._progress, full_history=True))
+
     def reprocess(self) -> None:
         self._run_job(lambda: services.reprocess_activities(progress=self._progress))
 
@@ -253,7 +263,71 @@ class MainPage(Page):
         self.refresh_table()
 
 
+class SettingsPage(Page):
+    """The settings in settings.FIELDS as a form (data/settings.json)."""
+
+    title = "Settings"
+
+    def __init__(self, window) -> None:
+        super().__init__(window)
+        values = settings.load()
+        self.checks: dict[str, QCheckBox | dict[str, QCheckBox]] = {}
+        for field in settings.FIELDS:
+            if field.kind == "bool":
+                check = QCheckBox(field.label)
+                check.setChecked(values[field.key])
+                self.checks[field.key] = check
+                self.layout_.addWidget(check)
+            else:
+                self.layout_.addWidget(label(field.label, "pageTitle"))
+                boxes = {}
+                for sport in settings.SPORT_GROUPS:
+                    box = QCheckBox(sport)
+                    box.setChecked(sport in values[field.key])
+                    boxes[sport] = box
+                self.checks[field.key] = boxes
+                self.layout_.addLayout(row_layout(*boxes.values()))
+            self.layout_.addWidget(label(field.help, "status", wrap=True))
+        self.layout_.addLayout(row_layout(
+            button("Save (Ctrl+S)", self.save, primary=True), button("Cancel (esc)", self.window_.pop),
+        ))
+        self.layout_.addStretch(1)
+        self.bind_back()
+        self.bind("Ctrl+S", "Save", self.save)
+
+    def save(self) -> None:
+        values = {}
+        for field in settings.FIELDS:
+            checks = self.checks[field.key]
+            if field.kind == "bool":
+                values[field.key] = checks.isChecked()
+            else:
+                values[field.key] = [sport for sport, box in checks.items() if box.isChecked()]
+        settings.save(values)
+        self.notify(f"Settings saved to {storage.SETTINGS_PATH}")
+        self.window_.pop()
+
+
 # --- Laps ----------------------------------------------------------------------------
+
+
+def activity_page(window, activity: ActivitySummary, client) -> Page:
+    """The page an activity opens on: its strength sets for a gym session (the laps page is
+    one key away), its laps otherwise."""
+    if services.is_strength(activity):
+        return StrengthSetsPage(window, activity, client)
+    return LapsPage(window, activity, client)
+
+
+def switch_page(page: Page, other_type: type, make) -> None:
+    """Show the other view of the same activity: back to it when it's the page below (so
+    sets <-> laps toggles instead of stacking), else pushed on top."""
+    stack = page.window_.stack
+    below = stack.widget(stack.count() - 2) if stack.count() > 1 else None
+    if isinstance(below, other_type) and below.activity.activity_id == page.activity.activity_id:
+        page.window_.pop()
+    else:
+        page.window_.push(make())
 
 
 class LapsPage(Page):
@@ -275,6 +349,8 @@ class LapsPage(Page):
         )
         activity_tiles = StatRow()
         activity_tiles.set_stats(display.activity_stats(a))
+        self.metric_tiles = StatRow()  # filled once the record stream is loaded
+        self.metric_tiles.setVisible(False)
         self.split_input = QLineEdit(placeholderText="400 = metres · 60s / 1m / 1:30 = time")
         self.split_input.returnPressed.connect(lambda: self._run(lambda: self.session.split(self.split_input.text())))
         self.filter_button = button("Interval only (f)", self.toggle_filter, checkable=True)
@@ -283,6 +359,7 @@ class LapsPage(Page):
         self.interval_hint = label("", "status")
         self.layout_.addWidget(heading)
         self.layout_.addWidget(activity_tiles)
+        self.layout_.addWidget(self.metric_tiles)
         if self.session.multisport:
             legs_row = QHBoxLayout()
             legs_row.setSpacing(10)
@@ -319,6 +396,7 @@ class LapsPage(Page):
         self.bind("i", "Split intervals", self.split_intervals)
         self.bind("f", "Interval-only", self.toggle_filter)
         self.bind("h", "Phase time/pace/power", self.histograms)
+        self.bind("t", "Strength sets", self.strength_sets)
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         self._rebuild()
@@ -328,6 +406,12 @@ class LapsPage(Page):
 
     def _track_loaded(self, _) -> None:
         self._refresh_side_map(refit=True)
+        stats = display.activity_metric_stats(self.session.advanced_metrics())
+        if stats:
+            self.metric_tiles.set_stats(stats)
+            self.metric_tiles.setVisible(True)
+        if not self.session.auto_detect:
+            return
         run_background(
             self.session.detect_physical_laps,
             lambda laps: self._run(lambda: self.session.apply_physical_laps(laps, explicit=False)),
@@ -438,6 +522,12 @@ class LapsPage(Page):
         self.notify("Loading track...")
         run_background(self.session.ensure_records, show, lambda e: self.notify(str(e), "warning"))
 
+    def strength_sets(self) -> None:
+        if not services.is_strength(self.activity):
+            self.notify("Not a strength activity", "warning")
+            return
+        switch_page(self, StrengthSetsPage, lambda: StrengthSetsPage(self.window_, self.activity, self.client))
+
     def histograms(self) -> None:
         try:
             phases = self.session.histogram_phases()
@@ -540,6 +630,48 @@ class ZonesPage(Page):
     def _error(self, message: str) -> None:
         self.status.setText(message)
         self.notify(message, "error")
+
+
+class StrengthSetsPage(Page):
+    """A strength activity's sets (exercise, reps, weight) as recorded by the watch."""
+
+    def __init__(self, window, activity: ActivitySummary, client) -> None:
+        super().__init__(window)
+        self.activity = activity
+        self.client = client
+        self.title = f"Strength sets — {activity.name}"
+        self.status = label(self.title, "status")
+        self.summary = label("", "notes", wrap=True)
+        self.table = make_table(display.SET_COLUMNS, stretch_column=1)
+        tiles = StatRow()
+        tiles.set_stats(display.activity_stats(activity))
+        self.layout_.addWidget(tiles)
+        self.layout_.addWidget(self.status)
+        self.layout_.addWidget(self.summary)
+        self.layout_.addWidget(self.table, 1)
+        self.bind_back()
+        self.bind("l", "Laps & HR", lambda: switch_page(self, LapsPage, lambda: LapsPage(self.window_, activity, client)))
+        self.bind("z", "Zones", lambda: self.window_.push(ZonesPage(self.window_, activity, client)))
+        self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} sets"))
+        cached = storage.load_exercise_sets(activity.activity_id)
+        if cached is not None:
+            self._render(cached)
+        elif client is None:
+            self.status.setText("Not logged in — sets aren't downloaded for this activity")
+        else:
+            self.status.setText("Fetching sets from Garmin Connect...")
+            run_background(
+                lambda: services.exercise_sets(client, activity.activity_id), self._render,
+                lambda e: self.notify(f"Couldn't fetch sets: {e}", "error"),
+            )
+
+    def focus_widget(self):
+        return self.table
+
+    def _render(self, sets: list[dict]) -> None:
+        self.status.setText(self.title)
+        self.summary.setText(display.strength_summary(sets))
+        fill_table(self.table, display.strength_rows(sets), right_aligned={2, 3, 4, 5, 6})
 
 
 class ComparePage(Page):
@@ -703,7 +835,7 @@ class RouteActivitiesPage(Page):
         _, activities = storage.load_index()
         self.activities = sorted((a for a in activities if a.route_id == route.route_id), key=lambda a: a.start_time_local, reverse=True)
         self.table = make_table(display.ACTIVITY_COLUMNS, stretch_column=1)
-        self.table.cellActivated.connect(lambda row, _: self.window_.push(LapsPage(self.window_, self.activities[row], client)))
+        self.table.cellActivated.connect(lambda row, _: self.window_.push(activity_page(self.window_, self.activities[row], client)))
         self.layout_.addWidget(label(f"Route: {route.name}  |  {len(self.activities)} activities", "status"))
         self.layout_.addWidget(self.table, 1)
         fill_table(
@@ -839,6 +971,7 @@ class TrainingWeekPage(Page):
         self.view = None
         self.week_title = label("", "pageTitle")
         self.load_tiles = StatRow()
+        self.metric_tiles = StatRow()
         self.tss_bar = StackedBar()
         self.thresholds = label("", "status")
         self.table = make_table(display.WEEK_COLUMNS, stretch_column=4)
@@ -850,6 +983,7 @@ class TrainingWeekPage(Page):
             button("This week (t)", self.this_week), button("Refresh (r)", self.refresh), stretch_index=1,
         ))
         self.layout_.addWidget(self.load_tiles)
+        self.layout_.addWidget(self.metric_tiles)
         self.layout_.addWidget(self.tss_bar)
         self.layout_.addWidget(self.thresholds)
         self.layout_.addWidget(self.table, 2)
@@ -876,6 +1010,7 @@ class TrainingWeekPage(Page):
         today = date.today()
         self.week_title.setText(display.week_title(self.week))
         self.load_tiles.set_stats(display.week_load_stats(self.view))
+        self.metric_tiles.set_stats(display.week_metric_stats(self.view.load_metrics))
         parts = display.week_tss_parts(self.view)
         self.tss_bar.set_parts(
             f"Week TSS — {parts['done']} done + {parts['remaining']} remaining = {parts['done'] + parts['remaining']}"
@@ -885,7 +1020,7 @@ class TrainingWeekPage(Page):
         )
         self.thresholds.setText(display.format_thresholds(self.view.thresholds))
         rows, styles = [], []
-        for item in self.view.week.items:
+        for item in self.view.visible_items:
             cells, color = display.week_item_cells(item, today)
             rows.append(cells)
             styles.append({
@@ -955,7 +1090,7 @@ class TrainingWeekPage(Page):
 
     def _selected_item(self) -> training_load.WeekItem | None:
         row = self.table.currentRow()
-        items = self.view.week.items if self.view else []
+        items = self.view.visible_items if self.view else []
         return items[row] if 0 <= row < len(items) else None
 
     def _choose(self, title: str, prompt: str, options: list[str]) -> int | None:
@@ -1035,16 +1170,16 @@ class TrainingWeekPage(Page):
             self._local_change(lambda: services.link(item, candidates[index]))
 
     def export(self) -> None:
-        index = self._choose("Export weeks", training_export.export_prompt(self.week), training_export.week_choices(self.week))
+        index = self._choose("Export weeks", training_export.EXPORT_PROMPT, training_export.choice_labels(date.today()))
         if index is None:
             return
-        week, weeks = self.week, training_export.WEEK_CHOICES[index]
+        choice = training_export.CHOICES[index]
 
         def done(result) -> None:
             path, warnings = result
             for message in warnings:
                 self.notify(message, "warning")
-            self.notify(f"Exported {weeks} week(s) to {path}")
+            self.notify(f"Exported to {path}")
             self._load_view(keep_row=True)
 
         def failed(error) -> None:
@@ -1052,7 +1187,7 @@ class TrainingWeekPage(Page):
             self._load_view(keep_row=True)
 
         run_background(
-            lambda: services.export_training(self.client, week, weeks, progress=lambda m: on_ui(self.week_title.setText, m)),
+            lambda: services.export_training(self.client, choice, progress=lambda m: on_ui(self.week_title.setText, m)),
             done,
             failed,
         )

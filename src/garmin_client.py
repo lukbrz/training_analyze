@@ -199,6 +199,28 @@ def schedule_workout(garmin: Garmin, workout_id: int, date_str: str) -> None:
     garmin.schedule_workout(workout_id, date_str)
 
 
+def exercise_sets(garmin: Garmin, activity_id: str) -> list[dict]:
+    """A strength activity's sets, as recorded by the watch (and corrected in Garmin
+    Connect): [{"type": "active"|"rest", "start", "duration_s", "reps", "weight_kg",
+    "exercise", "category", "step"}]. Garmin reports weight in grams; exercise and category
+    are its upper-case keys lower-cased (e.g. "chest_supported_dumbbell_row", "row"), the
+    exercise None when only the category was recognised."""
+    out = []
+    for s in garmin.get_activity_exercise_sets(activity_id).get("exerciseSets") or []:
+        exercise = (s.get("exercises") or [{}])[0]
+        out.append({
+            "type": (s.get("setType") or "").lower(),
+            "start": s.get("startTime"),
+            "duration_s": s.get("duration"),
+            "reps": s.get("repetitionCount"),
+            "weight_kg": s["weight"] / 1000 if s.get("weight") else None,
+            "exercise": (exercise.get("name") or "").lower() or None,
+            "category": (exercise.get("category") or "").lower() or None,
+            "step": s.get("wktStepIndex"),
+        })
+    return out
+
+
 def workout_exists(garmin: Garmin, workout_id: int) -> bool:
     """Whether a workout is still in the user's Garmin workout library (False once deleted)."""
     try:
@@ -226,6 +248,7 @@ __all__ = [
     "schedule_workout",
     "unschedule_workout",
     "workout_exists",
+    "exercise_sets",
     "activity_stats",
     "get_thresholds",
     "get_calendar_month",

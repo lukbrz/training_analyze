@@ -27,6 +27,8 @@ CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
 PLAN_LINKS_PATH = DATA_DIR / "plan_links.json"
 EXPORTS_DIR = BASE_DIR / "exports"
+SETTINGS_PATH = DATA_DIR / "settings.json"
+EXERCISE_SETS_DIR = DATA_DIR / "exercise_sets"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -241,6 +243,24 @@ def load_plan_links(path: Path = PLAN_LINKS_PATH) -> dict[str, str | None]:
 
 def save_plan_links(links: dict[str, str | None], path: Path = PLAN_LINKS_PATH) -> None:
     _write_json(path, links)
+
+
+def load_settings(path: Path = SETTINGS_PATH) -> dict:
+    return _read_json(path, {})
+
+
+def save_settings(values: dict, path: Path = SETTINGS_PATH) -> None:
+    _write_json(path, values)
+
+
+def load_exercise_sets(activity_id: str, sets_dir: Path = EXERCISE_SETS_DIR) -> list[dict] | None:
+    """A strength activity's sets as fetched from Garmin (see garmin_client.exercise_sets);
+    None if not fetched yet."""
+    return _read_json(sets_dir / f"{activity_id}.json", None)
+
+
+def save_exercise_sets(activity_id: str, sets: list[dict], sets_dir: Path = EXERCISE_SETS_DIR) -> None:
+    _write_json(sets_dir / f"{activity_id}.json", sets)
 
 
 def save_export(name: str, document: dict, exports_dir: Path = EXPORTS_DIR) -> Path:

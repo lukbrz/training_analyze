@@ -38,6 +38,13 @@ ACTIVITY_COLUMNS = (
 ACTIVITY_DURATION_COLUMN = 3
 
 
+def activities_status(shown: int, listed: int, hidden: int) -> str:
+    """The activity list's status line: shown under the sport filter, of those listed,
+    plus how many hidden sports' activities settings leave out."""
+    text = f"{shown} activities synced" if shown == listed else f"{shown} of {listed} activities"
+    return text + (f" ({hidden} of hidden sports not listed)" if hidden else "")
+
+
 def activity_row(activity: ActivitySummary, route_name: str) -> tuple[str, ...]:
     return (
         activity.start_time_local.replace("T", " ")[:16],
@@ -437,8 +444,69 @@ def week_summary_text(view: services.TrainingWeekView) -> str:
         f"week total {done + remaining}\n"
         f"{format_pmc_point('Today', view.today_point)}\n"
         f"{format_pmc_point('Week end (projected)' if projected else 'Week end', view.week_end_point)}\n"
+        f"{week_metrics_text(view.load_metrics)}\n"
         f"{format_thresholds(view.thresholds)}"
     )
+
+
+# --- Strength sets ----------------------------------------------------------------
+
+SET_COLUMNS = ("#", "Exercise", "Reps", "Weight", "Volume", "Time", "Rest after")
+
+
+def exercise_name(s: dict) -> str:
+    name = s.get("exercise") or s.get("category") or "unknown"
+    return name.replace("_", " ").capitalize()
+
+
+def _kg(value: float | None) -> str:
+    return f"{value:g} kg" if value else "–"
+
+
+def strength_rows(sets: list[dict]) -> list[tuple[str, ...]]:
+    """One row per active set, with the rest that follows it."""
+    rows = []
+    for i, s in enumerate(sets):
+        if s.get("type") != "active":
+            continue
+        rest = sets[i + 1] if i + 1 < len(sets) and sets[i + 1].get("type") == "rest" else None
+        reps, kg = s.get("reps"), s.get("weight_kg")
+        rows.append((
+            str(len(rows) + 1),
+            exercise_name(s),
+            str(reps) if reps else "–",
+            _kg(kg),
+            _kg(reps * kg) if reps and kg else "–",
+            format_duration(s.get("duration_s") or 0),
+            format_duration(rest["duration_s"]) if rest and rest.get("duration_s") else "–",
+        ))
+    return rows
+
+
+def strength_summary(sets: list[dict]) -> str:
+    """Totals and one line per exercise ("3 x 10 @ 16 kg"), in the order first done."""
+    active = [s for s in sets if s.get("type") == "active"]
+    if not active:
+        return "No sets recorded for this activity"
+    reps = sum(s.get("reps") or 0 for s in active)
+    volume = sum((s.get("reps") or 0) * (s.get("weight_kg") or 0) for s in active)
+    work = sum(s.get("duration_s") or 0 for s in active)
+    rest = sum(s.get("duration_s") or 0 for s in sets if s.get("type") == "rest")
+    lines = [
+        f"Sets: {len(active)}  |  Reps: {reps}  |  Volume: {volume:g} kg  |  "
+        f"Work: {format_duration(work)}  |  Rest: {format_duration(rest)}"
+    ]
+    by_exercise: dict[str, list[dict]] = {}
+    for s in active:
+        by_exercise.setdefault(exercise_name(s), []).append(s)
+    for name, group in by_exercise.items():
+        parts = [
+            f"{s['reps']}" + (f" @ {s['weight_kg']:g} kg" if s.get("weight_kg") else "") if s.get("reps")
+            else format_duration(s.get("duration_s") or 0)
+            for s in group
+        ]
+        lines.append(f"  {name}: " + ", ".join(parts))
+    return "\n".join(lines)
 
 
 # --- Zones, compare charts, routes ------------------------------------------------
@@ -605,6 +673,42 @@ def week_load_stats(view: services.TrainingWeekView) -> list[Stat]:
         Stat("Fatigue (ATL)", str(round(today.atl)), "", "magenta", f"→ {round(end.atl)} {end_label}" if end else ""),
         Stat("Form (TSB)", f"{round(today.tsb):+d}", wording, color, hint(end.tsb if end else None)),
     ]
+
+
+def _metric(value: float | None, fmt: str) -> str:
+    return "–" if value is None else format(value, fmt)
+
+
+def week_metric_stats(m) -> list[Stat]:
+    """Ramp rate / ACWR / monotony / strain tiles (see metrics.WeekMetrics), coloured where
+    the value is past the usual caution line."""
+    acwr_color = "" if m.acwr is None else "red" if m.acwr > 1.5 else "yellow" if m.acwr > 1.3 else "green" if m.acwr >= 0.8 else ""
+    return [
+        Stat("Ramp rate", _metric(m.ramp_rate, "+.1f"), "CTL/week", "yellow" if (m.ramp_rate or 0) > 8 else "", "≤ 5-8 is sustainable"),
+        Stat("ACWR", _metric(m.acwr, ".2f"), "ATL/CTL", acwr_color, "0.8-1.3 sweet spot"),
+        Stat("Monotony", _metric(m.monotony, ".1f"), "", "yellow" if (m.monotony or 0) > 2 else "", "> 2: too little variation"),
+        Stat("Strain", _metric(m.strain, ".0f"), "", "", "weekly TSS x monotony"),
+    ]
+
+
+def week_metrics_text(m) -> str:
+    return "  ·  ".join(f"{s.label} {s.value}{(' ' + s.unit) if s.unit and s.value != '–' else ''}" for s in week_metric_stats(m))
+
+
+def activity_metric_stats(m) -> list[Stat]:
+    """Efficiency factor / aerobic decoupling tiles (see metrics.ActivityMetrics); empty when
+    neither applies."""
+    stats = []
+    if m.efficiency_factor is not None:
+        stats.append(Stat("Efficiency factor", f"{m.efficiency_factor:.2f}", m.ef_basis, "accent", "output per heartbeat"))
+    if m.decoupling_pct is not None:
+        color = "green" if m.decoupling_pct < 5 else "yellow" if m.decoupling_pct < 10 else "red"
+        stats.append(Stat("Aerobic decoupling", f"{m.decoupling_pct:+.1f}", "%", color, "< 5% on steady sessions: good endurance"))
+    return stats
+
+
+def activity_metrics_text(m) -> str:
+    return "  |  ".join(f"{s.label}: {s.value} {s.unit}".rstrip() for s in activity_metric_stats(m))
 
 
 def week_tss_parts(view: services.TrainingWeekView) -> dict[str, int]:

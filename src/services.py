@@ -13,7 +13,9 @@ import dedupe
 import fit_parser
 import garmin_client
 import geocode
+import metrics
 import routes
+import settings
 import storage
 import training_load as tl
 import workouts
@@ -22,6 +24,14 @@ from models import ActivitySummary, Route
 Progress = Callable[[str], None]
 
 INITIAL_SYNC_DAYS = 365
+# Where a full-history sync starts looking (Garmin Connect launched in 2007-08).
+FULL_HISTORY_START = "2005-01-01"
+FULL_HISTORY_PROMPT = (
+    "Download every activity in your Garmin Connect account since "
+    f"{FULL_HISTORY_START[:4]}, not just the last year?\n\n"
+    "Each one is a FIT download, so years of training can take a long while; Garmin may also "
+    "rate-limit it part-way. Everything downloaded is kept, so just run it again to carry on."
+)
 
 # How far back the first training-stress fetch goes; later refreshes re-check the last week
 # (activities can appear late, e.g. synced from a second device).
@@ -89,6 +99,15 @@ def _calendar_items(week: date) -> list[dict]:
     return items
 
 
+def listed_activities() -> tuple[list[ActivitySummary], int]:
+    """(activities to list, how many are left out because their sport is hidden in
+    settings)."""
+    _, activities = storage.load_index()
+    prefs = settings.load()
+    shown = [a for a in activities if not settings.is_hidden(a.sport, prefs)]
+    return shown, len(activities) - len(shown)
+
+
 def load_thresholds() -> tl.Thresholds:
     known = {f for f in tl.Thresholds.__dataclass_fields__}
     return tl.Thresholds(**{k: v for k, v in storage.load_thresholds().items() if k in known})
@@ -113,6 +132,9 @@ class TrainingWeekView:
     week_end_point: tl.PmcPoint | None
     notes: list[str] = field(default_factory=list)
     calendar_cached: bool = True
+    # The week's rows minus those of sports hidden in settings (their load still counts).
+    visible_items: list[tl.WeekItem] = field(default_factory=list)
+    load_metrics: metrics.WeekMetrics = field(default_factory=metrics.WeekMetrics)
 
 
 def load_training_week(week: date, today: date | None = None, history_days: int = PMC_CHART_DAYS) -> TrainingWeekView:
@@ -140,6 +162,11 @@ def load_training_week(week: date, today: date | None = None, history_days: int 
         notes.append(f"{len(unsynced)} activity(ies) this week exist in Garmin but aren't synced yet — sync to include them")
     if any(p[0].get("workoutId") and storage.load_cached_workout(p[0]["workoutId"]) is None for p in planned):
         notes.append("Some planned workouts aren't downloaded yet — press r to refresh from Garmin")
+    prefs = settings.load()
+    visible = [i for i in summary.items if not settings.is_hidden(i.sport, prefs)]
+    if len(visible) < len(summary.items):
+        hidden = len(summary.items) - len(visible)
+        notes.append(f"{hidden} row(s) of hidden sports ({', '.join(prefs['hidden_sports'])}) not shown — their TSS still counts")
     missing = [n for n, v in (("cycling FTP", thresholds.ftp_cycling_w), ("running LTHR", thresholds.lthr_running)) if not v]
     if missing:
         notes.append("Missing thresholds: " + ", ".join(missing) + " — press r, or set them in data/thresholds_override.json")
@@ -161,6 +188,7 @@ def load_training_week(week: date, today: date | None = None, history_days: int 
     # Up to and including today the chart shows what was done; after today, the plan.
     points = [actual_points[d] if d <= today else projected_points[d] for d in sorted(actual_points)]
     chart_start = min(week, today) - timedelta(days=history_days)
+    week_points = [actual_points[d] if d <= today else projected_points[d] for d in sorted(actual_points) if week <= d <= week_end]
     return TrainingWeekView(
         week=summary,
         thresholds=thresholds,
@@ -169,21 +197,26 @@ def load_training_week(week: date, today: date | None = None, history_days: int 
         week_end_point=(actual_points if week_end <= today else projected_points).get(week_end),
         notes=notes,
         calendar_cached=calendar_cached,
+        visible_items=visible,
+        load_metrics=metrics.week_metrics(week_points),
     )
 
 
 # --- Export ------------------------------------------------------------------------
 
 
-def export_training(client, end_week: date, weeks: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
-    """Write `weeks` weeks ending with the week starting `end_week` to one JSON file in
-    exports/ (see training_export) and return (its path, warnings). Logged in, it first
-    fetches from Garmin what the period is missing locally: thresholds and load stats, every
-    calendar month the period touches, and planned workouts not downloaded yet."""
+def export_training(client, choice: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
+    """Write a training_export.CHOICES period (0 = this week so far, else that many full
+    weeks ending last Sunday) to one JSON file in exports/ and return (its path, warnings).
+    Logged in, it first fetches from Garmin what the period is missing locally: thresholds
+    and load stats, every calendar month the period touches, and planned workouts not
+    downloaded yet."""
     import training_export  # imports services itself
 
     warnings: list[str] = []
-    start = end_week - timedelta(days=7 * (weeks - 1))
+    today = date.today()
+    start, end_week, _ = training_export.period(choice, today)
+    weeks = (end_week - start).days // 7 + 1  # weeks touched (1 for this week so far)
     if client is not None:
         warnings += refresh_training_data(client, end_week, progress)
         months = sorted({m for n in range(weeks) for m in _months_of_week(start + timedelta(days=7 * n))})
@@ -208,13 +241,17 @@ def export_training(client, end_week: date, weeks: int, progress: Progress = lam
                 storage.save_cached_workout(workout_id, garmin_client.get_workout(client, workout_id))
             except Exception as e:
                 warnings.append(f"Couldn't fetch planned workout {workout_id}: {e}")
+        _, activities = storage.load_index()
+        in_period = [a for a in activities if start.isoformat() <= a.start_time_local[:10]]
+        _, sets_failed = fetch_missing_exercise_sets(client, in_period, progress)
+        if sets_failed:
+            warnings.append(f"Strength sets of {sets_failed} session(s) couldn't be fetched")
     else:
         warnings.append("Not logged in to Garmin — exported from cached data only")
 
     progress("Writing export...")
-    document = training_export.build(end_week, weeks, notes=list(warnings))
-    end = end_week + timedelta(days=6)
-    path = storage.save_export(f"training_{start:%Y-%m-%d}_{end:%Y-%m-%d}_{weeks}w.json", document)
+    document = training_export.build(choice, today, notes=list(warnings))
+    path = storage.save_export(training_export.file_name(choice, today), document)
     return path, warnings
 
 
@@ -446,15 +483,54 @@ def merge_duplicates(
     return merged_activities, newly_merged
 
 
-def sync_activities(client, progress: Progress = lambda _: None) -> str:
-    """Download every new Garmin activity since the last sync (FIT file, laps, route), merge
+# --- Strength sets -------------------------------------------------------------------
+
+
+def is_strength(activity: ActivitySummary) -> bool:
+    return tl.sport_family(activity.sport) == "strength"
+
+
+def exercise_sets(client, activity_id: str) -> list[dict] | None:
+    """A strength activity's sets: cached, else fetched from Garmin (when logged in) and
+    cached. None when not cached and not logged in."""
+    sets = storage.load_exercise_sets(activity_id)
+    if sets is None and client is not None:
+        sets = garmin_client.exercise_sets(client, activity_id)
+        storage.save_exercise_sets(activity_id, sets)
+    return sets
+
+
+def fetch_missing_exercise_sets(client, activities: list[ActivitySummary], progress: Progress) -> tuple[int, int]:
+    """Fetch the sets of every strength activity that has none cached (new ones after a
+    sync, and the backlog the first time); returns (fetched, failed)."""
+    missing = [a for a in activities if is_strength(a) and storage.load_exercise_sets(a.activity_id) is None]
+    fetched = failed = 0
+    for n, activity in enumerate(missing, start=1):
+        progress(f"Fetching strength sets {n}/{len(missing)}: {activity.name}...")
+        try:
+            exercise_sets(client, activity.activity_id)
+            fetched += 1
+        except garmin_client.GarminConnectTooManyRequestsError:
+            failed += len(missing) - n + 1  # the next sync carries on from here
+            break
+        except Exception:  # one unreadable activity shouldn't stop the rest
+            failed += 1
+    return fetched, failed
+
+
+def sync_activities(client, progress: Progress = lambda _: None, full_history: bool = False) -> str:
+    """Download every new Garmin activity since the last sync — or, with `full_history`,
+    every activity in the account not downloaded yet — (FIT file, laps, route), merge
     duplicate recordings, and return a summary message."""
     last_synced_date, activities = storage.load_index()
     routes_list = storage.load_routes()
     # Also treat any activity already folded into another as "known" — otherwise a
     # future sync would re-download and re-add it, undoing a prior merge.
     known_ids = {a.activity_id for a in activities} | set(storage.load_merge_ledger())
-    start_date = last_synced_date or (date.today() - timedelta(days=INITIAL_SYNC_DAYS)).isoformat()
+    start_date = (
+        FULL_HISTORY_START if full_history
+        else last_synced_date or (date.today() - timedelta(days=INITIAL_SYNC_DAYS)).isoformat()
+    )
     end_date = date.today().isoformat()
 
     progress(f"Fetching activity list since {start_date}...")
@@ -505,13 +581,33 @@ def sync_activities(client, progress: Progress = lambda _: None) -> str:
     progress("Checking for duplicate recordings...")
     activities, merged_count = merge_duplicates(activities, recompute_existing=False)
     storage.save_index(last_synced_date, activities)
+    if full_history and new_count:
+        _fetch_history_stats(client, activities, progress)
+    sets_fetched, sets_failed = fetch_missing_exercise_sets(client, activities, progress)
 
     message = f"Sync complete: {new_count} new activities"
     if merged_count:
         message += f", {merged_count} merged as duplicates"
     if skipped:
         message += f", {skipped} skipped (no usable FIT file)"
+    if sets_fetched:
+        message += f", strength sets of {sets_fetched} session(s) imported"
+    if sets_failed:
+        message += f" ({sets_failed} not fetched — sync again later)"
     return message
+
+
+def _fetch_history_stats(client, activities: list[ActivitySummary], progress: Progress) -> None:
+    """Garmin's load fields (normalized power, its own TSS) for activities older than the
+    window refresh_training_data keeps up to date — one paginated list call."""
+    fetched_until, stats = storage.load_activity_stats()
+    oldest = min(a.start_time_local[:10] for a in activities)
+    progress(f"Fetching activity load data since {oldest}...")
+    try:
+        stats.update(garmin_client.activity_stats(client, oldest, date.today().isoformat()))
+    except Exception:  # optional: TSS falls back to HR/per-hour estimates without it
+        return
+    storage.save_activity_stats(fetched_until or date.today().isoformat(), stats)
 
 
 def reprocess_activities(progress: Progress = lambda _: None) -> str:

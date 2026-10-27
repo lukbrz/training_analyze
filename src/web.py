@@ -17,6 +17,7 @@ import display
 import fit_parser
 import garmin_client
 import services
+import settings
 import storage
 import training_export
 import training_load
@@ -116,7 +117,7 @@ def main_page() -> None:
     table = grid(display.ACTIVITY_COLUMNS, [], height="calc(100vh - 230px)")
 
     def render() -> None:
-        _, activities = storage.load_index()
+        activities, hidden = services.listed_activities()
         routes_by_id = {r.route_id: r for r in storage.load_routes()}
         sports = sorted({a.sport for a in activities})
         sport_select.set_options({ALL_SPORTS: "All sports", **{s: s.title() for s in sports}}, value=state["sport"] if state["sport"] in sports else ALL_SPORTS)
@@ -126,7 +127,7 @@ def main_page() -> None:
         table.options["rowData"] = grid_rows(rows, [{"_sport_color": SPORT_COLORS.get(a.sport, COLORS["fg"])} for a in shown])
         table.options["columnDefs"][2][":cellStyle"] = "params => ({color: params.data._sport_color})"
         table.update()
-        status.set_text(f"{len(shown)} activities synced" if len(shown) == len(activities) else f"{len(shown)} of {len(activities)} activities")
+        status.set_text(display.activities_status(len(shown), len(activities), hidden))
 
     def on_sport(e) -> None:
         state["sport"] = e.value or ALL_SPORTS
@@ -162,6 +163,20 @@ def main_page() -> None:
             return
         await job(services.sync_activities, State.client)
 
+    async def sync_history() -> None:
+        if State.client is None:
+            notify("Not logged in to Garmin", "warning")
+            return
+        with ui.dialog() as dialog, ui.card().classes("ta-card p-6"):
+            ui.html(escape(services.FULL_HISTORY_PROMPT)).classes("ta-pre")
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("outline")
+                ui.button("Sync full history", on_click=lambda: dialog.submit(True))
+        confirmed = await dialog
+        dialog.delete()
+        if confirmed:
+            await job(lambda progress: services.sync_activities(State.client, progress, full_history=True))
+
     sync_button.on_click(sync)
     reprocess_button.on_click(lambda: job(services.reprocess_activities))
     frame.bind("s", "Sync", sync)
@@ -169,9 +184,46 @@ def main_page() -> None:
     frame.bind("o", "Routes", lambda: ui.navigate.to("/routes"))
     frame.bind("w", "Workouts", lambda: ui.navigate.to("/workouts"))
     frame.bind("c", "Calendar & load", lambda: ui.navigate.to("/calendar"))
+    frame.bind("p", "Settings", lambda: ui.navigate.to("/settings"))
+    frame.bind("H", "Sync full history", sync_history)
     frame.bind("Enter", "Open", open_selected, shown_key="enter")
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"))
     render()
+
+
+# --- Settings --------------------------------------------------------------------------
+
+
+@ui.page("/settings")
+def settings_page() -> None:
+    frame = Frame("Settings")
+    values = settings.load()
+    inputs: dict[str, object] = {}
+    with ui.column().classes("gap-1"):
+        for field in settings.FIELDS:
+            if field.kind == "bool":
+                inputs[field.key] = ui.checkbox(field.label, value=values[field.key])
+            else:
+                ui.label(field.label).classes("font-semibold mt-2")
+                with ui.row().classes("gap-2"):
+                    inputs[field.key] = {
+                        sport: ui.checkbox(sport, value=sport in values[field.key]) for sport in settings.SPORT_GROUPS
+                    }
+            ui.label(field.help).classes("ta-status")
+
+    def save() -> None:
+        new = {}
+        for field in settings.FIELDS:
+            widget = inputs[field.key]
+            new[field.key] = widget.value if field.kind == "bool" else [s for s, box in widget.items() if box.value]
+        settings.save(new)
+        notify(f"Settings saved to {storage.SETTINGS_PATH}")
+        ui.navigate.back()
+
+    with ui.row().classes("gap-2 mt-4"):
+        ui.button("Save", on_click=save)
+        ui.button("Cancel", on_click=ui.navigate.back).props("outline")
+    frame.bind_back()
 
 
 # --- Laps (with map / phases / compare / zones tabs) --------------------------------
@@ -199,6 +251,7 @@ def laps_page(activity_id: str) -> None:
         ui.html(f"<span style='color:{SPORT_COLORS.get(activity.sport, COLORS['fg'])}; font-weight:600'>{activity.sport}</span>")
         ui.label(f"·  {activity.start_time_local.replace('T', ' ')[:16]}").classes("ta-status")
     stat_tiles(display.activity_stats(activity))
+    metrics_area = ui.column().classes("w-full")  # filled once the record stream is loaded
     if session.multisport:
         with ui.row().classes("w-full gap-3 no-wrap"):
             for name, sport, stats in display.leg_stats(storage.load_laps(activity_id)):
@@ -214,7 +267,9 @@ def laps_page(activity_id: str) -> None:
         phases_tab = ui.tab("Phases (h)")
         compare_tab = ui.tab("Compare (c)")
         zones_tab = ui.tab("Zones (z)")
-    with ui.tab_panels(tabs, value=laps_tab).classes("w-full").style("background: transparent"):
+        sets_tab = ui.tab("Sets (t)") if services.is_strength(activity) else None
+    # A gym session opens on its sets; everything else on its laps.
+    with ui.tab_panels(tabs, value=sets_tab or laps_tab).classes("w-full").style("background: transparent"):
         with ui.tab_panel(laps_tab).classes("p-0 gap-2"):
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 split_input = ui.input(placeholder="400 = metres · 60s / 1m / 1:30 = time").classes("flex-grow").props("dense outlined")
@@ -241,6 +296,9 @@ def laps_page(activity_id: str) -> None:
             compare_area = ui.column().classes("w-full gap-2")
         with ui.tab_panel(zones_tab).classes("p-0"):
             zones_area = ui.column().classes("w-full gap-2")
+        if sets_tab is not None:
+            with ui.tab_panel(sets_tab).classes("p-0"):
+                sets_area = ui.column().classes("w-full gap-2")
 
     def rebuild(keep_row: int | None = None) -> None:
         state["rows"] = session.rows()
@@ -301,6 +359,13 @@ def laps_page(activity_id: str) -> None:
     async def initial_load() -> None:
         """Track on the side map, then the PHYSICAL section (seconds each on a long ride)."""
         await refresh_side_map(0, fit=True)
+        if session.records is not None:
+            extra = display.activity_metric_stats(await run.io_bound(session.advanced_metrics))
+            if extra:
+                with metrics_area:
+                    stat_tiles(extra)
+        if not session.auto_detect:
+            return
         try:
             laps = await run.io_bound(session.detect_physical_laps)
         except LapsError:
@@ -414,6 +479,28 @@ def laps_page(activity_id: str) -> None:
                 ui.label(title).classes("font-semibold")
                 grid(display.ZONE_COLUMNS, grid_rows(display.zone_rows(zones)), height="28vh")
 
+    async def show_sets() -> None:
+        if sets_tab is None:
+            notify("Not a strength activity", "warning")
+            return
+        state["sets_loaded"] = True
+        tabs.set_value(sets_tab)
+        sets_area.clear()
+        with sets_area:
+            status = ui.label("Fetching sets from Garmin Connect...").classes("ta-status")
+        try:
+            sets = await run.io_bound(services.exercise_sets, State.client, activity_id)
+        except Exception as e:
+            status.set_text(f"Couldn't fetch sets: {e}")
+            return
+        if sets is None:
+            status.set_text("Not logged in — sets aren't downloaded for this activity")
+            return
+        status.delete()
+        with sets_area:
+            ui.html(escape(display.strength_summary(sets))).classes("ta-pre")
+            grid(display.SET_COLUMNS, grid_rows(display.strength_rows(sets)), height="55vh")
+
     async def go_back() -> None:
         if tabs.value != laps_tab and tabs.value != "Laps":
             tabs.set_value(laps_tab)
@@ -423,6 +510,9 @@ def laps_page(activity_id: str) -> None:
     frame.bind_back(go_back)
     frame.bind("m", "Mark interval", toggle_interval)
     frame.bind("z", "Zones", show_zones)
+    frame.bind("t", "Strength sets", show_sets)
+    if sets_tab is not None:  # clicking the tab loads it too, not only the t key
+        tabs.on_value_change(lambda e: show_sets() if e.value in (sets_tab, "Sets (t)") and not state.get("sets_loaded") else None)
     frame.bind("c", "Compare intervals", draw_compare)
     frame.bind("p", "Re-detect loops", physical_laps)
     frame.bind("i", "Split intervals", split_intervals)
@@ -435,6 +525,8 @@ def laps_page(activity_id: str) -> None:
     on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
     rebuild(0)
     ui.timer(0.2, initial_load, once=True)
+    if sets_tab is not None:
+        ui.timer(0.1, show_sets, once=True)
 
 
 # --- Routes --------------------------------------------------------------------------
@@ -639,6 +731,7 @@ def calendar_page() -> None:
         tiles_area.clear()
         with tiles_area:
             stat_tiles(display.week_load_stats(view))
+            stat_tiles(display.week_metric_stats(view.load_metrics))
         parts = display.week_tss_parts(view)
         total = sum(parts.values()) or 1
         segments = "".join(
@@ -653,7 +746,7 @@ def calendar_page() -> None:
         )
         thresholds.set_text(display.format_thresholds(view.thresholds))
         rows, extras = [], []
-        for item in view.week.items:
+        for item in view.visible_items:
             cells, color = display.week_item_cells(item, today)
             rows.append(cells)
             extras.append({"_color": COLORS.get(color, COLORS["fg"]) if color else COLORS["fg"],
@@ -724,7 +817,7 @@ def calendar_page() -> None:
 
     async def selected_item() -> training_load.WeekItem | None:
         row = await selected_row(table)
-        items = state["view"].week.items
+        items = state["view"].visible_items
         return items[row] if row is not None and row < len(items) else None
 
     async def dialog_result(build) -> object:
@@ -826,20 +919,18 @@ def calendar_page() -> None:
             await local_change(lambda: services.link(item, candidates[index]))
 
     async def export() -> None:
-        week = state["week"]
-        index = await choose(training_export.export_prompt(week), training_export.week_choices(week))
+        index = await choose(training_export.EXPORT_PROMPT, training_export.choice_labels(date.today()))
         if index is None:
             return
-        weeks = training_export.WEEK_CHOICES[index]
         try:
-            path, warnings = await run_with_progress(week_title, services.export_training, State.client, week, weeks)
+            path, warnings = await run_with_progress(week_title, services.export_training, State.client, training_export.CHOICES[index])
         except Exception as e:
             notify(f"Export failed: {e}", "error")
             load()
             return
         for message in warnings:
             notify(message, "warning")
-        notify(f"Exported {weeks} week(s) to {path}")
+        notify(f"Exported to {path}")
         ui.download(path)  # a copy in the browser's downloads too
         load()
 
@@ -853,7 +944,7 @@ def calendar_page() -> None:
     frame.bind("l", "Link/unlink plan", unless_dialog(link))
     frame.bind("e", "Export weeks", unless_dialog(export))
     frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
-        display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].week.items]), "week"))
+        display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].visible_items]), "week"))
     load()
     ui.timer(0.1, refresh, once=True)
 

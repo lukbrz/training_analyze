@@ -12,20 +12,33 @@ Written without indentation: a 24-week export is ~250 KB, and the reader is a pr
 
 from datetime import date, datetime, timedelta
 
+import fit_parser
+import metrics
 import services
 import storage
 import training_load as tl
 from models import ActivitySummary, Lap, format_speed_or_pace
 
 FORMAT = "training_analyze/export"
-VERSION = 1
-WEEK_CHOICES = (1, 4, 12, 24)
+VERSION = 2
+# What can be exported: 0 = this week so far (Monday to today), else that many complete
+# Monday-Sunday weeks ending last Sunday.
+CHOICES = (0, 1, 4, 12, 24)
+EXPORT_PROMPT = "Export to one JSON file in the exports/ folder:"
 
 UNITS = {
     "duration": "seconds", "distance": "metres", "speed": "m/s", "power": "W",
     "heart_rate": "bpm", "ascent": "metres", "weight": "kg",
     "pace": "m:ss per km (running/hiking), per 100 m (swimming); km/h for cycling",
     "tss": "training stress score (100 = one hour at threshold)",
+}
+METRICS_HELP = {
+    "efficiency_factor": "output per heartbeat: normalized power / avg HR (W/bpm) for rides, speed in m/min / avg HR for runs; compare across similar sessions",
+    "aerobic_decoupling_pct": "drop in output per heartbeat from the first to the second half; < 5% on a long steady session = good aerobic endurance; meaningless for intervals",
+    "ramp_rate": "CTL gained over the week; > 5-8 per week is aggressive",
+    "acwr": "acute:chronic workload ratio (ATL / CTL); 0.8-1.3 sweet spot, > 1.5 injury risk rises",
+    "monotony": "mean daily TSS / its standard deviation over the week; > 2 = too little hard/easy variation",
+    "strain": "weekly TSS x monotony",
 }
 STATUS_HELP = {
     "done (planned)": "a planned workout and the activity that carried it out",
@@ -35,8 +48,7 @@ STATUS_HELP = {
 }
 FITNESS_HELP = (
     "CTL (fitness) and ATL (fatigue) are 42- and 7-day exponentially weighted averages of "
-    "daily TSS; TSB (form) = yesterday's CTL - ATL. Days after today are projected from the "
-    "planned workouts."
+    "daily TSS; TSB (form) = yesterday's CTL - ATL."
 )
 
 
@@ -175,7 +187,37 @@ def _zones(zones) -> list[dict]:
     ]
 
 
-def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str]) -> dict:
+# Strength sets are a table like laps.
+SET_COLUMNS = ("type", "exercise", "category", "reps", "weight_kg", "duration_s", "start", "workout_step")
+
+
+def _sets_table(sets: list[dict]) -> dict:
+    return {
+        "columns": list(SET_COLUMNS),
+        "rows": [
+            [s.get("type"), s.get("exercise"), s.get("category"), s.get("reps"), s.get("weight_kg"),
+             _r(s.get("duration_s")), s.get("start"), s.get("step")]
+            for s in sets
+        ],
+    }
+
+
+def _activity_metrics(a: ActivitySummary, stats: dict | None) -> dict:
+    try:
+        records = fit_parser.load_records(a.activity_id) if storage.has_fit(a.activity_id) else []
+    except Exception:  # an unreadable FIT file just means no metrics
+        records = []
+    m = metrics.activity_metrics(a, stats, records)
+    out = {}
+    if m.efficiency_factor is not None:
+        out["efficiency_factor"] = _r(m.efficiency_factor, 3)
+        out["efficiency_factor_unit"] = m.ef_basis
+    if m.decoupling_pct is not None:
+        out["aerobic_decoupling_pct"] = _r(m.decoupling_pct)
+    return out
+
+
+def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str], stats: dict[str, dict]) -> dict:
     out = {
         "garmin_activity_id": a.activity_id,
         "name": a.name,
@@ -195,8 +237,12 @@ def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str]
         out["route"] = route_names[a.route_id]
     if a.virtual:
         out["virtual"] = True
+    out.update(_activity_metrics(a, stats.get(a.activity_id)))
     laps = storage.load_laps(a.activity_id)
     out["laps"] = _laps_table(laps, a.sport)
+    sets = storage.load_exercise_sets(a.activity_id) if services.is_strength(a) else None
+    if sets:
+        out["strength_sets"] = _sets_table(sets)
     intervals = [lap for lap in laps if lap.is_interval]
     if intervals:
         out["marked_intervals"] = len(intervals)
@@ -210,7 +256,7 @@ def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str]
     return out
 
 
-def _item(item: tl.WeekItem, activities: dict[str, ActivitySummary], route_names: dict[str, str]) -> dict:
+def _item(item: tl.WeekItem, activities: dict[str, ActivitySummary], route_names: dict[str, str], stats: dict[str, dict]) -> dict:
     out = {
         "date": item.day.isoformat(),
         "weekday": item.day.strftime("%A"),
@@ -226,7 +272,7 @@ def _item(item: tl.WeekItem, activities: dict[str, ActivitySummary], route_names
         out["planned"] = _planned(item, item.title, item.day)
     activity = activities.get(item.activity_id) if item.activity_id else None
     if activity is not None:
-        out["activity"] = _activity(activity, item, route_names)
+        out["activity"] = _activity(activity, item, route_names, stats)
     return out
 
 
@@ -237,6 +283,12 @@ def _point(point: tl.PmcPoint | None, today: date) -> dict | None:
     if point.day > today:
         out["projected"] = True
     return out
+
+
+def _week_metrics(points: list[tl.PmcPoint]) -> dict:
+    m = metrics.week_metrics(points)
+    out = {"ramp_rate": _r(m.ramp_rate), "acwr": _r(m.acwr, 2), "monotony": _r(m.monotony, 2), "strain": _r(m.strain, 0)}
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def _thresholds(th: tl.Thresholds) -> dict:
@@ -252,57 +304,85 @@ def _thresholds(th: tl.Thresholds) -> dict:
     return {k: v for k, v in out.items() if v is not None}
 
 
-def export_prompt(end_week: date) -> str:
-    return f"Export to one JSON file (exports/ folder) the weeks ending with {end_week:%d.%m} – {end_week + timedelta(days=6):%d.%m.%Y}:"
+def period(weeks: int, today: date) -> tuple[date, date, date]:
+    """(first Monday, last Monday, last day) of a CHOICES entry: this week up to today for
+    0, else `weeks` complete weeks ending last Sunday."""
+    this_monday = tl.week_start(today)
+    if weeks == 0:
+        return this_monday, this_monday, today
+    last_monday = this_monday - timedelta(days=7)
+    return last_monday - timedelta(days=7 * (weeks - 1)), last_monday, last_monday + timedelta(days=6)
 
 
-def week_choices(end_week: date) -> list[str]:
-    """One pick-list line per WEEK_CHOICES entry, naming the period it covers."""
-    end = end_week + timedelta(days=6)
-    return [
-        f"{n} week{'s' if n > 1 else ''}  ({end_week - timedelta(days=7 * (n - 1)):%d.%m.%Y} – {end:%d.%m.%Y})"
-        for n in WEEK_CHOICES
-    ]
+def choice_labels(today: date) -> list[str]:
+    """One pick-list line per CHOICES entry, naming the period it covers."""
+    labels = []
+    for weeks in CHOICES:
+        first, _, last = period(weeks, today)
+        name = "This week so far" if weeks == 0 else f"Last {weeks} full week{'s' if weeks > 1 else ''}"
+        labels.append(f"{name}  ({first:%a %d.%m.%Y} – {last:%a %d.%m.%Y})")
+    return labels
 
 
-def build(end_week: date, weeks: int, today: date | None = None, notes: list[str] | None = None) -> dict:
-    """The export document for `weeks` weeks ending with the week starting `end_week`."""
+def file_name(weeks: int, today: date) -> str:
+    first, _, last = period(weeks, today)
+    return f"training_{first:%Y-%m-%d}_{last:%Y-%m-%d}_{'this-week' if weeks == 0 else f'{weeks}w'}.json"
+
+
+def _tss_totals(items: list[tl.WeekItem]) -> dict:
+    def total(statuses):
+        return _r(sum(i.tss for i in items if i.status in statuses), 0)
+    return {"done": total(("done (planned)", "unplanned")), "remaining": total(("planned",)), "missed": total(("missed",))}
+
+
+def build(weeks: int, today: date | None = None, notes: list[str] | None = None) -> dict:
+    """The export document for a CHOICES entry (see `period`): every day from its first
+    Monday to its last day — Sunday, or today for this week so far."""
     today = today or date.today()
-    starts = [end_week - timedelta(days=7 * n) for n in reversed(range(weeks))]
-    period_start, period_end = starts[0], end_week + timedelta(days=6)
+    period_start, last_monday, period_end = period(weeks, today)
+    starts = [period_start + timedelta(days=7 * n) for n in range((last_monday - period_start).days // 7 + 1)]
     _, activities = storage.load_index()
     by_id = {a.activity_id: a for a in activities}
     route_names = {r.route_id: r.name for r in storage.load_routes()}
+    _, stats = storage.load_activity_stats()
     notes = list(notes or [])
 
+    last = services.load_training_week(last_monday, today, history_days=(today - period_start).days + 7)
+    points = {p.day: p for p in last.pmc}
     week_docs = []
     for start in starts:
         view = services.load_training_week(start, today)
         if not view.calendar_cached:
             notes.append(f"Garmin calendar for the week of {start} isn't downloaded: its planned workouts are missing")
-        w = view.week
+        end = min(start + timedelta(days=6), period_end)
+        items = [i for i in view.week.items if i.day <= end]
         week_docs.append({
             "week": start.isocalendar().week,
             "start": start.isoformat(),
-            "end": (start + timedelta(days=6)).isoformat(),
-            "tss": {"done": _r(w.done_tss, 0), "remaining": _r(w.remaining_tss, 0), "missed": _r(w.missed_tss, 0)},
-            "fitness_at_week_end": _point(view.week_end_point, today),
-            "items": [_item(i, by_id, route_names) for i in w.items],
+            "end": end.isoformat(),
+            **({"partial": "this week up to today"} if end < start + timedelta(days=6) else {}),
+            "tss": _tss_totals(items),
+            "fitness_at_end": _point(points.get(end), today),
+            "load_metrics": _week_metrics([p for d, p in sorted(points.items()) if start <= d <= end]),
+            "items": [_item(i, by_id, route_names, stats) for i in items],
         })
 
-    last = services.load_training_week(end_week, today, history_days=(today - period_start).days + 7)
     daily = [
-        {"date": p.day.isoformat(), "tss": _r(p.tss, 0), "ctl": _r(p.ctl), "atl": _r(p.atl), "tsb": _r(p.tsb), **({"projected": True} if p.day > today else {})}
+        {"date": p.day.isoformat(), "tss": _r(p.tss, 0), "ctl": _r(p.ctl), "atl": _r(p.atl), "tsb": _r(p.tsb)}
         for p in last.pmc if period_start <= p.day <= period_end
     ]
     return {
         "format": FORMAT,
         "version": VERSION,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
-        "period": {"weeks": weeks, "start": period_start.isoformat(), "end": period_end.isoformat(), "today": today.isoformat()},
+        "period": {
+            "kind": "this week so far" if weeks == 0 else f"last {weeks} full week(s), Monday to Sunday",
+            "start": period_start.isoformat(), "end": period_end.isoformat(), "today": today.isoformat(),
+        },
         "units": UNITS,
         "status_meanings": STATUS_HELP,
         "fitness_meaning": FITNESS_HELP,
+        "metrics_meaning": METRICS_HELP,
         "thresholds": _thresholds(last.thresholds),
         "fitness_today": _point(last.today_point, today),
         "weeks": week_docs,

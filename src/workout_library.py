@@ -4,18 +4,26 @@ previews, and the "upload a whole week" plan. Shared by the Textual screen and t
 
 Rows are keyed by path relative to the workouts folder ("week/file.json" — also the key in
 the uploaded-workouts ledger); week header rows are "week:<folder>".
+
+Past plans are archived (see settings): a week whose workouts' dates have all passed (its
+folder and zip), or a loose file whose date has passed, moves into workouts/archive/, its
+ledger keys gaining the "archive/" prefix. Archived workouts are only listed when the
+show-archived setting is on, as "archive/<week>" weeks and "archive/<file>" rows.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
+import shutil
 from pathlib import Path
 
 import services
+import settings
 import storage
 import workouts
 
 WEEK_KEY_PREFIX = "week:"
+ARCHIVE = "archive"
 COLUMNS = ("File", "Date", "Name", "Sport", "Status", "Uploaded")
 EMPTY_HINT = (
     "Put workout .json files, or a week's plan as a .zip of them, in the folders above "
@@ -79,39 +87,54 @@ class WorkoutLibrary:
         self.collapsed ^= {week}
         return True
 
-    def refresh(self) -> list[str]:
-        """Unpack new/updated week zips, rescan the folder; returns unpack messages."""
+    def refresh(self, today: date | None = None) -> list[str]:
+        """Unpack new/updated week zips, archive past plans (if enabled), rescan the folder;
+        returns messages for the user."""
+        today = (today or date.today()).isoformat()
         self.root.mkdir(parents=True, exist_ok=True)
         messages = workouts.extract_new_archives(self.root)
+        prefs = settings.load()
+        if prefs["auto_archive_workouts"]:
+            messages += self.archive_past(today)
         uploaded = storage.load_uploaded_workouts()
         self.entries, self.week_dirs, self.all_rows = {}, {}, []
-        today = date.today().isoformat()
 
-        for path in sorted(self.root.glob("*.json")):
-            self.entries[path.name] = _load_entry(path)
-            self.all_rows.append(self._entry_row(path.name, path.name, uploaded))
+        folders = [(self.root, "")]
+        archive_root = self.root / ARCHIVE
+        if prefs["show_archived_workouts"] and archive_root.is_dir():
+            folders.append((archive_root, f"{ARCHIVE}/"))
+        for folder, prefix in folders:
+            self._scan(folder, prefix, uploaded, today)
+        return messages
 
-        for week_dir in sorted(d for d in self.root.iterdir() if d.is_dir()):
+    def _scan(self, folder: Path, prefix: str, uploaded: dict[str, int], today: str) -> None:
+        for path in sorted(folder.glob("*.json")):
+            key = f"{prefix}{path.name}"
+            self.entries[key] = _load_entry(path)
+            self.all_rows.append(self._entry_row(key, key, uploaded))
+
+        for week_dir in sorted(d for d in folder.iterdir() if d.is_dir() and not (d.name == ARCHIVE and not prefix)):
+            week = f"{prefix}{week_dir.name}"
             keys = []
             for path in week_dir.glob("*.json"):
-                key = f"{week_dir.name}/{path.name}"
+                key = f"{week}/{path.name}"
                 self.entries[key] = _load_entry(path)
                 keys.append(key)
             if not keys:
                 continue
             keys.sort(key=lambda k: (self.date_of(k), k))
-            self.week_dirs[week_dir.name] = keys
+            self.week_dirs[week] = keys
             dates = [d for d in (self.date_of(k) for k in keys) if d]
             invalid = sum(not isinstance(self.entries[k], dict) for k in keys)
             done = sum(k in uploaded for k in keys)
-            if week_dir.name not in self._seen_weeks:
-                self._seen_weeks.add(week_dir.name)
+            if week not in self._seen_weeks:
+                self._seen_weeks.add(week)
                 if dates and dates[-1] < today:
-                    self.collapsed.add(week_dir.name)
+                    self.collapsed.add(week)
             self.all_rows.append(LibraryRow(
-                f"{WEEK_KEY_PREFIX}{week_dir.name}",
+                f"{WEEK_KEY_PREFIX}{week}",
                 (
-                    week_dir.name,
+                    week,
                     f"{dates[0]} – {dates[-1]}" if dates else "",
                     f"{len(keys)} workouts",
                     "",
@@ -121,7 +144,42 @@ class WorkoutLibrary:
                 "week",
             ))
             for key in keys:
-                self.all_rows.append(self._entry_row(key, f"  {key.split('/', 1)[1]}", uploaded))
+                self.all_rows.append(self._entry_row(key, f"  {key.rsplit('/', 1)[1]}", uploaded))
+
+    def archive_past(self, today: str) -> list[str]:
+        """Move plans whose dates have all passed into workouts/archive/ (see the module
+        docstring); returns one message per move. Undated files are never archived."""
+        archive_root = self.root / ARCHIVE
+        moves: list[tuple[Path, Path, str, str]] = []  # (source, target, old key prefix, new)
+        for path in sorted(self.root.glob("*.json")):
+            entry = _load_entry(path)
+            if isinstance(entry, dict) and entry.get("schedule_date") and entry["schedule_date"] < today:
+                moves.append((path, archive_root / path.name, path.name, f"{ARCHIVE}/{path.name}"))
+        for week_dir in sorted(d for d in self.root.iterdir() if d.is_dir() and d.name != ARCHIVE):
+            entries = [_load_entry(p) for p in week_dir.glob("*.json")]
+            dates = [e.get("schedule_date") for e in entries if isinstance(e, dict)]
+            if dates and all(d and d < today for d in dates):
+                moves.append((week_dir, archive_root / week_dir.name, f"{week_dir.name}/", f"{ARCHIVE}/{week_dir.name}/"))
+                zip_path = week_dir.parent / f"{week_dir.name}.zip"  # not with_suffix: "12-18.10" has a dot
+                if zip_path.exists():
+                    moves.append((zip_path, archive_root / zip_path.name, "", ""))
+        if not moves:
+            return []
+
+        archive_root.mkdir(exist_ok=True)
+        ledger = storage.load_uploaded_workouts()
+        messages = []
+        for source, target, old, new in moves:
+            if target.exists():  # a re-delivered plan for an archived week replaces it
+                shutil.rmtree(target) if target.is_dir() else target.unlink()
+            source.rename(target)
+            if old:
+                ledger = {
+                    (new + k[len(old):] if (k.startswith(old) if old.endswith("/") else k == old) else k): v
+                    for k, v in ledger.items()
+                }
+                messages.append(f"Archived {source.name} (all its dates have passed)")
+        storage.save_uploaded_workouts(ledger)
         return messages
 
     def _entry_row(self, key: str, label: str, uploaded: dict[str, int]) -> LibraryRow:
@@ -141,12 +199,14 @@ class WorkoutLibrary:
 
     @staticmethod
     def week_of(key: str | None) -> str | None:
-        """The week folder a row belongs to (its header row or one of its workouts)."""
+        """The week folder a row belongs to (its header row or one of its workouts):
+        "week" for "week/file.json", "archive/week" for "archive/week/file.json"."""
         if key is None:
             return None
         if key.startswith(WEEK_KEY_PREFIX):
             return key[len(WEEK_KEY_PREFIX):]
-        return key.split("/", 1)[0] if "/" in key else None
+        folder = key.rsplit("/", 1)[0] if "/" in key else None
+        return None if folder == ARCHIVE else folder
 
     def preview(self, key: str | None) -> tuple[str, bool]:
         """(preview text, is_error) for the selected row."""
@@ -191,7 +251,7 @@ class WorkoutLibrary:
         if invalid:
             raise LibraryError(
                 f"{len(invalid)} workout(s) in {week} are invalid — fix or remove them first: "
-                + ", ".join(k.split("/", 1)[1] for k in invalid),
+                + ", ".join(k.rsplit("/", 1)[1] for k in invalid),
                 severity="error",
             )
         # Already-uploaded workouts are included too: upload_many checks each against Garmin
