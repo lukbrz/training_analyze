@@ -205,6 +205,21 @@ def load_training_week(week: date, today: date | None = None, history_days: int 
 # --- Export ------------------------------------------------------------------------
 
 
+ATHLETE_LOOKBACK_DAYS = 90
+
+
+def refresh_athlete(client, start: date, end: date) -> None:
+    """Fetch the athlete's profile and the daily history of their parameters (weight,
+    resting HR, VO2max, thresholds) between two dates into the local cache, merged with
+    what's cached already."""
+    athlete = storage.load_athlete()
+    athlete["profile"] = garmin_client.athlete_profile(client)
+    history = athlete.setdefault("history", {})
+    for name, values in garmin_client.athlete_history(client, start.isoformat(), end.isoformat()).items():
+        history.setdefault(name, {}).update(values)
+    storage.save_athlete(athlete)
+
+
 def export_training(client, choice: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
     """Write a training_export.CHOICES period (0 = this week so far, else that many full
     weeks ending last Sunday) to one JSON file in exports/ and return (its path, warnings).
@@ -241,6 +256,13 @@ def export_training(client, choice: int, progress: Progress = lambda _: None) ->
                 storage.save_cached_workout(workout_id, garmin_client.get_workout(client, workout_id))
             except Exception as e:
                 warnings.append(f"Couldn't fetch planned workout {workout_id}: {e}")
+        progress("Fetching athlete parameters (weight, resting HR, VO2max, thresholds)...")
+        try:
+            # From well before the period, so its first weeks get the last weigh-in and
+            # threshold set before it.
+            refresh_athlete(client, start - timedelta(days=ATHLETE_LOOKBACK_DAYS), today)
+        except Exception as e:  # export with what's cached
+            warnings.append(f"Couldn't fetch athlete parameters: {e}")
         _, activities = storage.load_index()
         in_period = [a for a in activities if start.isoformat() <= a.start_time_local[:10]]
         _, sets_failed = fetch_missing_exercise_sets(client, in_period, progress)

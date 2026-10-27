@@ -31,7 +31,14 @@ UNITS = {
     "heart_rate": "bpm", "ascent": "metres", "weight": "kg",
     "pace": "m:ss per km (running/hiking), per 100 m (swimming); km/h for cycling",
     "tss": "training stress score (100 = one hour at threshold)",
+    "age": "whole years, from the birth year only",
 }
+ATHLETE_HELP = (
+    "Top-level 'athlete': current profile and HR zones (zone_floors_bpm = lower limits of "
+    "zones 1-5). Each week's 'athlete': weight (latest weigh-in up to the week's last day), "
+    "average resting HR of the week, and VO2max / thresholds as Garmin had them on the "
+    "week's last day; W/kg = threshold power / that weight."
+)
 METRICS_HELP = {
     "efficiency_factor": "output per heartbeat: normalized power / avg HR (W/bpm) for rides, speed in m/min / avg HR for runs; compare across similar sessions",
     "aerobic_decoupling_pct": "drop in output per heartbeat from the first to the second half; < 5% on a long steady session = good aerobic endurance; meaningless for intervals",
@@ -291,6 +298,48 @@ def _week_metrics(points: list[tl.PmcPoint]) -> dict:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _latest(series: dict[str, float], until: date) -> tuple[str, float] | None:
+    """The last (date, value) of a daily series on or before `until`."""
+    dates = [d for d in series if d <= until.isoformat()]
+    return (max(dates), series[max(dates)]) if dates else None
+
+
+def _week_athlete(history: dict[str, dict[str, float]], start: date, end: date) -> dict:
+    """The athlete's parameters for one week: weight, VO2max and thresholds as of its last
+    day (each with the date it was last updated where that matters), and resting HR as the
+    week's average."""
+    out: dict = {}
+    weight = _latest(history.get("weight_kg", {}), end)
+    if weight:
+        out["weight_kg"], out["weight_date"] = _r(weight[1]), weight[0]
+    rhr = [v for d, v in history.get("resting_hr_bpm", {}).items() if start.isoformat() <= d <= end.isoformat()]
+    if rhr:
+        out["resting_hr_avg_bpm"] = _r(sum(rhr) / len(rhr))
+    for name in ("vo2max_running", "vo2max_cycling", "ftp_cycling_w", "threshold_power_running_w", "lthr_running_bpm"):
+        latest = _latest(history.get(name, {}), end)
+        if latest:
+            out[name] = _r(latest[1])
+    speed = _latest(history.get("threshold_speed_running_mps", {}), end)
+    if speed:
+        out["threshold_speed_running_mps"] = _r(speed[1], 3)
+        out["threshold_pace_running"] = _pace_text(speed[1], "running")
+    if weight:
+        for name, out_name in (("ftp_cycling_w", "ftp_cycling_w_per_kg"), ("threshold_power_running_w", "threshold_power_running_w_per_kg")):
+            if out.get(name):
+                out[out_name] = _r(out[name] / weight[1], 2)
+    return out
+
+
+def _athlete(profile: dict, today: date) -> dict:
+    out = {
+        "gender": profile.get("gender"),
+        "age_years": today.year - profile["birth_year"] if profile.get("birth_year") else None,
+        "height_cm": profile.get("height_cm"),
+        "hr_zones": profile.get("hr_zones"),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 def _thresholds(th: tl.Thresholds) -> dict:
     out = {
         "ftp_cycling_w": th.ftp_cycling_w,
@@ -345,7 +394,11 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
     by_id = {a.activity_id: a for a in activities}
     route_names = {r.route_id: r.name for r in storage.load_routes()}
     _, stats = storage.load_activity_stats()
+    athlete = storage.load_athlete()
+    history = athlete.get("history") or {}
     notes = list(notes or [])
+    if not history:
+        notes.append("Athlete parameters (weight, resting HR, VO2max, threshold history) aren't downloaded — export while logged in")
 
     last = services.load_training_week(last_monday, today, history_days=(today - period_start).days + 7)
     points = {p.day: p for p in last.pmc}
@@ -364,6 +417,7 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
             "tss": _tss_totals(items),
             "fitness_at_end": _point(points.get(end), today),
             "load_metrics": _week_metrics([p for d, p in sorted(points.items()) if start <= d <= end]),
+            "athlete": _week_athlete(history, start, end),
             "items": [_item(i, by_id, route_names, stats) for i in items],
         })
 
@@ -383,6 +437,8 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
         "status_meanings": STATUS_HELP,
         "fitness_meaning": FITNESS_HELP,
         "metrics_meaning": METRICS_HELP,
+        "athlete_meaning": ATHLETE_HELP,
+        "athlete": _athlete(athlete.get("profile") or {}, today),
         "thresholds": _thresholds(last.thresholds),
         "fitness_today": _point(last.today_point, today),
         "weeks": week_docs,

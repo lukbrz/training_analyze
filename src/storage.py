@@ -29,6 +29,7 @@ PLAN_LINKS_PATH = DATA_DIR / "plan_links.json"
 EXPORTS_DIR = BASE_DIR / "exports"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 EXERCISE_SETS_DIR = DATA_DIR / "exercise_sets"
+ATHLETE_PATH = DATA_DIR / "athlete.json"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -251,6 +252,15 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
 
 def save_settings(values: dict, path: Path = SETTINGS_PATH) -> None:
     _write_json(path, values)
+
+
+def load_athlete(path: Path = ATHLETE_PATH) -> dict:
+    """{"profile": garmin_client.athlete_profile(), "history": {series: {date: value}}}."""
+    return _read_json(path, {"profile": {}, "history": {}})
+
+
+def save_athlete(athlete: dict, path: Path = ATHLETE_PATH) -> None:
+    _write_json(path, athlete)
 
 
 def load_exercise_sets(activity_id: str, sets_dir: Path = EXERCISE_SETS_DIR) -> list[dict] | None:

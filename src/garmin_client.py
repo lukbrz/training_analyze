@@ -221,6 +221,77 @@ def exercise_sets(garmin: Garmin, activity_id: str) -> list[dict]:
     return out
 
 
+def athlete_profile(garmin: Garmin) -> dict:
+    """The athlete's current profile: gender, birth year (only the year — an age to the
+    year is all anything here needs), height, and heart-rate zones per sport."""
+    data = (garmin.get_user_profile() or {}).get("userData") or {}
+    out = {
+        "gender": (data.get("gender") or "").lower() or None,
+        "birth_year": int(data["birthDate"][:4]) if data.get("birthDate") else None,
+        "height_cm": data.get("height"),
+    }
+    zones = {}
+    for z in garmin.get_heart_rate_zones() or []:
+        floors = [z.get(f"zone{n}Floor") for n in range(1, 6)]
+        zones[(z.get("sport") or "default").lower()] = {
+            "zone_floors_bpm": floors if all(floors) else None,
+            "max_hr_bpm": z.get("maxHeartRateUsed"),
+            "resting_hr_bpm": z.get("restingHeartRateUsed"),
+            "lthr_bpm": z.get("lactateThresholdHeartRateUsed"),
+            "method": z.get("trainingMethod"),
+        }
+    out["hr_zones"] = zones
+    return out
+
+
+def athlete_history(garmin: Garmin, start: str, end: str) -> dict[str, dict[str, float]]:
+    """Daily values of the athlete's parameters between two YYYY-MM-DD dates, as
+    {series: {date: value}} — one request per series, whatever the range. A series Garmin
+    can't serve is left out (each is optional)."""
+    out: dict[str, dict[str, float]] = {}
+
+    def series(name: str, fetch, parse) -> None:
+        try:
+            out[name] = {d: v for d, v in parse(fetch()) if d and v is not None}
+        except Exception:
+            pass
+
+    bio = garmin.garmin_connect_biometric_stats_url
+    range_query = "aggregation=daily&aggregationStrategy=LATEST"
+
+    def biometric(metric: str, sport: str):
+        return garmin.connectapi(f"{bio}/{metric}/range/{start}/{end}?sport={sport}&{range_query}")
+
+    def values(entries, scale: float = 1.0):
+        return [(e.get("from"), e["value"] * scale if e.get("value") is not None else None) for e in entries or []]
+
+    series("weight_kg", lambda: garmin.get_weigh_ins(start, end), lambda r: [
+        (s.get("summaryDate"), (s.get("latestWeight") or {}).get("weight", 0) / 1000 or None)
+        for s in r.get("dailyWeightSummaries") or []
+    ])
+    series("resting_hr_bpm", lambda: garmin.connectapi(
+        f"{garmin.garmin_connect_rhr_url}/{garmin.display_name}",
+        params={"fromDate": start, "untilDate": end, "metricId": 60},
+    ), lambda r: [
+        (e.get("calendarDate"), e.get("value"))
+        for e in ((r.get("allMetrics") or {}).get("metricsMap") or {}).get("WELLNESS_RESTING_HEART_RATE") or []
+    ])
+    try:  # one response holds both sports' VO2max
+        vo2 = garmin.connectapi(f"{garmin.garmin_connect_metrics_url}/{start}/{end}") or []
+    except Exception:
+        vo2 = []
+    for name, key in (("vo2max_running", "generic"), ("vo2max_cycling", "cycling")):
+        series(name, lambda: vo2, lambda r, key=key: [
+            ((e.get(key) or {}).get("calendarDate"), (e.get(key) or {}).get("vo2MaxPreciseValue")) for e in r
+        ])
+    series("ftp_cycling_w", lambda: biometric("functionalThresholdPower", "CYCLING"), values)
+    series("threshold_power_running_w", lambda: biometric("functionalThresholdPower", "RUNNING"), values)
+    series("lthr_running_bpm", lambda: biometric("lactateThresholdHeartRate", "RUNNING"), values)
+    # Lactate-threshold speed comes in units of 10 m/s, as in get_thresholds.
+    series("threshold_speed_running_mps", lambda: biometric("lactateThresholdSpeed", "RUNNING"), lambda r: values(r, 10.0))
+    return out
+
+
 def workout_exists(garmin: Garmin, workout_id: int) -> bool:
     """Whether a workout is still in the user's Garmin workout library (False once deleted)."""
     try:
@@ -249,6 +320,8 @@ __all__ = [
     "unschedule_workout",
     "workout_exists",
     "exercise_sets",
+    "athlete_profile",
+    "athlete_history",
     "activity_stats",
     "get_thresholds",
     "get_calendar_month",

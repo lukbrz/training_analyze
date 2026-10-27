@@ -173,6 +173,7 @@ A planned workout counts as done when an activity of the same sport is on the sa
 - **Planned workouts** with their steps, in the same format as `src/workout_schema.json` plus reps, exercise and weight for strength.
 - **Activities** with summary, laps (a table with your interval marks), TSS, efficiency factor, aerobic decoupling, time in zones and, for strength, every set.
 - **Load:** weekly TSS and load metrics, daily TSS/CTL/ATL/TSB, and your thresholds.
+- **Athlete:** gender, age in whole years, height and HR zones. Each week also gets that week's weight, average resting HR, VO2max (run/bike), FTP, running threshold power/HR/pace, and W/kg. These come from Garmin's history, so you can see how they changed over the period.
 
 Values are in seconds, metres, m/s, W and bpm, with paces also as text. The file is compact JSON: about 50 KB for 4 weeks and 250 KB for 24.
 
