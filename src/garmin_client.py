@@ -223,7 +223,7 @@ def exercise_sets(garmin: Garmin, activity_id: str) -> list[dict]:
 
 def athlete_profile(garmin: Garmin) -> dict:
     """The athlete's current profile: gender, birth year (only the year — an age to the
-    year is all anything here needs), height, and heart-rate zones per sport."""
+    year is all anything here needs), height, and heart-rate and power zones per sport."""
     data = (garmin.get_user_profile() or {}).get("userData") or {}
     out = {
         "gender": (data.get("gender") or "").lower() or None,
@@ -241,6 +241,16 @@ def athlete_profile(garmin: Garmin) -> dict:
             "method": z.get("trainingMethod"),
         }
     out["hr_zones"] = zones
+    power = {}
+    try:
+        for z in garmin.get_power_zones() or []:
+            floors = [z.get(f"zone{n}Floor") for n in range(1, 8)]
+            # Unused zones come back as 0 (running has 5): keep the rising floors only.
+            used = [f for i, f in enumerate(floors) if f is not None and (i == 0 or f > floors[i - 1])]
+            power[(z.get("sport") or "").lower()] = {"ftp_w": z.get("functionalThresholdPower"), "zone_floors_w": used}
+    except Exception:  # optional: time in power zones is just left out
+        pass
+    out["power_zones"] = power
     return out
 
 

@@ -169,13 +169,18 @@ Each run or ride also shows its **efficiency factor** (power or speed per heartb
 
 A planned workout counts as done when an activity of the same sport is on the same day. Links override this. They are stored only in this app (`data/plan_links.json`), because Garmin has no such link.
 
-**Export (`e`):** if you're logged in, the app first downloads whatever the period is missing from Garmin: older calendar months and planned workouts. The file lists every week as the calendar shows it:
-- **Planned workouts** with their steps, in the same format as `src/workout_schema.json` plus reps, exercise and weight for strength.
-- **Activities** with summary, laps (a table with your interval marks), TSS, efficiency factor, aerobic decoupling, time in zones and, for strength, every set.
-- **Load:** weekly TSS and load metrics, daily TSS/CTL/ATL/TSB, and your thresholds.
-- **Athlete:** gender, age in whole years, height and HR zones. Each week also gets that week's weight, average resting HR, VO2max (run/bike), FTP, running threshold power/HR/pace, and W/kg. These come from Garmin's history, so you can see how they changed over the period.
+**Export (`e`):** the file is meant for an AI coach that reviews your training and gives feedback. If you're logged in, the app first downloads whatever the period is missing from Garmin (older calendar months, planned workouts, strength sets, your weight/resting HR/VO2max/threshold history). It reads top-down:
+- **Guide:** a few lines telling the model what the file is and how to read it.
+- **Athlete:** gender, age, height, HR and power zones, current thresholds and fitness.
+- **Trend:** one row per week (TSS planned/done, hours, km per sport, intensity split, CTL/ATL/TSB, ACWR, monotony, resting HR, weight).
+- **Each week's summary:** sessions done/missed/extra, volume per sport, TSS against plan, time in HR zones and the easy/moderate/hard split, load metrics, that week's weight/resting HR/VO2max/thresholds and W/kg, key sessions, and **flags**. Flags are rule-based hints, such as a high ACWR, a missed session, reps off target, an easy session done too hard, resting HR above its 4-week baseline, or high decoupling.
+- **Each session:**
+  - **execution:** the plan against what was done, step by step when the workout was followed on the watch. Each step shows its target, the actual pace, grade-adjusted pace, HR, power and NP, a verdict (on target / faster / slower, by how much) and HR recovery in rests. Strength sessions get planned against done sets × reps @ kg per exercise.
+  - **planned:** the workout as written.
+  - **activity:** what was recorded, with intensity factor, efficiency factor, decoupling, exact time in HR and power zones, and cadence against 166 spm.
+  - **Laps and splits:** the activity's laps (its structure, with your interval marks), each split again every 300 m (runs) or 1 km (rides). Laps and splits include min/avg/max HR, power, NP, cadence and, on runs, grade-adjusted pace, ground contact time, vertical oscillation and ratio, and step length.
 
-Values are in seconds, metres, m/s, W and bpm, with paces also as text. The file is compact JSON: about 50 KB for 4 weeks and 250 KB for 24.
+Values are in seconds, metres, m/s, W and bpm, with paces also as text. The file is compact JSON: about 75 KB for a week, 1 MB for 24 weeks. After this update, press `r` (Reprocess) once on the main screen so rides recorded on two devices also get cadence and running dynamics.
 
 ### Workouts
 

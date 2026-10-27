@@ -113,3 +113,113 @@ def week_metrics(points: list[tl.PmcPoint]) -> WeekMetrics:
             out.monotony = statistics.fmean(daily) / spread
             out.strain = total * out.monotony
     return out
+
+
+# --- Per-segment statistics (a lap, a split, a rest) from the record stream ---------------
+
+NP_WINDOW_S = 30
+GRADE_WINDOW_M = 20.0  # altitude is noisy: measure grade over at least this much distance
+MAX_GRADE = 0.45
+HR_RECOVERY_S = 60
+
+
+def _mean(values: list[float]) -> float | None:
+    return statistics.fmean(values) if values else None
+
+
+def normalized_power(records: list[RecordPoint]) -> float | None:
+    """Coggan normalized power: the 4th-power mean of the 30 s rolling average power —
+    what the effort cost physiologically, unlike a plain average that coasting and surges
+    cancel out in. None under 30 s of power data."""
+    samples = [(r.timestamp_utc, r.power) for r in records if r.power is not None]
+    if len(samples) < NP_WINDOW_S:
+        return None
+    rolling, window, total = [], [], 0.0
+    for ts, power in samples:
+        window.append((ts, power))
+        total += power
+        while (ts - window[0][0]).total_seconds() >= NP_WINDOW_S:
+            total -= window.pop(0)[1]
+        if (ts - samples[0][0]).total_seconds() >= NP_WINDOW_S - 1:
+            rolling.append(total / len(window))
+    return statistics.fmean(v ** 4 for v in rolling) ** 0.25 if rolling else None
+
+
+def _minetti_cost(grade: float) -> float:
+    """Energy cost of running at a grade (J/kg/m), Minetti et al. 2002; 3.6 on the flat."""
+    i = max(-MAX_GRADE, min(MAX_GRADE, grade))
+    return 155.4 * i**5 - 30.4 * i**4 - 43.3 * i**3 + 46.3 * i**2 + 19.5 * i + 3.6
+
+
+def grade_adjusted_speed(records: list[RecordPoint]) -> float | None:
+    """The flat-ground speed costing the same effort (GAP, in m/s): distance weighted by
+    the energy cost of its grade, over the elapsed time. None without distance and
+    altitude."""
+    points = [r for r in records if r.distance_m is not None and r.altitude_m is not None]
+    if len(points) < 2:
+        return None
+    adjusted = seconds = 0.0
+    anchor = points[0]
+    for r in points[1:]:
+        run = r.distance_m - anchor.distance_m
+        if run < GRADE_WINDOW_M and r is not points[-1]:
+            continue
+        if run > 0:
+            adjusted += run * _minetti_cost((r.altitude_m - anchor.altitude_m) / run) / _minetti_cost(0.0)
+        seconds += (r.timestamp_utc - anchor.timestamp_utc).total_seconds()
+        anchor = r
+    return adjusted / seconds if seconds else None
+
+
+def segment_stats(records: list[RecordPoint], foot: bool) -> dict:
+    """Exact statistics of a stretch of the record stream (stopped samples — zero cadence
+    — left out of cadence and dynamics): HR avg/min/max, power avg and NP, cadence and, on
+    foot, running dynamics and grade-adjusted speed. Keys with no data are left out."""
+    # Lap / split boundaries are interpolated samples, so values can be fractional: round HR.
+    hr = [round(r.heart_rate) for r in records if r.heart_rate]
+    power = [r.power for r in records if r.power is not None]
+    moving = [r for r in records if r.cadence]
+    out = {
+        "avg_hr": _mean(hr), "min_hr": min(hr) if hr else None, "max_hr": max(hr) if hr else None,
+        "avg_power_w": _mean(power), "np_w": normalized_power(records),
+        "cadence": _mean([r.cadence for r in moving]),
+    }
+    if foot:
+        out.update({
+            "gap_speed_mps": grade_adjusted_speed(records),
+            "ground_contact_ms": _mean([r.stance_time_ms for r in moving if r.stance_time_ms]),
+            "vertical_oscillation_mm": _mean([r.vertical_oscillation_mm for r in moving if r.vertical_oscillation_mm]),
+            "vertical_ratio_pct": _mean([r.vertical_ratio_pct for r in moving if r.vertical_ratio_pct]),
+            "step_length_m": (lambda v: v / 1000 if v else None)(_mean([r.step_length_mm for r in moving if r.step_length_mm])),
+        })
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def hr_recovery(records: list[RecordPoint]) -> dict | None:
+    """Heart-rate recovery over a rest: HR at its start, HR 60 s in (or at its end if
+    shorter), and the drop — faster drops mean better recovery between efforts."""
+    hr = [(r.timestamp_utc, round(r.heart_rate)) for r in records if r.heart_rate]
+    if len(hr) < 2:
+        return None
+    start_ts, start_hr = hr[0]
+    later = [(ts, v) for ts, v in hr if (ts - start_ts).total_seconds() <= HR_RECOVERY_S]
+    end_ts, end_hr = later[-1]
+    return {
+        "start_bpm": start_hr, "end_bpm": end_hr, "drop_bpm": start_hr - end_hr,
+        "over_s": round((end_ts - start_ts).total_seconds()),
+    }
+
+
+def time_in_zones(records: list[RecordPoint], field: str, floors: list[float], max_gap_s: float = 10) -> list[float] | None:
+    """Seconds in each zone of a metric (zone i from floors[i] up to floors[i+1]; below the
+    first floor counts as zone 1) — the exact distribution, not lap averages."""
+    if not floors:
+        return None
+    seconds = [0.0] * len(floors)
+    for prev, rec in zip(records, records[1:]):
+        value = getattr(prev, field)
+        gap = (rec.timestamp_utc - prev.timestamp_utc).total_seconds()
+        if value is None or not 0 < gap <= max_gap_s:
+            continue
+        seconds[max((i for i, f in enumerate(floors) if value >= f), default=0)] += gap
+    return seconds if any(seconds) else None

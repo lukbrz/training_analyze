@@ -91,6 +91,10 @@ def merge_summary(primary: ActivitySummary, secondaries: list[ActivitySummary]) 
 GEO_FIELDS = ("distance_m", "speed_mps", "lat", "lon", "altitude_m")
 
 
+# Fields merged like HR/power: the primary's value, else the first other stream's.
+EXTRA_FIELDS = ("cadence", "stance_time_ms", "vertical_oscillation_mm", "vertical_ratio_pct", "step_length_mm")
+
+
 def merge_records(streams: list[list[RecordPoint]], geo_source: int | None = None) -> list[RecordPoint]:
     """Combine multiple record streams for the same physical session into one, keyed by
     wall-clock second (FIT timestamps are UTC regardless of device, so streams line up
@@ -131,6 +135,7 @@ def merge_records(streams: list[list[RecordPoint]], geo_source: int | None = Non
             lat=_first_non_null(candidates, "lat"),
             lon=_first_non_null(candidates, "lon"),
             altitude_m=_first_non_null(candidates, "altitude_m"),
+            **{f: _first_non_null(candidates, f) for f in EXTRA_FIELDS},
         )
         if geo is not None:
             source = geo.get(ts)

@@ -10,8 +10,11 @@ Raw values are SI (seconds, metres, m/s, W, bpm); paces are also given as displa
 Written without indentation: a 24-week export is ~250 KB, and the reader is a program.
 """
 
+import math
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+import coaching
 import fit_parser
 import metrics
 import services
@@ -20,7 +23,7 @@ import training_load as tl
 from models import ActivitySummary, Lap, format_speed_or_pace
 
 FORMAT = "training_analyze/export"
-VERSION = 2
+VERSION = 4
 # What can be exported: 0 = this week so far (Monday to today), else that many complete
 # Monday-Sunday weeks ending last Sunday.
 CHOICES = (0, 1, 4, 12, 24)
@@ -32,6 +35,8 @@ UNITS = {
     "pace": "m:ss per km (running/hiking), per 100 m (swimming); km/h for cycling",
     "tss": "training stress score (100 = one hour at threshold)",
     "age": "whole years, from the birth year only",
+    "laps": "an activity's structure: the device's own laps (auto-lap / lap button / workout steps) in order, 'interval' = marked by the user as a work interval",
+    "splits": "inside a lap: that lap cut every 300 m (runs) or 1 km (rides) from the recorded stream, the last one possibly shorter; a leftover under 30% of a split joins the one before; laps under 1.5 splits long have none",
 }
 ATHLETE_HELP = (
     "Top-level 'athlete': current profile and HR zones (zone_floors_bpm = lower limits of "
@@ -47,11 +52,33 @@ METRICS_HELP = {
     "monotony": "mean daily TSS / its standard deviation over the week; > 2 = too little hard/easy variation",
     "strain": "weekly TSS x monotony",
 }
+ANALYSIS_GUIDE = [
+    "This file is one athlete's training over the period, prepared for a coach to review it and give the athlete feedback.",
+    "Read top-down: 'athlete' (who, zones, thresholds), 'trend' (one row per week), then each week's 'summary' "
+    "(volume, compliance with the plan, intensity distribution, load, flags) before its 'sessions'.",
+    "Each session: 'status' says whether a plan was done, missed or extra; 'execution' compares plan and reality step by step "
+    "(each step's target, what was done, a verdict); 'planned' is the workout as written; 'activity' is what was recorded, "
+    "its 'laps' the session's structure (watch laps / workout steps) with 'splits' inside each lap.",
+    "'flags' are rule-based hints (thresholds in 'reference'), not diagnoses — confirm them against the data.",
+    "Useful feedback covers: was the week's plan done, were key sessions executed as intended (targets, pacing, fade), "
+    "was easy kept easy, is load progressing safely, recovery signs (resting HR, decoupling, HR drift), and what to adjust next.",
+]
 STATUS_HELP = {
     "done (planned)": "a planned workout and the activity that carried it out",
     "planned": "a planned workout still ahead",
     "missed": "a planned workout whose day has passed without a matching activity",
     "unplanned": "an activity with no planned workout",
+}
+FLAG_RULES = {
+    "acwr": f"> {coaching.ACWR_CAUTION} load rising faster than fitness; > {coaching.ACWR_HIGH} injury risk rising",
+    "ramp_rate": f"> {coaching.RAMP_HIGH} CTL per week",
+    "monotony": f"> {coaching.MONOTONY_HIGH}",
+    "resting_hr": f"week average >= {coaching.RHR_RISE_BPM:g} bpm above the 4 weeks before",
+    "targets": f"a session with under {coaching.ON_TARGET_SHARE_LOW:.0%} of judged steps on target "
+               f"(pace within {coaching.PACE_TOLERANCE:.0%}, HR within {coaching.HR_TOLERANCE_BPM} bpm, power within {coaching.POWER_TOLERANCE:.0%}; "
+               f"HR only judged on steps of {coaching.MIN_HR_CHECK_S} s or more)",
+    "easy_but_hard": f"a session planned in HR zone 1-2 with over {coaching.EASY_ABOVE_Z2_SHARE:.0%} of its time above zone 2",
+    "decoupling": f"> {coaching.DECOUPLING_HIGH:g}% on a steady session of {coaching.MIN_DECOUPLING_FLAG_S // 60} min or more",
 }
 FITNESS_HELP = (
     "CTL (fitness) and ATL (fatigue) are 42- and 7-day exponentially weighted averages of "
@@ -162,29 +189,87 @@ def _planned(item: tl.WeekItem, title: str, day: date) -> dict:
     return out
 
 
-# Laps are a table — column names once, one row per lap — since activities can have dozens.
-LAP_COLUMNS = (
-    "lap", "start_local", "duration_s", "distance_m", "avg_speed_mps", "pace", "avg_hr",
-    "avg_power_w", "ascent_m", "descent_m", "interval",
+# An activity's structure is a tree: its device laps (auto-lap / lap button / workout
+# steps, with the user's interval marks) are the branches, each with its own fixed-distance
+# splits as leaves — fine enough to see pacing within a rep or a long block (300 m on foot,
+# 1 km on the bike). A lap under MIN_SPLITS_PER_LAP splits long has no leaves: it is
+# about one split already (a 300-400 m rep). A leftover shorter than MIN_LAST_SPLIT of a
+# split joins the one before it (a 2059 m lap is 1000 + 1059 m, not 1000 + 1000 + 59 m).
+SPLIT_DISTANCE_M = {"running": 300.0, "cycling": 1000.0}
+MIN_SPLITS_PER_LAP = 1.5
+MIN_LAST_SPLIT = 0.3
+# Columns of a lap / split, per kind of sport (laps carry the same keys as objects).
+FOOT_COLUMNS = (
+    "split", "start_local", "duration_s", "distance_m", "pace", "gap_pace", "avg_hr", "min_hr", "max_hr",
+    "avg_power_w", "np_w", "cadence_spm", "ground_contact_ms", "vertical_oscillation_mm",
+    "vertical_ratio_pct", "step_length_m", "ascent_m", "descent_m",
+)
+RIDE_COLUMNS = (
+    "split", "start_local", "duration_s", "distance_m", "speed", "avg_hr", "min_hr", "max_hr",
+    "avg_power_w", "np_w", "cadence_rpm", "ascent_m", "descent_m",
 )
 
 
-def _lap_row(lap: Lap, activity_sport: str, multisport: bool) -> list:
-    sport = lap.sport or activity_sport
-    row = [
-        lap.lap_index, _iso(lap.start_time_local), _r(lap.duration_s), _r(lap.distance_m),
-        _r(lap.avg_speed_mps, 3), _pace_text(lap.avg_speed_mps, sport), lap.avg_hr,
-        _r(lap.avg_power, 0), _r(lap.total_ascent_m, 0), _r(lap.total_descent_m, 0), lap.is_interval,
-    ]
-    return row + [sport] if multisport else row
+def _is_foot(sport: str) -> bool:
+    return tl.sport_family(sport) in ("running", "hiking")
 
 
-def _laps_table(laps: list[Lap], activity_sport: str) -> dict:
-    multisport = any(lap.sport and lap.sport != activity_sport for lap in laps)
-    return {
-        "columns": list(LAP_COLUMNS) + (["sport"] if multisport else []),
-        "rows": [_lap_row(lap, activity_sport, multisport) for lap in laps],
+def _segment(segment: Lap, sport: str, records: list) -> dict:
+    """A lap or split's figures — HR, power, NP, cadence, running dynamics and grade-adjusted
+    pace computed exactly from its stretch of the record stream (`records`), falling back to
+    the lap's own averages where the stream has nothing (e.g. no records cached)."""
+    foot = _is_foot(sport)
+    stats = metrics.segment_stats(records, foot) if records else {}
+    hr = stats.get("avg_hr") or segment.avg_hr
+    power = stats.get("avg_power_w") or segment.avg_power
+    out = {
+        "split": segment.lap_index,
+        "start_local": _iso(segment.start_time_local),
+        "duration_s": _r(segment.duration_s),
+        "distance_m": _r(segment.distance_m),
+        ("pace" if foot else "speed"): _pace_text(segment.avg_speed_mps, sport),
+        "gap_pace": _pace_text(stats.get("gap_speed_mps"), "running") if foot else None,
+        "avg_hr": _r(hr, 0), "min_hr": stats.get("min_hr"), "max_hr": stats.get("max_hr"),
+        "avg_power_w": _r(power, 0), "np_w": _r(stats.get("np_w"), 0),
+        ("cadence_spm" if foot else "cadence_rpm"): _r(stats.get("cadence"), 0),
+        "ground_contact_ms": _r(stats.get("ground_contact_ms"), 0),
+        "vertical_oscillation_mm": _r(stats.get("vertical_oscillation_mm")),
+        "vertical_ratio_pct": _r(stats.get("vertical_ratio_pct")),
+        "step_length_m": _r(stats.get("step_length_m"), 2),
+        "ascent_m": _r(segment.total_ascent_m, 0), "descent_m": _r(segment.total_descent_m, 0),
     }
+    return out
+
+
+def _lap_node(lap: Lap, activity_sport: str, records: list, offset: timedelta | None) -> dict:
+    sport = lap.sport or activity_sport
+    lap_records = fit_parser.lap_record_slice(records, lap, offset) if offset is not None else []
+    values = _segment(lap, sport, lap_records)
+    node = {"lap": values.pop("split"), **{k: v for k, v in values.items() if v is not None}, "interval": lap.is_interval}
+    if lap.sport and lap.sport != activity_sport:
+        node["sport"] = lap.sport
+    meters = SPLIT_DISTANCE_M.get(tl.sport_family(sport))
+    if meters and lap.distance_m >= MIN_SPLITS_PER_LAP * meters and sum(r.distance_m is not None for r in lap_records) >= 2:
+        splits = fit_parser.split_by_distance(lap_records, meters, offset, min_tail_fraction=MIN_LAST_SPLIT)
+        if len(splits) > 1:
+            columns = FOOT_COLUMNS if _is_foot(sport) else RIDE_COLUMNS
+            rows = []
+            for split in splits:
+                values = _segment(split, sport, fit_parser.lap_record_slice(lap_records, split, offset))
+                rows.append([values.get(c) for c in columns])
+            # Drop columns with no data in any split (no power meter, no dynamics pod...).
+            keep = [i for i, c in enumerate(columns) if any(row[i] is not None for row in rows)]
+            node["splits"] = {
+                "split_m": meters,
+                "columns": [columns[i] for i in keep],
+                "rows": [[row[i] for i in keep] for row in rows],
+            }
+    return node
+
+
+def _lap_tree(a: ActivitySummary, laps: list[Lap], records: list) -> list[dict]:
+    offset = fit_parser.load_utc_offset(a.activity_id, a.start_time_local) if records else None
+    return [_lap_node(lap, a.sport, records, offset) for lap in laps]
 
 
 def _zones(zones) -> list[dict]:
@@ -194,7 +279,7 @@ def _zones(zones) -> list[dict]:
     ]
 
 
-# Strength sets are a table like laps.
+# Strength sets are a table: column names once, one row per set.
 SET_COLUMNS = ("type", "exercise", "category", "reps", "weight_kg", "duration_s", "start", "workout_step")
 
 
@@ -209,11 +294,14 @@ def _sets_table(sets: list[dict]) -> dict:
     }
 
 
-def _activity_metrics(a: ActivitySummary, stats: dict | None) -> dict:
+def _records(a: ActivitySummary) -> list:
     try:
-        records = fit_parser.load_records(a.activity_id) if storage.has_fit(a.activity_id) else []
-    except Exception:  # an unreadable FIT file just means no metrics
-        records = []
+        return fit_parser.load_records(a.activity_id) if storage.has_fit(a.activity_id) else []
+    except Exception:  # an unreadable FIT file just means no metrics or splits
+        return []
+
+
+def _activity_metrics(a: ActivitySummary, stats: dict | None, records: list) -> dict:
     m = metrics.activity_metrics(a, stats, records)
     out = {}
     if m.efficiency_factor is not None:
@@ -224,7 +312,19 @@ def _activity_metrics(a: ActivitySummary, stats: dict | None) -> dict:
     return out
 
 
-def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str], stats: dict[str, dict]) -> dict:
+@dataclass
+class _Context:
+    """What every session of an export needs, loaded once."""
+    activities: dict[str, ActivitySummary]
+    route_names: dict[str, str]
+    stats: dict[str, dict]
+    hr_zones: dict
+    power_zones: dict
+    thresholds: tl.Thresholds
+
+
+def _activity(a: ActivitySummary, item: tl.WeekItem, ctx: _Context) -> dict:
+    route_names, stats = ctx.route_names, ctx.stats
     out = {
         "garmin_activity_id": a.activity_id,
         "name": a.name,
@@ -240,13 +340,45 @@ def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str]
         "tss": _r(item.tss, 0),
         "tss_method": item.method,
     }
+    if item.tss and a.duration_s:
+        # TSS = hours x IF^2 x 100, so the session's average intensity relative to threshold is:
+        out["intensity_factor"] = _r(math.sqrt(item.tss / (a.duration_s / 3600) / 100), 2)
     if a.route_id and route_names.get(a.route_id):
         out["route"] = route_names[a.route_id]
     if a.virtual:
         out["virtual"] = True
-    out.update(_activity_metrics(a, stats.get(a.activity_id)))
+    records = _records(a)
+    whole = metrics.segment_stats(records, _is_foot(a.sport)) if records else {}
+    # A merged recording's summary can lack the HR / power its stream has (a virtual ride
+    # whose HR and power came from the bike computer): take them from the stream.
+    for key, value in (("avg_hr", whole.get("avg_hr")), ("avg_power_w", whole.get("avg_power_w"))):
+        if out[key] is None and value is not None:
+            out[key] = _r(value, 0)
+    if whole.get("np_w"):
+        out["np_w"] = _r(whole["np_w"], 0)
+    if whole.get("max_hr"):
+        out["max_hr"] = whole["max_hr"]
+    if _is_foot(a.sport) and whole.get("gap_speed_mps"):
+        out["gap_pace"] = _pace_text(whole["gap_speed_mps"], "running")
+    out.update(_activity_metrics(a, stats.get(a.activity_id), records))
+    zone_seconds = coaching.hr_zone_seconds(records, coaching.hr_zone_bounds(ctx.hr_zones, a.sport))
+    if zone_seconds:
+        out["hr_zone_minutes"] = [_r(s / 60) for s in zone_seconds]
+    family = tl.sport_family(a.sport)
+    power_floors = (ctx.power_zones.get(family) or {}).get("zone_floors_w")
+    power_seconds = metrics.time_in_zones(records, "power", power_floors) if power_floors else None
+    if power_seconds:
+        out["power_zone_minutes"] = [_r(s / 60) for s in power_seconds]
+    if family == "running":
+        cadence = [r.cadence for r in records if r.cadence]
+        if cadence:
+            out["cadence"] = {
+                "avg_spm": _r(sum(cadence) / len(cadence), 0),
+                "reference_spm": coaching.CADENCE_TARGET_SPM,
+                "time_at_or_above_reference_pct": round(sum(c >= coaching.CADENCE_TARGET_SPM for c in cadence) / len(cadence) * 100),
+            }
     laps = storage.load_laps(a.activity_id)
-    out["laps"] = _laps_table(laps, a.sport)
+    out["laps"] = _lap_tree(a, laps, records)
     sets = storage.load_exercise_sets(a.activity_id) if services.is_strength(a) else None
     if sets:
         out["strength_sets"] = _sets_table(sets)
@@ -263,7 +395,38 @@ def _activity(a: ActivitySummary, item: tl.WeekItem, route_names: dict[str, str]
     return out
 
 
-def _item(item: tl.WeekItem, activities: dict[str, ActivitySummary], route_names: dict[str, str], stats: dict[str, dict]) -> dict:
+def _execution(item: tl.WeekItem, activity: ActivitySummary, act: dict, ctx: _Context) -> tuple[dict | None, str | None]:
+    """(plan vs execution, "done too hard" note for a planned-easy session) of a done
+    planned session."""
+    dto = storage.load_cached_workout(item.workout_id) if item.workout_id else None
+    if dto is None:
+        return None, None
+    if services.is_strength(activity):
+        sets = storage.load_exercise_sets(activity.activity_id)
+        return (coaching.strength_execution(dto, sets) if sets else {"note": "sets not downloaded"}), None
+    family = tl.sport_family(activity.sport)
+    records = _records(activity)
+    offset = fit_parser.load_utc_offset(activity.activity_id, activity.start_time_local) if records else None
+    ex = coaching.execution(
+        dto, storage.load_laps(activity.activity_id), activity, ctx.hr_zones, ctx.thresholds.ftp(family), records, offset,
+    )
+    estimate = tl.workout_tss(dto, ctx.thresholds)
+    totals = {}
+    if estimate.duration_s:
+        totals["duration_vs_plan_pct"] = round(activity.duration_s / estimate.duration_s * 100)
+    if item.planned_tss:
+        totals["tss_vs_plan_pct"] = round(item.tss / item.planned_tss * 100)
+    ex = {"totals": totals, **ex} if totals else ex
+    easy_note = None
+    zones = act.get("hr_zone_minutes")
+    if coaching.is_easy_plan(dto) and zones and sum(zones):
+        above = sum(zones[2:]) / sum(zones)
+        if above > coaching.EASY_ABOVE_Z2_SHARE:
+            easy_note = f"{above * 100:.0f}% of the time above HR zone 2 (avg HR {act.get('avg_hr')})"
+    return ex, easy_note
+
+
+def _session(item: tl.WeekItem, ctx: _Context) -> dict:
     out = {
         "date": item.day.isoformat(),
         "weekday": item.day.strftime("%A"),
@@ -272,15 +435,94 @@ def _item(item: tl.WeekItem, activities: dict[str, ActivitySummary], route_names
         "title": item.title,
         "tss": _r(item.tss, 0),
     }
+    activity = ctx.activities.get(item.activity_id) if item.activity_id else None
+    act = _activity(activity, item, ctx) if activity is not None else None
     if item.status == "done (planned)":
         out["paired_by"] = "user link" if item.linked else "same day and sport"
+        if activity is not None:
+            ex, easy_note = _execution(item, activity, act, ctx)
+            if ex:
+                out["execution"] = ex
+            if easy_note:
+                out["easy_but_hard"] = easy_note
         out["planned"] = _planned(item, item.plan_title or "", item.plan_day or item.day)
     elif item.status in ("planned", "missed"):
         out["planned"] = _planned(item, item.title, item.day)
-    activity = activities.get(item.activity_id) if item.activity_id else None
-    if activity is not None:
-        out["activity"] = _activity(activity, item, route_names, stats)
+    if act is not None:
+        out["activity"] = act
     return out
+
+
+def _week_summary(sessions: list[dict], load: dict, fitness: dict | None, athlete: dict, rhr_base: float | None) -> dict:
+    """The week at a glance: volume per sport, plan compliance, intensity distribution,
+    load, athlete markers and flags."""
+    done = [s for s in sessions if s["status"] in ("done (planned)", "unplanned")]
+    by_sport: dict[str, dict] = {}
+    zone_minutes = [0.0] * 5
+    for s in done:
+        act = s.get("activity") or {}
+        family = tl.sport_family(act.get("sport") or s["sport"])
+        entry = by_sport.setdefault(family, {"sessions": 0, "time_min": 0.0, "distance_km": 0.0, "tss": 0})
+        entry["sessions"] += 1
+        entry["time_min"] += (act.get("duration_s") or 0) / 60
+        entry["distance_km"] += (act.get("distance_m") or 0) / 1000
+        entry["tss"] += s.get("tss") or 0
+        for i, minutes in enumerate(act.get("hr_zone_minutes") or []):
+            zone_minutes[i] += minutes or 0
+    for entry in by_sport.values():
+        entry["time_min"], entry["distance_km"] = round(entry["time_min"]), _r(entry["distance_km"])
+
+    with_plan = [s for s in sessions if s["status"] in ("done (planned)", "missed", "planned")]
+    planned_tss = sum((s.get("planned") or {}).get("estimated_tss") or 0 for s in with_plan)
+    done_tss = sum(s.get("tss") or 0 for s in done)
+    summary = {
+        "sessions": {
+            "done_as_planned": sum(s["status"] == "done (planned)" for s in sessions),
+            "missed": sum(s["status"] == "missed" for s in sessions),
+            "extra_unplanned": sum(s["status"] == "unplanned" for s in sessions),
+            "still_planned": sum(s["status"] == "planned" for s in sessions),
+        },
+        "volume_by_sport": by_sport,
+        "tss": {"done": _r(done_tss, 0), "planned": _r(planned_tss, 0),
+                **({"done_vs_planned_pct": round(done_tss / planned_tss * 100)} if planned_tss else {})},
+    }
+    if any(zone_minutes):
+        summary["time_in_hr_zones_min"] = [_r(m) for m in zone_minutes]
+        summary["intensity_distribution"] = coaching.intensity_distribution(zone_minutes)
+    summary["load"] = load
+    summary["fitness_at_end"] = fitness
+    summary["athlete"] = athlete
+    if rhr_base is not None:
+        summary["athlete"] = {**athlete, "resting_hr_4wk_baseline_bpm": _r(rhr_base)}
+    if done:
+        longest = max(done, key=lambda s: (s.get("activity") or {}).get("duration_s") or 0)
+        hardest = max(done, key=lambda s: s.get("tss") or 0)
+        summary["key_sessions"] = [{"date": longest["date"], "title": longest["title"], "why": "longest"}]
+        if hardest is not longest:
+            summary["key_sessions"].append({"date": hardest["date"], "title": hardest["title"], "why": "highest TSS"})
+    summary["flags"] = coaching.week_flags(load, athlete.get("resting_hr_avg_bpm"), rhr_base, sessions)
+    return summary
+
+
+def _trend_row(week: dict) -> dict:
+    s = week["summary"]
+    sport = s["volume_by_sport"]
+    row = {
+        "week_start": week["start"],
+        "tss_done": s["tss"]["done"], "tss_planned": s["tss"]["planned"],
+        "hours": _r(sum(v["time_min"] for v in sport.values()) / 60),
+        "run_km": (sport.get("running") or {}).get("distance_km", 0),
+        "bike_km": (sport.get("cycling") or {}).get("distance_km", 0),
+        "swim_km": (sport.get("swimming") or {}).get("distance_km", 0),
+        "strength_sessions": (sport.get("strength") or {}).get("sessions", 0),
+        "missed": s["sessions"]["missed"],
+        **{k: v for k, v in (s.get("intensity_distribution") or {}).items()},
+        **{k: (s.get("fitness_at_end") or {}).get(k) for k in ("ctl", "atl", "tsb")},
+        **{k: s["load"].get(k) for k in ("acwr", "monotony")},
+        "resting_hr": s["athlete"].get("resting_hr_avg_bpm"),
+        "weight_kg": s["athlete"].get("weight_kg"),
+    }
+    return row
 
 
 def _point(point: tl.PmcPoint | None, today: date) -> dict | None:
@@ -378,12 +620,6 @@ def file_name(weeks: int, today: date) -> str:
     return f"training_{first:%Y-%m-%d}_{last:%Y-%m-%d}_{'this-week' if weeks == 0 else f'{weeks}w'}.json"
 
 
-def _tss_totals(items: list[tl.WeekItem]) -> dict:
-    def total(statuses):
-        return _r(sum(i.tss for i in items if i.status in statuses), 0)
-    return {"done": total(("done (planned)", "unplanned")), "remaining": total(("planned",)), "missed": total(("missed",))}
-
-
 def build(weeks: int, today: date | None = None, notes: list[str] | None = None) -> dict:
     """The export document for a CHOICES entry (see `period`): every day from its first
     Monday to its last day — Sunday, or today for this week so far."""
@@ -395,12 +631,14 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
     route_names = {r.route_id: r.name for r in storage.load_routes()}
     _, stats = storage.load_activity_stats()
     athlete = storage.load_athlete()
+    profile = athlete.get("profile") or {}
     history = athlete.get("history") or {}
     notes = list(notes or [])
     if not history:
         notes.append("Athlete parameters (weight, resting HR, VO2max, threshold history) aren't downloaded — export while logged in")
 
     last = services.load_training_week(last_monday, today, history_days=(today - period_start).days + 7)
+    ctx = _Context(by_id, route_names, stats, profile.get("hr_zones") or {}, profile.get("power_zones") or {}, last.thresholds)
     points = {p.day: p for p in last.pmc}
     week_docs = []
     for start in starts:
@@ -409,16 +647,21 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
             notes.append(f"Garmin calendar for the week of {start} isn't downloaded: its planned workouts are missing")
         end = min(start + timedelta(days=6), period_end)
         items = [i for i in view.week.items if i.day <= end]
+        sessions = [_session(i, ctx) for i in items]
+        summary = _week_summary(
+            sessions,
+            _week_metrics([p for d, p in sorted(points.items()) if start <= d <= end]),
+            _point(points.get(end), today),
+            _week_athlete(history, start, end),
+            coaching.rhr_baseline(history.get("resting_hr_bpm", {}), start),
+        )
         week_docs.append({
             "week": start.isocalendar().week,
             "start": start.isoformat(),
             "end": end.isoformat(),
             **({"partial": "this week up to today"} if end < start + timedelta(days=6) else {}),
-            "tss": _tss_totals(items),
-            "fitness_at_end": _point(points.get(end), today),
-            "load_metrics": _week_metrics([p for d, p in sorted(points.items()) if start <= d <= end]),
-            "athlete": _week_athlete(history, start, end),
-            "items": [_item(i, by_id, route_names, stats) for i in items],
+            "summary": summary,
+            "sessions": sessions,
         })
 
     daily = [
@@ -433,15 +676,22 @@ def build(weeks: int, today: date | None = None, notes: list[str] | None = None)
             "kind": "this week so far" if weeks == 0 else f"last {weeks} full week(s), Monday to Sunday",
             "start": period_start.isoformat(), "end": period_end.isoformat(), "today": today.isoformat(),
         },
-        "units": UNITS,
-        "status_meanings": STATUS_HELP,
-        "fitness_meaning": FITNESS_HELP,
-        "metrics_meaning": METRICS_HELP,
-        "athlete_meaning": ATHLETE_HELP,
-        "athlete": _athlete(athlete.get("profile") or {}, today),
-        "thresholds": _thresholds(last.thresholds),
-        "fitness_today": _point(last.today_point, today),
+        "analysis_guide": ANALYSIS_GUIDE,
+        "athlete": {
+            **_athlete(profile, today),
+            "current_thresholds": _thresholds(last.thresholds),
+            "fitness_today": _point(last.today_point, today),
+        },
+        "trend": [_trend_row(w) for w in week_docs],
         "weeks": week_docs,
         "daily_load": daily,
         "notes": sorted(set(notes), key=notes.index),
+        "reference": {
+            "units": UNITS,
+            "status_meanings": STATUS_HELP,
+            "fitness_meaning": FITNESS_HELP,
+            "metrics_meaning": METRICS_HELP,
+            "athlete_meaning": ATHLETE_HELP,
+            "flag_rules": FLAG_RULES,
+        },
     }

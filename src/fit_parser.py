@@ -262,6 +262,7 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
     distance and interval phase-splitting work on them like on any other activity.
     """
     fitfile = fitparse.FitFile(fit_bytes)
+    session_sport = next((m.get_value("sport") for m in fitfile.get_messages("session")), None)
     records = []
     for rec in fitfile.get_messages("record"):
         timestamp = rec.get_value("timestamp")
@@ -275,6 +276,12 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
             altitude = rec.get_value("altitude")
         lat_semicircles = rec.get_value("position_lat")
         lon_semicircles = rec.get_value("position_long")
+        cadence = rec.get_value("cadence")
+        if cadence is not None:
+            cadence += rec.get_value("fractional_cadence") or 0.0
+            # FIT running cadence counts one leg (strides/min); steps per minute is double.
+            if (rec.get_value("activity_type") or session_sport) in FOOT_SPORTS:
+                cadence *= 2
         records.append(
             RecordPoint(
                 timestamp_utc=timestamp.replace(tzinfo=None),
@@ -285,6 +292,11 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
                 lat=lat_semicircles * SEMICIRCLE_TO_DEGREES if lat_semicircles is not None else None,
                 lon=lon_semicircles * SEMICIRCLE_TO_DEGREES if lon_semicircles is not None else None,
                 altitude_m=altitude,
+                cadence=cadence,
+                stance_time_ms=rec.get_value("stance_time"),
+                vertical_oscillation_mm=rec.get_value("vertical_oscillation"),
+                vertical_ratio_pct=rec.get_value("vertical_ratio"),
+                step_length_mm=rec.get_value("step_length"),
             )
         )
 
@@ -297,8 +309,12 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
 
 
 # Bump whenever parse_records() output changes, so stale caches are rebuilt rather than reused.
-RECORDS_CACHE_VERSION = 1
-_CACHED_FIELDS = ("distance_m", "heart_rate", "power", "speed_mps", "lat", "lon", "altitude_m")
+RECORDS_CACHE_VERSION = 2
+_CACHED_FIELDS = (
+    "distance_m", "heart_rate", "power", "speed_mps", "lat", "lon", "altitude_m",
+    "cadence", "stance_time_ms", "vertical_oscillation_mm", "vertical_ratio_pct", "step_length_mm",
+)
+FOOT_SPORTS = ("running", "walking", "hiking", "trail_running")
 _EPOCH = datetime(1970, 1, 1)
 
 
@@ -522,7 +538,9 @@ def _fold_negligible_tail(
         segments.pop()
 
 
-def split_by_distance(records: list[RecordPoint], meters: float, offset: timedelta) -> list[Lap]:
+def split_by_distance(
+    records: list[RecordPoint], meters: float, offset: timedelta, min_tail_fraction: float = 0.05,
+) -> list[Lap]:
     segments: list[list[RecordPoint]] = []
     bucket: list[RecordPoint] = []
     bucket_start_distance = None
@@ -546,7 +564,7 @@ def split_by_distance(records: list[RecordPoint], meters: float, offset: timedel
     # A genuine final partial split (the lap's distance doesn't divide evenly by `meters`) is
     # usually close to a full split and should stand on its own — only fold away a sliver that
     # couldn't be a meaningful phase on its own.
-    _fold_negligible_tail(segments, min_tail=max(1.0, meters * 0.05))
+    _fold_negligible_tail(segments, min_tail=max(1.0, meters * min_tail_fraction))
 
     return [_bucket_to_lap(segment, i, offset) for i, segment in enumerate(segments, start=1)]
 

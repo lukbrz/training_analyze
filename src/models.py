@@ -55,6 +55,14 @@ class RecordPoint:
     lat: float | None = None
     lon: float | None = None
     altitude_m: float | None = None
+    # Cadence: steps per minute on foot (both legs), revolutions per minute on the bike.
+    cadence: float | None = None
+    # Running dynamics (HRM-Pro / watch): ground contact time, vertical oscillation, vertical
+    # ratio (oscillation / step length) and step length.
+    stance_time_ms: float | None = None
+    vertical_oscillation_mm: float | None = None
+    vertical_ratio_pct: float | None = None
+    step_length_mm: float | None = None
 
 
 @dataclass
