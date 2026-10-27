@@ -711,6 +711,29 @@ def activity_metrics_text(m) -> str:
     return "  |  ".join(f"{s.label}: {s.value} {s.unit}".rstrip() for s in activity_metric_stats(m))
 
 
+def week_strip_stats(view: services.TrainingWeekView) -> tuple[list[Stat], list[Stat], str]:
+    """The week header's one-line strip: (fitness stats with a short "→ week end" hint
+    each, load-metric stats whose hints are explanations, caption for the arrows)."""
+    today, end = view.today_point, view.week_end_point
+    projected = end is not None and end.day > date.today()
+    load = week_load_stats(view)
+    if today is not None and end is not None:
+        load[0].hint = f"→ {round(end.ctl)}"
+        load[1].hint = f"→ {round(end.atl)}"
+        load[2].hint = f"→ {round(end.tsb):+d}"
+    return load, week_metric_stats(view.load_metrics), "→ week end" + (" (plan)" if projected else "")
+
+
+def week_tss_caption(view: services.TrainingWeekView) -> str:
+    """One caption line for the TSS bar, with the thresholds the estimates use."""
+    parts = week_tss_parts(view)
+    missed = f" · {parts['missed']} missed" if parts["missed"] else ""
+    return (
+        f"Week TSS {parts['done']} done + {parts['remaining']} remaining = {parts['done'] + parts['remaining']}{missed}"
+        f"   ·   {format_thresholds(view.thresholds)}"
+    )
+
+
 def week_tss_parts(view: services.TrainingWeekView) -> dict[str, int]:
     """Rounded TSS done / remaining / missed, for a stacked progress bar."""
     w = view.week

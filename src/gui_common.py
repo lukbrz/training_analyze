@@ -480,12 +480,45 @@ class StatRow(QWidget):
         self.setVisible(bool(stats))
 
 
-class StackedBar(QWidget):
-    """A rounded horizontal bar split into coloured parts, each labelled with its value."""
+class StatStrip(QLabel):
+    """Stats inline on one line for a dense header: label, coloured value, unit. Groups are
+    separated by a bar; a group's hints show inline (short ones like "→ 53") or, for
+    explanations, in the strip's tooltip. `caption` explains the first group's hints and
+    follows it."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumHeight(54)
+        self.setObjectName("statStrip")
+        self.setTextFormat(Qt.TextFormat.RichText)
+
+    def set_groups(self, groups: list[tuple[list, bool]], caption: str = "") -> None:
+        muted = COLORS["comment"]
+        html_groups, tips = [], []
+        for stats, inline_hints in groups:
+            items = []
+            for s in stats:
+                hint = f"<span style='color:{muted}'>&nbsp;{s.hint}</span>" if inline_hints and s.hint else ""
+                unit = f"<span style='color:{muted}; font-size:9pt'>&nbsp;{s.unit}</span>" if s.unit else ""
+                items.append(
+                    f"<span style='color:{muted}'>{s.label}</span>&nbsp;"
+                    f"<b style='font-size:13pt; color:{palette(s.color)}'>{s.value}</b>{unit}{hint}"
+                )
+                if s.hint and not inline_hints:
+                    tips.append(f"{s.label}: {s.hint}")
+            html_groups.append("&nbsp;&nbsp;·&nbsp;&nbsp;".join(items))
+        if caption and html_groups:
+            html_groups[0] += f"&nbsp;&nbsp;<span style='color:{muted}; font-size:8.5pt'>({caption})</span>"
+        self.setText(f"&nbsp;&nbsp;<span style='color:{COLORS['border2']}'>│</span>&nbsp;&nbsp;".join(html_groups))
+        self.setToolTip("\n".join(tips))
+
+
+class StackedBar(QWidget):
+    """A rounded horizontal bar split into coloured parts, each labelled with its value."""
+
+    def __init__(self, bar_height: int = 26) -> None:
+        super().__init__()
+        self.bar_height = bar_height
+        self.setFixedHeight(bar_height + 22)
         self.parts: list[tuple[str, int, str]] = []  # (label, value, colour)
         self.title = ""
 
@@ -501,7 +534,7 @@ class StackedBar(QWidget):
         painter.setFont(font)
         painter.setPen(QColor(COLORS["comment"]))
         painter.drawText(QRectF(0, 0, self.width(), 18), Qt.AlignmentFlag.AlignLeft, self.title)
-        bar = QRectF(0, 22, self.width(), 26)
+        bar = QRectF(0, 20, self.width(), self.bar_height)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(QColor(COLORS["surface"])))
         painter.drawRoundedRect(bar, 8, 8)

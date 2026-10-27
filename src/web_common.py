@@ -111,6 +111,28 @@ def stat_tiles(stats) -> None:
             ).classes("ta-tile")
 
 
+def stat_strip(groups: list[tuple[list, bool]], caption: str = ""):
+    """Stats inline on one line for a dense header (see gui_common.StatStrip): a group's
+    hints inline, or as each value's hover tooltip; `caption` follows the first group."""
+    muted = COLORS["comment"]
+    html_groups = []
+    for stats, inline_hints in groups:
+        items = []
+        for s in stats:
+            color = COLORS.get(s.color, COLORS["fg"]) if s.color else COLORS["fg"]
+            unit = f"<span style='color:{muted}; font-size:0.8rem'> {escape(s.unit)}</span>" if s.unit else ""
+            hint = f"<span style='color:{muted}'> {escape(s.hint)}</span>" if inline_hints and s.hint else ""
+            title = f" title='{escape(s.hint)}'" if s.hint and not inline_hints else ""
+            items.append(
+                f"<span{title}><span style='color:{muted}'>{escape(s.label)}</span> "
+                f"<b style='font-size:1.15rem; color:{color}'>{escape(s.value)}</b>{unit}{hint}</span>"
+            )
+        html_groups.append(" &nbsp;·&nbsp; ".join(items))
+    if caption and html_groups:
+        html_groups[0] += f" <span style='color:{muted}; font-size:0.75rem'>({escape(caption)})</span>"
+    return ui.html(f" &nbsp;<span style='color:{COLORS['border2']}'>│</span>&nbsp; ".join(html_groups)).classes("w-full")
+
+
 def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_style: str | None = None, **options):
     """An AG Grid table; each row dict holds the column values plus hidden helper fields."""
     # cellDataType False: every value is already display text. Without it AG Grid infers a type

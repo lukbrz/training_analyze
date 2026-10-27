@@ -37,6 +37,7 @@ from gui_common import (
     Page,
     StackedBar,
     StatRow,
+    StatStrip,
     fill_table,
     label,
     make_chart_view,
@@ -970,23 +971,21 @@ class TrainingWeekPage(Page):
         self.week = training_load.week_start(date.today())
         self.view = None
         self.week_title = label("", "pageTitle")
-        self.load_tiles = StatRow()
-        self.metric_tiles = StatRow()
-        self.tss_bar = StackedBar()
-        self.thresholds = label("", "status")
+        # The week's rows are the page's main part: a one-line stat strip and a slim TSS bar
+        # above them, a shorter fitness chart below.
+        self.strip = StatStrip()
+        self.tss_bar = StackedBar(bar_height=16)
         self.table = make_table(display.WEEK_COLUMNS, stretch_column=4)
         self.notes = label("", "notes", wrap=True)
         chart_view, self.chart = make_chart_view()
-        chart_view.setMinimumHeight(240)
+        chart_view.setMinimumHeight(170)
         self.layout_.addLayout(row_layout(
             button("◀ Previous ([)", self.prev_week), self.week_title, button("Next (]) ▶", self.next_week),
             button("This week (t)", self.this_week), button("Refresh (r)", self.refresh), stretch_index=1,
         ))
-        self.layout_.addWidget(self.load_tiles)
-        self.layout_.addWidget(self.metric_tiles)
+        self.layout_.addWidget(self.strip)
         self.layout_.addWidget(self.tss_bar)
-        self.layout_.addWidget(self.thresholds)
-        self.layout_.addWidget(self.table, 2)
+        self.layout_.addWidget(self.table, 5)
         self.layout_.addWidget(self.notes)
         self.layout_.addWidget(chart_view, 2)
         self.bind_back()
@@ -1009,16 +1008,14 @@ class TrainingWeekPage(Page):
         self.view = services.load_training_week(self.week)
         today = date.today()
         self.week_title.setText(display.week_title(self.week))
-        self.load_tiles.set_stats(display.week_load_stats(self.view))
-        self.metric_tiles.set_stats(display.week_metric_stats(self.view.load_metrics))
+        load, load_metrics, caption = display.week_strip_stats(self.view)
+        self.strip.set_groups([(load, True), (load_metrics, False)], caption)
         parts = display.week_tss_parts(self.view)
         self.tss_bar.set_parts(
-            f"Week TSS — {parts['done']} done + {parts['remaining']} remaining = {parts['done'] + parts['remaining']}"
-            + (f"   ·   {parts['missed']} missed" if parts["missed"] else ""),
+            display.week_tss_caption(self.view),
             [("done", parts["done"], COLORS["green"]), ("remaining", parts["remaining"], COLORS["accent"]),
              ("missed", parts["missed"], COLORS["red"])],
         )
-        self.thresholds.setText(display.format_thresholds(self.view.thresholds))
         rows, styles = [], []
         for item in self.view.visible_items:
             cells, color = display.week_item_cells(item, today)

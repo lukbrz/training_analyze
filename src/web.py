@@ -44,6 +44,7 @@ from web_common import (
     select_row,
     selected_row,
     set_selected,
+    stat_strip,
     stat_tiles,
     track_payload,
 )
@@ -716,12 +717,14 @@ def calendar_page() -> None:
         ui.button("Next (]) ▶", on_click=lambda: change(7)).props("outline")
         ui.button("This week (t)", on_click=lambda: this_week()).props("outline")
         ui.button("Refresh (r)", on_click=lambda: refresh()).props("outline")
-    tiles_area = ui.column().classes("w-full")
+    # The week's rows are the page's main part: a one-line stat strip and a slim TSS bar
+    # above them, a shorter fitness chart below.
+    tiles_area = ui.column().classes("w-full gap-1")
     bar = ui.html("").classes("w-full")
-    thresholds = ui.label("").classes("ta-status")
-    table = grid(display.WEEK_COLUMNS, [], height="26vh")
+    # As tall as the week's rows (a week is a dozen or so), so the chart follows right below.
+    table = grid(display.WEEK_COLUMNS, [], height="auto", domLayout="autoHeight")
     notes = ui.label("").classes("ta-notes")
-    chart = ui.echart({**ECHART_BASE}).classes("w-full").style("height: 30vh")
+    chart = ui.echart({**ECHART_BASE}).classes("w-full").style("height: 230px")
 
     def load(keep_row: int | None = None) -> None:
         view = services.load_training_week(state["week"])
@@ -730,8 +733,8 @@ def calendar_page() -> None:
         week_title.set_text(display.week_title(state["week"]))
         tiles_area.clear()
         with tiles_area:
-            stat_tiles(display.week_load_stats(view))
-            stat_tiles(display.week_metric_stats(view.load_metrics))
+            load, load_metrics, caption = display.week_strip_stats(view)
+            stat_strip([(load, True), (load_metrics, False)], caption)
         parts = display.week_tss_parts(view)
         total = sum(parts.values()) or 1
         segments = "".join(
@@ -739,12 +742,10 @@ def calendar_page() -> None:
             for name, value, color in (("done", parts["done"], COLORS["green"]), ("remaining", parts["remaining"], COLORS["accent"]), ("missed", parts["missed"], COLORS["red"]))
             if value
         )
-        missed = f" · {parts['missed']} missed" if parts["missed"] else ""
         bar.set_content(
-            f"<div class='ta-status' style='margin-bottom:4px'>Week TSS — {parts['done']} done + {parts['remaining']} remaining = "
-            f"{parts['done'] + parts['remaining']}{missed}</div><div class='ta-bar'>{segments}</div>"
+            f"<div class='ta-status' style='margin-bottom:2px'>{escape(display.week_tss_caption(view))}</div>"
+            f"<div class='ta-bar' style='height:18px; font-size:0.75rem'>{segments}</div>"
         )
-        thresholds.set_text(display.format_thresholds(view.thresholds))
         rows, extras = [], []
         for item in view.visible_items:
             cells, color = display.week_item_cells(item, today)
