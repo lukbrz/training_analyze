@@ -752,3 +752,70 @@ def metric_legend(metric: str, sport: str):
         "power": ("Power", lambda v: f"{v:.0f} W"),
         "altitude_m": ("Elevation", lambda v: f"{v:.0f} m"),
     }[metric]
+
+
+# --- Context menus (right-click on a row) -------------------------------------------------
+# Described once for every front end: each item names a shared action, which a front end
+# maps to the same method its key runs, so a menu and its key always do the same thing.
+
+
+@dataclass
+class MenuItem:
+    action: str
+    label: str
+    key: str = ""
+    enabled: bool = True
+
+    @property
+    def text(self) -> str:
+        return f"{self.label}   ({self.key})" if self.key else self.label
+
+
+def activity_menu(activity: ActivitySummary) -> list[MenuItem]:
+    strength = training_load.sport_family(activity.sport) == "strength"
+    return [
+        MenuItem("open", "Open strength sets" if strength else "Open laps", "enter"),
+        MenuItem("zones", "HR & power zones", "z"),
+        MenuItem("copy", "Copy table", "y"),
+    ]
+
+
+def lap_menu(row) -> list[MenuItem]:
+    """`row`: the laps_session.LapRow right-clicked (None: no row)."""
+    lap_row = row is not None and row.kind in ("interval", "plain")
+    return [
+        MenuItem("toggle_interval", "Unmark interval" if row is not None and row.kind == "interval" else "Mark as interval", "m", lap_row),
+        MenuItem("split_intervals", "Split intervals into phases", "i"),
+        MenuItem("toggle_filter", "Intervals only / all laps", "f"),
+        MenuItem("map", "Map", "g"),
+        MenuItem("compare", "Compare intervals", "c"),
+        MenuItem("phase_metrics", "Phase time / pace / power", "h"),
+        MenuItem("physical_laps", "Re-detect loops", "p"),
+        MenuItem("zones", "HR & power zones", "z"),
+        MenuItem("copy", "Copy table", "y"),
+    ]
+
+
+def week_menu(item: training_load.WeekItem | None) -> list[MenuItem]:
+    """`item`: the calendar row right-clicked (None: no row)."""
+    plan = item is not None and item.status in ("planned", "missed") and bool(item.schedule_id)
+    done_planned = item is not None and item.status == "done (planned)"
+    linkable = plan or (item is not None and item.status == "unplanned")
+    return [
+        MenuItem("open", "Open activity", "enter", item is not None and bool(item.activity_id)),
+        MenuItem("move", "Move workout…", "m", plan),
+        MenuItem("cancel", "Cancel workout…", "x", plan),
+        MenuItem("link", "Unlink plan and activity" if done_planned else "Link with…", "l", done_planned or linkable),
+        MenuItem("export", "Export weeks…", "e"),
+        MenuItem("copy", "Copy table", "y"),
+    ]
+
+
+def workout_menu(key: str | None, is_week: bool) -> list[MenuItem]:
+    """`key`: the workouts-list row right-clicked; `is_week` when it's (in) a week plan."""
+    return [
+        MenuItem("upload", "Upload workout", "u", key is not None and not key.startswith("week:")),
+        MenuItem("upload_week", "Upload whole week…", "U", is_week),
+        MenuItem("toggle_week", "Expand / collapse week", "x", is_week),
+        MenuItem("refresh", "Rescan folder", "r"),
+    ]

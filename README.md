@@ -198,6 +198,10 @@ Past plans move to `workouts/archive/` automatically (see Settings). Nothing is 
 
 **Planning with an AI assistant:** give an AI assistant (ChatGPT, Claude, …) the contents of `src/workout_schema.json` and ask it for workouts that follow it. A whole week can come as one `.zip` with one `.json` per workout. Drop the zip into `workouts/`; the app unpacks it and shows it as a collapsible week.
 
+### Right-click menus
+
+In the desktop and web apps, and in the terminal app if it gets mouse clicks, right-click a row in the activity list, laps, calendar or workouts list for its actions: move or cancel a planned workout, link a plan with an activity, mark an interval, open the map, upload a week, and so on. Each entry shows its key. Entries that don't apply to that row are greyed out (desktop/web) or left out (terminal). In the calendar, double-click or Enter on a row opens its activity.
+
 ## Options
 
 ```bash

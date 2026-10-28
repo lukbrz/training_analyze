@@ -4,7 +4,7 @@ import subprocess
 from datetime import date, timedelta
 
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, HorizontalGroup, Vertical
@@ -192,7 +192,38 @@ class LoginScreen(Screen):
         self.query_one("#login_button", Button).disabled = disabled
 
 
-class MainScreen(Screen):
+class ContextMenuMixin:
+    """Right-click on a screen's table opens the selected row's menu (display.*_menu):
+    a pick list of what applies to that row, each entry running the same action as its
+    key. A screen lists its menu items in context_menu() and maps their shared action
+    names to its own in MENU_ACTIONS."""
+
+    MENU_ACTIONS: dict[str, str] = {}
+
+    def context_menu(self) -> list[display.MenuItem]:
+        return []
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if event.button != 3:
+            return
+        # The table moves its cursor to the clicked row first; read the menu after that.
+        self.call_after_refresh(self._open_context_menu)
+
+    def _open_context_menu(self) -> None:
+        items = [i for i in self.context_menu() if i.enabled and i.action in self.MENU_ACTIONS]
+        if not items:
+            return
+
+        def chosen(index: int | None) -> None:
+            if index is not None:
+                self.call_later(self.run_action, self.MENU_ACTIONS[items[index].action])
+
+        self.app.push_screen(ChoiceScreen("Actions for this row:", [i.text for i in items]), chosen)
+
+
+class MainScreen(ContextMenuMixin, Screen):
+    MENU_ACTIONS = {"open": "open_selected", "zones": "zones", "copy": "copy"}
+
     BINDINGS = [
         Binding("s", "sync", "Sync"),
         Binding("r", "reprocess", "Reprocess"),
@@ -291,6 +322,26 @@ class MainScreen(Screen):
         if activity is not None:
             self.app.push_screen(activity_screen(activity, self.client))
 
+    def _selected_activity(self) -> ActivitySummary | None:
+        table = self.query_one(DataTable)
+        if not table.row_count or table.cursor_row is None:
+            return None
+        return self.activities_by_id.get(table.coordinate_to_cell_key((table.cursor_row, 0)).row_key.value)
+
+    def context_menu(self) -> list[display.MenuItem]:
+        activity = self._selected_activity()
+        return display.activity_menu(activity) if activity else []
+
+    def action_open_selected(self) -> None:
+        activity = self._selected_activity()
+        if activity is not None:
+            self.app.push_screen(activity_screen(activity, self.client))
+
+    def action_zones(self) -> None:
+        activity = self._selected_activity()
+        if activity is not None:
+            self.app.push_screen(ZonesScreen(activity, self.client))
+
     def action_sync(self) -> None:
         self._set_buttons_disabled(True)
         self._sync()
@@ -377,9 +428,15 @@ def _switch_screen(screen: Screen, other_type: type, make) -> None:
         screen.app.push_screen(make())
 
 
-class LapsScreen(Screen):
+class LapsScreen(ContextMenuMixin, Screen):
     """One activity's laps — a Textual shell around laps_session.LapsSession, which owns all
     the state and behaviour (shared with the Qt GUI)."""
+
+    MENU_ACTIONS = {
+        "toggle_interval": "toggle_interval", "split_intervals": "split_intervals",
+        "toggle_filter": "toggle_interval_filter", "compare": "compare", "phase_metrics": "phase_metrics",
+        "physical_laps": "physical_laps", "zones": "zones", "copy": "copy",
+    }
 
     CSS = """
     #split_value_input {
@@ -569,6 +626,9 @@ class LapsScreen(Screen):
             self.action_toggle_interval_filter()
         elif event.button.id == "reset_button":
             self._run(self.session.reset)
+
+    def context_menu(self) -> list[display.MenuItem]:
+        return display.lap_menu(self.session.row(self.query_one(DataTable).cursor_row or 0))
 
     def action_toggle_interval(self) -> None:
         row = self.query_one(DataTable).cursor_row
@@ -1246,10 +1306,12 @@ class ChoiceScreen(ModalScreen[int | None]):
         self.dismiss(None)
 
 
-class WorkoutsScreen(Screen):
+class WorkoutsScreen(ContextMenuMixin, Screen):
     """Workout JSON files and week-plan zips in storage.WORKOUTS_DIR — a Textual shell around
     workout_library.WorkoutLibrary (shared with the Qt GUI): validate, preview, upload one
     workout with u or a whole week with U (after confirmation)."""
+
+    MENU_ACTIONS = {"upload": "upload", "upload_week": "upload_week", "toggle_week": "toggle_week", "refresh": "refresh"}
 
     CSS = """
     #workouts_table {
@@ -1330,6 +1392,10 @@ class WorkoutsScreen(Screen):
         if key and key.startswith(workout_library.WEEK_KEY_PREFIX):
             self._toggle(key)
 
+    def context_menu(self) -> list[display.MenuItem]:
+        key = self._selected_key()
+        return display.workout_menu(key, self.library.week_of(key) in self.library.week_dirs)
+
     def action_toggle_week(self) -> None:
         self._toggle(self._selected_key())
 
@@ -1379,10 +1445,15 @@ class WorkoutsScreen(Screen):
         self.app.pop_screen()
 
 
-class TrainingWeekScreen(Screen):
+class TrainingWeekScreen(ContextMenuMixin, Screen):
     """A week of training from the Garmin calendar: planned workouts and completed activities
     with their (estimated) TSS, and fitness/fatigue/form (CTL/ATL/TSB) — see training_load.
     Shows cached data at once, then refreshes from Garmin in the background."""
+
+    MENU_ACTIONS = {
+        "open": "open_activity", "move": "move_workout", "cancel": "cancel_workout", "link": "link",
+        "export": "export", "copy": "copy",
+    }
 
     CSS = """
     #week_summary {
@@ -1530,6 +1601,19 @@ class TrainingWeekScreen(Screen):
         row = self.query_one(DataTable).cursor_row
         items = self.view.visible_items if self.view else []
         return items[row] if row is not None and 0 <= row < len(items) else None
+
+    def context_menu(self) -> list[display.MenuItem]:
+        return display.week_menu(self._selected_item())
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.action_open_activity()
+
+    def action_open_activity(self) -> None:
+        item = self._selected_item()
+        _, activities = storage.load_index()
+        activity = next((a for a in activities if item and a.activity_id == item.activity_id), None)
+        if activity is not None:
+            self.app.push_screen(activity_screen(activity, self.client))
 
     def action_move_workout(self) -> None:
         item = self._selected_item()

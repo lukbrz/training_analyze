@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -39,6 +40,15 @@ from theme import COLORS, SERIES_COLORS, SPORT_COLORS
 MONO_FONT = "JetBrains Mono, DejaVu Sans Mono, Consolas, monospace"
 
 STYLESHEET = f"""
+QMenu {{
+    background: {COLORS['surface']}; color: {COLORS['fg']}; border: 1px solid {COLORS['border2']};
+    border-radius: 8px; padding: 4px;
+}}
+QMenu::item {{ padding: 6px 28px 6px 14px; border-radius: 5px; background: transparent; }}
+QMenu::item:selected {{ background: {COLORS['selection']}; }}
+QMenu::item:disabled {{ color: {COLORS['muted']}; }}
+QMenu::separator {{ height: 1px; background: {COLORS['border']}; margin: 4px 8px; }}
+QToolTip {{ background: {COLORS['surface2']}; color: {COLORS['fg']}; border: 1px solid {COLORS['border2']}; padding: 4px; }}
 QWidget {{
     background: {COLORS['bg']}; color: {COLORS['fg']};
     font-family: Inter, "Segoe UI", "Noto Sans", "DejaVu Sans", sans-serif; font-size: 10pt;
@@ -210,6 +220,32 @@ def make_table(columns: tuple[str, ...], stretch_column: int | None = None) -> Q
     header.setHighlightSections(False)
     table.setWordWrap(False)
     return table
+
+
+def attach_context_menu(table: QTableWidget, menu_for_row: Callable[[int], list], handlers: dict[str, Callable]) -> None:
+    """Right-click on a table row selects it and opens its menu (display.*_menu): every item
+    a handler is given for, greyed out where it doesn't apply to that row, with its key
+    shown on the right — each runs the same method as the key."""
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def show(pos) -> None:
+        row = table.rowAt(pos.y())
+        if row >= 0:
+            table.selectRow(row)
+        items = [i for i in menu_for_row(row) if i.action in handlers]
+        if not items:
+            return
+        menu = QMenu(table)
+        # Only the rounded panel (stylesheet) shows, not a square window behind it.
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        for item in items:
+            action = menu.addAction(f"{item.label}\t{item.key}" if item.key else item.label)
+            action.setEnabled(item.enabled)
+            action.triggered.connect(lambda _=False, fn=handlers[item.action]: fn())
+        menu.exec(table.viewport().mapToGlobal(pos))
+
+    table.customContextMenuRequested.connect(show)
 
 
 def fill_table(

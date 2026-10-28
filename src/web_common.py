@@ -133,6 +133,42 @@ def stat_strip(groups: list[tuple[list, bool]], caption: str = ""):
     return ui.html(f" &nbsp;<span style='color:{COLORS['border2']}'>│</span>&nbsp; ".join(html_groups)).classes("w-full")
 
 
+def row_context_menu(table, menu_for_row: Callable[[int], list], handlers: dict[str, Callable]) -> None:
+    """Right-click on a grid row selects it and opens its menu (display.*_menu) at the
+    cursor: every item a handler is given for, greyed out where it doesn't apply to that
+    row, with its key — each runs the same function as the key."""
+    # The grid renders no child elements, so the menu hangs off an invisible wrapper around
+    # it (display: contents keeps the page layout as it was).
+    parent = table.parent_slot.parent
+    index = parent.default_slot.children.index(table)
+    with parent:
+        wrapper = ui.element("div").style("display: contents")
+    wrapper.move(parent, target_index=index)
+    table.move(wrapper)
+    with wrapper:
+        menu = ui.context_menu().props("touch-position")
+
+    def fill(row: int | None) -> None:
+        menu.clear()
+        with menu:
+            for item in menu_for_row(row) if row is not None else []:
+                if item.action not in handlers:
+                    continue
+                with ui.menu_item(on_click=lambda fn=handlers[item.action]: _call(fn)).props("dense") as entry:
+                    ui.label(item.label)
+                    ui.space()
+                    ui.label(item.key).classes("ta-status").style("margin-left: 24px")
+                if not item.enabled:
+                    entry.disable()
+
+    def clicked(e) -> None:
+        row = (e.args.get("data") or {}).get("_row", e.args.get("rowIndex"))
+        select_row(table, row)
+        fill(row)
+
+    table.on("cellContextMenu", clicked)
+
+
 def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_style: str | None = None, **options):
     """An AG Grid table; each row dict holds the column values plus hidden helper fields."""
     # cellDataType False: every value is already display text. Without it AG Grid infers a type

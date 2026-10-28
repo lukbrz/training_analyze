@@ -38,6 +38,7 @@ from gui_common import (
     StackedBar,
     StatRow,
     StatStrip,
+    attach_context_menu,
     fill_table,
     label,
     make_chart_view,
@@ -184,6 +185,11 @@ class MainPage(Page):
         self.bind("p", "Settings", lambda: self.window_.push(SettingsPage(self.window_)))
         self.bind("Shift+H", "Sync full history", self.sync_history, display_key="H")
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} activities"))
+        attach_context_menu(self.table, lambda row: display.activity_menu(self.shown[row]) if 0 <= row < len(self.shown) else [], {
+            "open": lambda: self._open(self.table.currentRow()),
+            "zones": lambda: self.window_.push(ZonesPage(self.window_, self.shown[self.table.currentRow()], self.client)),
+            "copy": lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} activities"),
+        })
         self.refresh_table()
 
     def focus_widget(self):
@@ -427,6 +433,13 @@ class LapsPage(Page):
         self.bind("t", "Strength sets", self.strength_sets)
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
+        attach_context_menu(self.table, lambda row: display.lap_menu(self.session.row(row)), {
+            "toggle_interval": self.toggle_interval, "split_intervals": self.split_intervals,
+            "toggle_filter": self.toggle_filter, "map": self.open_map, "compare": self.compare,
+            "phase_metrics": self.histograms, "physical_laps": self.physical_laps,
+            "zones": lambda: self.window_.push(ZonesPage(self.window_, activity, client)),
+            "copy": lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"),
+        })
         self._rebuild()
         # First open of a long activity parses its FIT file (seconds): load off the UI thread,
         # then fill the PHYSICAL section (seconds again on a long ride).
@@ -900,6 +913,16 @@ class WorkoutsPage(Page):
         self.bind("Shift+U", "Upload week", self.upload_week, display_key="U")
         self.bind("x", "Expand/collapse week", lambda: self._toggle(self._selected_key()))
         self.bind("r", "Refresh", self.refresh)
+
+        def menu(row: int) -> list:
+            rows = self.library.rows
+            key = rows[row].key if 0 <= row < len(rows) else None
+            return display.workout_menu(key, self.library.week_of(key) in self.library.week_dirs)
+
+        attach_context_menu(self.table, menu, {
+            "upload": self.upload, "upload_week": self.upload_week,
+            "toggle_week": lambda: self._toggle(self._selected_key()), "refresh": self.refresh,
+        })
         self.refresh()
 
     def focus_widget(self):
@@ -1025,6 +1048,11 @@ class TrainingWeekPage(Page):
         self.bind("l", "Link/unlink plan", self.link)
         self.bind("e", "Export weeks", self.export)
         self.bind("y", "Copy table", self.copy)
+        self.table.cellActivated.connect(lambda *_: self.open_activity())
+        attach_context_menu(self.table, lambda row: display.week_menu(self._selected_item()), {
+            "open": self.open_activity, "move": self.move_workout, "cancel": self.cancel_workout,
+            "link": self.link, "export": self.export, "copy": self.copy,
+        })
         self._load_view()
         self.refresh()
 
@@ -1116,6 +1144,13 @@ class TrainingWeekPage(Page):
         row = self.table.currentRow()
         items = self.view.visible_items if self.view else []
         return items[row] if 0 <= row < len(items) else None
+
+    def open_activity(self) -> None:
+        item = self._selected_item()
+        _, activities = storage.load_index()
+        activity = next((a for a in activities if item and a.activity_id == item.activity_id), None)
+        if activity is not None:
+            self.window_.push(activity_page(self.window_, activity, self.client))
 
     def _choose(self, title: str, prompt: str, options: list[str]) -> int | None:
         text, ok = QInputDialog.getItem(self, title, prompt, options, 0, False)

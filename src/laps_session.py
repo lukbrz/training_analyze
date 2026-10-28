@@ -174,6 +174,10 @@ class LapsSession:
         extras = "/".join(lap.label for lap in laps if lap.label in (fit_parser.LEAD_IN_LABEL, fit_parser.WAY_BACK_LABEL))
         return f"{loops} loops" + (f" + {extras}" if extras else "")
 
+    def row(self, row_index: int) -> LapRow | None:
+        """A displayed row (as of the last rows() call); None when out of range."""
+        return self._rows[row_index] if 0 <= row_index < len(self._rows) else None
+
     def row_lap(self, row_index: int) -> Lap | None:
         """The lap (or phase split) shown in a displayed row; None for section headers."""
         return self._rows[row_index].lap if 0 <= row_index < len(self._rows) else None

@@ -9,6 +9,7 @@ OpenStreetMap (with the attribution Leaflet shows).
 """
 
 import argparse
+from pathlib import Path
 from datetime import date, timedelta
 
 from nicegui import app, background_tasks, run, ui
@@ -40,6 +41,7 @@ from web_common import (
     legend_html,
     notify,
     on_row_change,
+    row_context_menu,
     run_with_progress,
     select_row,
     selected_row,
@@ -196,6 +198,10 @@ def main_page() -> None:
     frame.bind("H", "Sync full history", sync_history)
     frame.bind("Enter", "Open", open_selected, shown_key="enter")
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"))
+    row_context_menu(table, lambda row: display.activity_menu(state["shown"][row]) if 0 <= row < len(state["shown"]) else [], {
+        "open": open_selected,
+        "copy": lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"),
+    })
     render()
 
 
@@ -533,6 +539,12 @@ def laps_page(activity_id: str) -> None:
     for key, text, attr in MAP_MODES:
         frame.keys[key] = lambda a=attr: draw_map(a) if tabs.value in (map_tab, "Map (g)") else None
     frame.bind("y", "Copy table", lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"))
+    row_context_menu(table, lambda row: display.lap_menu(session.row(row)), {
+        "toggle_interval": toggle_interval, "split_intervals": split_intervals, "toggle_filter": toggle_filter,
+        "map": draw_map, "compare": draw_compare, "phase_metrics": show_phases, "physical_laps": physical_laps,
+        "zones": show_zones,
+        "copy": lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"),
+    })
     on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
     rebuild(0)
     ui.timer(0.2, initial_load, once=True)
@@ -710,6 +722,15 @@ def workouts_page() -> None:
     frame.bind("U", "Upload week", upload_week)
     frame.bind("x", "Expand/collapse week", toggle_selected)
     frame.bind("r", "Refresh", refresh)
+
+    def workout_menu(row: int) -> list:
+        rows = library.rows
+        key = rows[row].key if 0 <= row < len(rows) else None
+        return display.workout_menu(key, library.week_of(key) in library.week_dirs)
+
+    row_context_menu(table, workout_menu, {
+        "upload": upload_one, "upload_week": upload_week, "toggle_week": toggle_selected, "refresh": refresh,
+    })
     refresh()
     show_preview(None)
 
@@ -954,6 +975,24 @@ def calendar_page() -> None:
     frame.bind("x", "Cancel workout", unless_dialog(cancel_workout))
     frame.bind("l", "Link/unlink plan", unless_dialog(link))
     frame.bind("e", "Export weeks", unless_dialog(export))
+
+    async def open_activity() -> None:
+        item = await selected_item()
+        if item is not None and item.activity_id:
+            ui.navigate.to(f"/activity/{item.activity_id}")
+
+    table.on("rowDoubleClicked", lambda e: open_activity())
+
+    def week_menu(row: int) -> list:
+        items = state["view"].visible_items
+        return display.week_menu(items[row] if 0 <= row < len(items) else None)
+
+    row_context_menu(table, week_menu, {
+        "open": open_activity, "move": unless_dialog(move_workout), "cancel": unless_dialog(cancel_workout),
+        "link": unless_dialog(link), "export": unless_dialog(export),
+        "copy": lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
+            display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].visible_items]), "week"),
+    })
     frame.bind("y", "Copy table", lambda: copy(display.week_summary_text(state["view"]) + "\n\n" + display.tsv(
         display.WEEK_COLUMNS, [display.week_item_cells(i, date.today())[0] for i in state["view"].visible_items]), "week"))
     load()
@@ -974,7 +1013,7 @@ def main() -> None:
     args = parser.parse_args()
     app.on_startup(_cached_login)
     ui.run(host="127.0.0.1", port=args.port, title=APP_TITLE, dark=True, reload=False, show=not args.no_browser,
-           favicon="🏃", show_welcome_message=False)
+           favicon=Path(__file__).parent / "assets" / "icon-64.png", show_welcome_message=False)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

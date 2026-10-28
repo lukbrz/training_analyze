@@ -3,8 +3,10 @@ the same order with the same keys, drawn with real widgets and vector charts. Ru
 run_gui.sh. All behaviour is shared with the TUI (see gui_pages.py)."""
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -130,9 +132,23 @@ class MainWindow(QMainWindow):
         self.replace_all(MainPage(self, garmin))
 
 
+ASSETS_DIR = Path(__file__).parent / "assets"
+
+
+def app_icon() -> QIcon:
+    """The app icon at every rendered size (assets/build_icons.py), so each place it shows
+    — title bar, taskbar, alt-tab — gets a crisp one."""
+    icon = QIcon()
+    for path in sorted(ASSETS_DIR.glob("icon-*.png")):
+        icon.addFile(str(path))
+    return icon
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
+    app.setDesktopFileName("training-analyze")  # lets Linux docks match a .desktop launcher
+    app.setWindowIcon(app_icon())
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setStyleSheet(STYLESHEET)
     init_bridge()
