@@ -163,12 +163,17 @@ class MainPage(Page):
         self.sport_filter = QComboBox()
         self.sport_filter.setMinimumWidth(180)
         self.sport_filter.currentIndexChanged.connect(lambda _: self._render_table())
+        self.period_filter = QComboBox()
+        for days, text in settings.PERIOD_CHOICES:
+            self.period_filter.addItem(text, days)
+        self._select_period()
+        self.period_filter.currentIndexChanged.connect(lambda _: self._period_changed())
         self.table = make_table(display.ACTIVITY_COLUMNS, stretch_column=1)
         self.table.cellActivated.connect(lambda row, _: self._open(row))
         self.layout_.addWidget(self.status)
         self.layout_.addLayout(row_layout(
             self.sync_button, self.reprocess_button, button("Routes (o)", self.routes),
-            button("Workouts (w)", self.workouts), button("Calendar (c)", self.calendar), self.sport_filter,
+            button("Workouts (w)", self.workouts), button("Calendar (c)", self.calendar), self.period_filter, self.sport_filter,
         ))
         self.layout_.addWidget(self.table, 1)
         self.bind("s", "Sync", self.sync)
@@ -184,8 +189,17 @@ class MainPage(Page):
     def focus_widget(self):
         return self.table
 
+    def _select_period(self) -> None:
+        self.period_filter.blockSignals(True)
+        self.period_filter.setCurrentIndex(max(self.period_filter.findData(settings.get("activity_period_days")), 0))
+        self.period_filter.blockSignals(False)
+
+    def _period_changed(self) -> None:
+        settings.save({"activity_period_days": self.period_filter.currentData()})  # the next start opens on it too
+        self.refresh_table()
+
     def refresh_table(self) -> None:
-        self.all_activities, self.hidden_count = services.listed_activities()
+        self.all_activities, self.hidden_count = services.listed_activities(self.period_filter.currentData() or 0)
         self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
         current = self.sport_filter.currentData() or ALL_SPORTS
         sports = sorted({a.sport for a in self.all_activities})
@@ -210,7 +224,9 @@ class MainPage(Page):
             route = self.routes_by_id.get(activity.route_id)
             rows.append(display.activity_row(activity, route.name if route else "–"))
         fill_table(self.table, rows, activity_styles(self.shown), right_aligned={display.ACTIVITY_DURATION_COLUMN})
-        self.status.setText(display.activities_status(len(self.shown), len(self.all_activities), self.hidden_count))
+        self.status.setText(display.activities_status(
+            len(self.shown), len(self.all_activities), self.hidden_count, self.period_filter.currentData() or 0,
+        ))
 
     def _open(self, row: int) -> None:
         if 0 <= row < len(self.shown):
@@ -261,6 +277,7 @@ class MainPage(Page):
         self.window_.push(TrainingWeekPage(self.window_, self.client))
 
     def on_shown(self) -> None:
+        self._select_period()  # the settings page may have changed it
         self.refresh_table()
 
 
@@ -279,6 +296,14 @@ class SettingsPage(Page):
                 check.setChecked(values[field.key])
                 self.checks[field.key] = check
                 self.layout_.addWidget(check)
+            elif field.kind == "choice":
+                combo = QComboBox()
+                for value, text in field.options:
+                    combo.addItem(text, value)
+                combo.setCurrentIndex(max(combo.findData(values[field.key]), 0))
+                self.checks[field.key] = combo
+                self.layout_.addWidget(label(field.label, "pageTitle"))
+                self.layout_.addLayout(row_layout(combo))
             else:
                 self.layout_.addWidget(label(field.label, "pageTitle"))
                 boxes = {}
@@ -302,6 +327,8 @@ class SettingsPage(Page):
             checks = self.checks[field.key]
             if field.kind == "bool":
                 values[field.key] = checks.isChecked()
+            elif field.kind == "choice":
+                values[field.key] = checks.currentData()
             else:
                 values[field.key] = [sport for sport, box in checks.items() if box.isChecked()]
         settings.save(values)

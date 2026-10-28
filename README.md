@@ -105,11 +105,12 @@ Every screen lists its keys in the footer at the bottom. In the desktop and web 
 | `y` | Copy the table to the clipboard (tab-separated, pastes into a spreadsheet) |
 | `Enter` | Open the selected activity |
 
-Use the sport drop-down to show only running, cycling, swimming and so on. Sync also imports the sets of strength sessions (exercise, reps, weight).
+Use the period drop-down to show only the last 7 or 14 days or 4 weeks (the app remembers your choice), and the sport drop-down to show only running, cycling, swimming and so on. Sync also imports the sets of strength sessions (exercise, reps, weight).
 
 ### Settings (`p`)
 
 Stored in `data/settings.json`:
+- **Activity list shows:** all activities, or only the last 7 / 14 days / 4 weeks (same as the main screen's period drop-down).
 - **Hidden sports:** e.g. strength. Hidden sports aren't listed among activities or as calendar rows, but their training load still counts.
 - **Archive past workouts:** moves week plans and workout files whose dates have all passed into `workouts/archive/`.
 - **Show archived workouts:** lists the archive on the Workouts screen again.

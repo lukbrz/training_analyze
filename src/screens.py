@@ -212,6 +212,7 @@ class MainScreen(Screen):
         self.all_activities: list[ActivitySummary] = []
         self.routes_by_id: dict[str, Route] = {}
         self.sport_filter: str = ALL_SPORTS
+        self.period_days: int = settings.get("activity_period_days")
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -222,6 +223,8 @@ class MainScreen(Screen):
             Button("Routes (o)", id="routes_button"),
             Button("Workouts (w)", id="workouts_button"),
             Button("Calendar (c)", id="calendar_button"),
+            Select([(label, days) for days, label in settings.PERIOD_CHOICES], value=self.period_days,
+                   allow_blank=False, id="period_select"),
             Select([("All sports", ALL_SPORTS)], value=ALL_SPORTS, id="sport_filter_select"),
         )
         yield DataTable(id="activities_table")
@@ -234,7 +237,7 @@ class MainScreen(Screen):
         self._refresh_table()
 
     def _refresh_table(self) -> None:
-        self.all_activities, self.hidden_count = services.listed_activities()
+        self.all_activities, self.hidden_count = services.listed_activities(self.period_days)
         self.routes_by_id = {r.route_id: r for r in storage.load_routes()}
         self._update_sport_options()
         self._render_table()
@@ -259,7 +262,7 @@ class MainScreen(Screen):
             table.add_row(
                 *_activity_cells(activity, route.name if route else "–"), key=activity.activity_id
             )
-        status = display.activities_status(len(activities), len(self.all_activities), self.hidden_count)
+        status = display.activities_status(len(activities), len(self.all_activities), self.hidden_count, self.period_days)
         self.query_one("#status", Static).update(status)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -278,6 +281,10 @@ class MainScreen(Screen):
         if event.select.id == "sport_filter_select":
             self.sport_filter = event.value
             self._render_table()
+        elif event.select.id == "period_select" and event.value != self.period_days:
+            self.period_days = event.value
+            settings.save({"activity_period_days": self.period_days})  # the next start opens on it too
+            self._refresh_table()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         activity = self.activities_by_id.get(event.row_key.value)
@@ -301,7 +308,13 @@ class MainScreen(Screen):
         self.app.push_screen(ConfirmScreen(services.FULL_HISTORY_PROMPT, "Sync full history"), confirmed)
 
     def action_settings(self) -> None:
-        self.app.push_screen(SettingsScreen(), lambda saved: self._refresh_table() if saved else None)
+        def saved(changed: bool) -> None:
+            if changed:
+                self.period_days = settings.get("activity_period_days")
+                self.query_one("#period_select", Select).value = self.period_days
+                self._refresh_table()
+
+        self.app.push_screen(SettingsScreen(), saved)
 
     def action_reprocess(self) -> None:
         self._set_buttons_disabled(True)
@@ -1136,6 +1149,10 @@ class SettingsScreen(Screen[bool]):
         for field in settings.FIELDS:
             if field.kind == "bool":
                 widgets.append(Checkbox(field.label, values[field.key], id=f"setting_{field.key}"))
+            elif field.kind == "choice":
+                widgets.append(Static(field.label, classes="setting_label"))
+                widgets.append(Select([(label, value) for value, label in field.options], value=values[field.key],
+                                      allow_blank=False, id=f"setting_{field.key}"))
             else:
                 widgets.append(Static(field.label, classes="setting_label"))
                 widgets.append(HorizontalGroup(*(
@@ -1155,6 +1172,8 @@ class SettingsScreen(Screen[bool]):
         for field in settings.FIELDS:
             if field.kind == "bool":
                 values[field.key] = self.query_one(f"#setting_{field.key}", Checkbox).value
+            elif field.kind == "choice":
+                values[field.key] = self.query_one(f"#setting_{field.key}", Select).value
             else:
                 values[field.key] = [
                     sport for sport in settings.SPORT_GROUPS

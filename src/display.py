@@ -38,10 +38,12 @@ ACTIVITY_COLUMNS = (
 ACTIVITY_DURATION_COLUMN = 3
 
 
-def activities_status(shown: int, listed: int, hidden: int) -> str:
-    """The activity list's status line: shown under the sport filter, of those listed,
-    plus how many hidden sports' activities settings leave out."""
-    text = f"{shown} activities synced" if shown == listed else f"{shown} of {listed} activities"
+def activities_status(shown: int, listed: int, hidden: int, period_days: int = 0) -> str:
+    """The activity list's status line: shown under the sport filter, of those listed (in
+    the period, when one is chosen), plus how many hidden sports' activities settings
+    leave out."""
+    period = f" in the last {period_days} days" if period_days else ""
+    text = f"{shown} activities{period or ' synced'}" if shown == listed else f"{shown} of {listed} activities{period}"
     return text + (f" ({hidden} of hidden sports not listed)" if hidden else "")
 
 

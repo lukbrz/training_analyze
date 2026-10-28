@@ -17,15 +17,24 @@ SPORT_GROUPS = ("running", "cycling", "swimming", "strength", "hiking", "multisp
 class Field:
     key: str
     label: str
-    kind: str  # "bool" or "sports" (a subset of SPORT_GROUPS)
+    kind: str  # "bool", "sports" (a subset of SPORT_GROUPS) or "choice" (one of `options`)
     default: object
     help: str = ""
+    options: tuple = ()  # for "choice": (value, label) pairs
 
+
+# How far back the activity list reaches: (days, label); 0 = everything.
+PERIOD_CHOICES = ((0, "All activities"), (7, "Last 7 days"), (14, "Last 14 days"), (28, "Last 4 weeks"))
 
 FIELDS = (
     Field(
         "hidden_sports", "Hidden sports", "sports", [],
         "Not listed among activities nor as calendar rows. Their training load still counts.",
+    ),
+    Field(
+        "activity_period_days", "Activity list shows", "choice", 0,
+        "How far back the main screen's activity list reaches (also changed by its period filter).",
+        PERIOD_CHOICES,
     ),
     Field(
         "auto_archive_workouts", "Archive past workouts", "bool", True,
@@ -46,6 +55,8 @@ _BY_KEY = {f.key: f for f in FIELDS}
 def _valid(field: Field, value) -> bool:
     if field.kind == "bool":
         return isinstance(value, bool)
+    if field.kind == "choice":
+        return value in [v for v, _ in field.options]
     return isinstance(value, list) and all(v in SPORT_GROUPS for v in value)
 
 

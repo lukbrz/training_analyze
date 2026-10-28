@@ -99,10 +99,13 @@ def _calendar_items(week: date) -> list[dict]:
     return items
 
 
-def listed_activities() -> tuple[list[ActivitySummary], int]:
+def listed_activities(period_days: int = 0, today: date | None = None) -> tuple[list[ActivitySummary], int]:
     """(activities to list, how many are left out because their sport is hidden in
-    settings)."""
+    settings). `period_days` > 0 keeps only the last that many days (today included)."""
     _, activities = storage.load_index()
+    if period_days:
+        since = ((today or date.today()) - timedelta(days=period_days - 1)).isoformat()
+        activities = [a for a in activities if a.start_time_local[:10] >= since]
     prefs = settings.load()
     shown = [a for a in activities if not settings.is_hidden(a.sport, prefs)]
     return shown, len(activities) - len(shown)

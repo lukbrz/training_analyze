@@ -114,11 +114,12 @@ def main_page() -> None:
         ui.button("Routes (o)", on_click=lambda: ui.navigate.to("/routes")).props("outline")
         ui.button("Workouts (w)", on_click=lambda: ui.navigate.to("/workouts")).props("outline")
         ui.button("Calendar (c)", on_click=lambda: ui.navigate.to("/calendar")).props("outline")
+        period_select = ui.select(dict(settings.PERIOD_CHOICES), value=settings.get("activity_period_days")).classes("w-40").props("dense outlined")
         sport_select = ui.select({ALL_SPORTS: "All sports"}, value=ALL_SPORTS).classes("w-48").props("dense outlined")
     table = grid(display.ACTIVITY_COLUMNS, [], height="calc(100vh - 230px)")
 
     def render() -> None:
-        activities, hidden = services.listed_activities()
+        activities, hidden = services.listed_activities(period_select.value or 0)
         routes_by_id = {r.route_id: r for r in storage.load_routes()}
         sports = sorted({a.sport for a in activities})
         sport_select.set_options({ALL_SPORTS: "All sports", **{s: s.title() for s in sports}}, value=state["sport"] if state["sport"] in sports else ALL_SPORTS)
@@ -128,13 +129,19 @@ def main_page() -> None:
         table.options["rowData"] = grid_rows(rows, [{"_sport_color": SPORT_COLORS.get(a.sport, COLORS["fg"])} for a in shown])
         table.options["columnDefs"][2][":cellStyle"] = "params => ({color: params.data._sport_color})"
         table.update()
-        status.set_text(display.activities_status(len(shown), len(activities), hidden))
+        status.set_text(display.activities_status(len(shown), len(activities), hidden, period_select.value or 0))
 
     def on_sport(e) -> None:
         state["sport"] = e.value or ALL_SPORTS
         render()
 
     sport_select.on_value_change(on_sport)
+
+    def on_period(e) -> None:
+        settings.save({"activity_period_days": e.value or 0})  # the next start opens on it too
+        render()
+
+    period_select.on_value_change(on_period)
 
     def open_row(row: int | None) -> None:
         if row is not None and 0 <= row < len(state["shown"]):
@@ -204,6 +211,9 @@ def settings_page() -> None:
         for field in settings.FIELDS:
             if field.kind == "bool":
                 inputs[field.key] = ui.checkbox(field.label, value=values[field.key])
+            elif field.kind == "choice":
+                ui.label(field.label).classes("font-semibold mt-2")
+                inputs[field.key] = ui.select(dict(field.options), value=values[field.key]).classes("w-48").props("dense outlined")
             else:
                 ui.label(field.label).classes("font-semibold mt-2")
                 with ui.row().classes("gap-2"):
@@ -216,7 +226,7 @@ def settings_page() -> None:
         new = {}
         for field in settings.FIELDS:
             widget = inputs[field.key]
-            new[field.key] = widget.value if field.kind == "bool" else [s for s, box in widget.items() if box.value]
+            new[field.key] = widget.value if field.kind in ("bool", "choice") else [s for s, box in widget.items() if box.value]
         settings.save(new)
         notify(f"Settings saved to {storage.SETTINGS_PATH}")
         ui.navigate.back()
