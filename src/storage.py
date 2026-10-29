@@ -33,6 +33,7 @@ ATHLETE_PATH = DATA_DIR / "athlete.json"
 RECORDING_NAMES_PATH = DATA_DIR / "recording_names.json"
 TPV_ROUTES_PATH = DATA_DIR / "tpv_routes.json"
 PHYSICAL_LAPS_DIR = DATA_DIR / "physical_laps"
+ACTIVITY_REGIONS_PATH = DATA_DIR / "activity_regions.json"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -278,6 +279,15 @@ def load_physical_laps(activity_id: str, key: str, laps_dir: Path = PHYSICAL_LAP
 
 def save_physical_laps(activity_id: str, key: str, laps: list[Lap], laps_dir: Path = PHYSICAL_LAPS_DIR) -> None:
     _write_json(laps_dir / f"{activity_id}.json", {"key": key, "laps": [dataclasses.asdict(lap) for lap in laps]})
+
+
+def load_activity_regions(path: Path = ACTIVITY_REGIONS_PATH) -> dict:
+    """{"version": n, "regions": {activity id: [platform, world]}} — see services.route_regions."""
+    return _read_json(path, {"version": 0, "regions": {}})
+
+
+def save_activity_regions(data: dict, path: Path = ACTIVITY_REGIONS_PATH) -> None:
+    _write_json(path, data)
 
 
 def load_tpv_routes(path: Path = TPV_ROUTES_PATH) -> dict:

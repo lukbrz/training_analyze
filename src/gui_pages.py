@@ -795,6 +795,11 @@ class RoutesPage(Page):
         self.status = label("Routes", "status")
         self.rename_input = QLineEdit(placeholderText="New name")
         self.rename_input.returnPressed.connect(self.rename)
+        self.discipline_filter = QComboBox()
+        self.region_filter = QComboBox()
+        self.region_filter.setMinimumWidth(220)
+        for combo in (self.discipline_filter, self.region_filter):
+            combo.currentIndexChanged.connect(lambda _: self._render_routes())
         self.table = make_table(display.ROUTE_COLUMNS, stretch_column=0)
         self.table.cellActivated.connect(lambda row, _: self._open(row))
         self.table.currentCellChanged.connect(lambda row, *_: self._show_route(row))
@@ -803,6 +808,7 @@ class RoutesPage(Page):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addLayout(row_layout(self.discipline_filter, self.region_filter, stretch_index=1))
         left_layout.addLayout(row_layout(self.rename_input, button("Rename", self.rename), stretch_index=0))
         left_layout.addWidget(self.table, 1)
         right = QWidget()
@@ -827,10 +833,29 @@ class RoutesPage(Page):
 
     def _refresh(self) -> None:
         self.all_routes = storage.load_routes()
-        _, activities = storage.load_index()
-        self.grouped = display.grouped_routes(self.all_routes, activities)
-        fill_table(self.table, [display.route_row(r, n) for r, n in self.grouped])
-        self.status.setText(f"{len(self.grouped)} routes with 2+ activities — select one to see it on the map, Enter to list its activities")
+        self.listed = services.listed_routes()
+        disciplines, regions = display.route_filter_options(self.listed)
+        for combo, options in ((self.discipline_filter, disciplines), (self.region_filter, regions)):
+            current = combo.currentData() or display.ALL_ROUTES
+            combo.blockSignals(True)
+            combo.clear()
+            for value, text in options:
+                combo.addItem(text, value)
+            combo.setCurrentIndex(max(combo.findData(current), 0))
+            combo.blockSignals(False)
+        self._render_routes()
+
+    def _render_routes(self) -> None:
+        shown = display.filter_routes(
+            self.listed, self.discipline_filter.currentData() or display.ALL_ROUTES,
+            self.region_filter.currentData() or display.ALL_ROUTES,
+        )
+        # Rename looks routes up here; keep the Route objects that get saved.
+        by_id = {r.route_id: r for r in self.all_routes}
+        self.grouped = [(by_id.get(route.route_id, route), count) for route, count, _ in shown]
+        self.region_of = {route.route_id: region for route, _, region in self.listed}
+        fill_table(self.table, [display.route_row(r, n, region) for r, n, region in shown])
+        self.status.setText(f"{len(shown)} of {len(self.listed)} routes with 2+ activities — select one to see it on the map, Enter to list its activities")
         self._show_route(self.table.currentRow())
 
     def _show_route(self, row: int) -> None:
@@ -839,7 +864,7 @@ class RoutesPage(Page):
         route, count = self.grouped[row]
         points = [(lat, lon) for lat, lon in route.signature.points]
         self.map_caption.setText(
-            f"<b>{route.name}</b> · {route.sport} · {route.place or 'unknown place'} · "
+            f"<b>{route.name}</b> · {route.sport} · {self.region_of.get(route.route_id, route.place or 'unknown place')} · "
             f"{format_distance(route.signature.distance_m)} · {count} activities"
         )
         # The stored signature is a coarse 20-point outline: show it at once, then replace it with
@@ -893,14 +918,15 @@ class LeaderboardPage(Page):
         self.title = f"Leaderboard — {route.name}"
         self.route, self.client, self.highlight = route, client, highlight
         self.best_only = False
-        self.efforts: list = []
-        self.loop_m = None
+        self.kind = "loops"
+        self.board = None
         self.status = label(f"{route.name} — finding loops...", "status")
         self.table = make_table(display.LEADERBOARD_COLUMNS, stretch_column=8)
         self.table.cellActivated.connect(lambda row, _: self._open(row))
         self.layout_.addWidget(self.status)
         self.layout_.addWidget(self.table, 1)
         self.bind_back()
+        self.bind("w", "Loops / whole route", self.toggle_kind)
         self.bind("o", "Best per ride / all", self.toggle_best)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} efforts"))
         run_background(
@@ -911,21 +937,33 @@ class LeaderboardPage(Page):
     def focus_widget(self):
         return self.table
 
-    def _loaded(self, result) -> None:
-        self.efforts, self.loop_m = result
+    def _loaded(self, board) -> None:
+        self.board = board
+        self.kind = "loops" if board.loops else "routes"
         self._render()
 
     def _shown(self) -> list:
-        return leaderboard.best_per_activity(self.efforts) if self.best_only else self.efforts
+        if self.board is None:
+            return []
+        if self.kind == "routes":
+            return self.board.routes
+        return leaderboard.best_per_activity(self.board.loops) if self.best_only else self.board.loops
 
     def _render(self) -> None:
         shown = self._shown()
-        self.status.setText(display.leaderboard_status(self.route.name, self.loop_m, shown, self.best_only))
+        b = self.board
+        other = len(b.routes if self.kind == "loops" else b.loops) if b else 0
+        length = (b.loop_m if self.kind == "loops" else b.route_m) if b else None
+        self.status.setText(display.leaderboard_status(self.route.name, self.kind, length, shown, self.best_only, other))
         styles = [{"bold": True, "color": COLORS["yellow"]} if e.activity_id == self.highlight else {} for e in shown]
         fill_table(self.table, display.leaderboard_rows(shown, self.route.sport), styles, right_aligned={0, 1, 3, 4, 5})
 
     def toggle_best(self) -> None:
         self.best_only = not self.best_only
+        self._render()
+
+    def toggle_kind(self) -> None:
+        self.kind = "routes" if self.kind == "loops" else "loops"
         self._render()
 
     def _open(self, row: int) -> None:

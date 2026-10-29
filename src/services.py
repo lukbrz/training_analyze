@@ -15,6 +15,7 @@ import fit_parser
 import garmin_client
 import geocode
 import metrics
+import regions
 import routes
 import settings
 import storage
@@ -619,6 +620,7 @@ def sync_activities(client, progress: Progress = lambda _: None, full_history: b
     refresh_tpv_catalogue(progress)
     _route_merged_rides(activities, routes_list)
     name_tpv_routes(activities, routes_list)
+    fill_route_places(routes_list, progress)
     storage.save_index(last_synced_date, activities)
     if full_history and new_count:
         _fetch_history_stats(client, activities, progress)
@@ -709,6 +711,87 @@ def tpv_loops(activity: ActivitySummary) -> TpvLoops | None:
         return None
     laps, loop_m = result
     return TpvLoops(name, route is not None, loop_m, laps, recording_id)
+
+
+REGIONS_VERSION = 2
+PLACES_PER_SYNC = 150  # reverse-geocoding is 1 request/second (Nominatim's usage policy)
+
+
+def fill_route_places(routes_list: list[Route], progress: Progress = lambda _: None, limit: int = PLACES_PER_SYNC) -> int:
+    """Reverse-geocode routes whose place couldn't be looked up when they were created
+    (a batch per sync); returns how many got one."""
+    missing = [r for r in routes_list if not r.place and r.signature.points][:limit]
+    filled = 0
+    for n, route in enumerate(missing, start=1):
+        progress(f"Looking up route places {n}/{len(missing)}...")
+        lat, lon = route.signature.points[0]
+        route.place = geocode.reverse_geocode(lat, lon)
+        filled += route.place is not None
+    if filled:
+        storage.save_routes(routes_list)
+    return filled
+
+
+def _indoor(activity_id: str) -> bool:
+    """Whether a recording was made indoors / in a virtual world (its FIT sub-sport)."""
+    if not storage.has_fit(activity_id):
+        return False
+    try:
+        fit = storage.fit_path(activity_id).read_bytes()
+        return fit_parser.sub_sport(fit) in regions.INDOOR_SUB_SPORTS or "virtual" in fit_parser.recording_name(fit).lower()
+    except Exception:  # unreadable: assume outdoors
+        return False
+
+
+def route_regions(activities: list[ActivitySummary], routes_list: list[Route]) -> dict[str, str]:
+    """Each route's region label (regions.label: "Zwift · Watopia", "Outdoor · Bydgoszcz"),
+    the most common among its activities. Activities are classified once and cached."""
+    cache = storage.load_activity_regions()
+    if cache.get("version") != REGIONS_VERSION:
+        cache = {"version": REGIONS_VERSION, "regions": {}}
+    known = cache["regions"]
+    by_route = {r.route_id: r for r in routes_list}
+    names = storage.load_recording_names()
+    merged: dict[str, list[str]] = {}
+    for secondary, primary in storage.load_merge_ledger().items():
+        merged.setdefault(primary, []).append(secondary)
+    catalogue = storage.load_tpv_routes().get("routes") or []
+    changed = False
+    votes: dict[str, dict[str, int]] = {}
+    for a in activities:
+        route = by_route.get(a.route_id)
+        if route is None:
+            continue
+        if a.activity_id not in known:
+            others = merged.get(a.activity_id, [])
+            titles = [a.name] + [names[s] for s in others if s in names]
+            indoor = a.virtual or _indoor(a.activity_id) or any(_indoor(s) for s in others)
+            start = tuple(route.signature.points[0]) if route.signature.points else None
+            platform, world = regions.classify(titles, indoor, start, route.place, catalogue)
+            # A place-named world follows the route's place (filled in later, renamed...).
+            known[a.activity_id] = [platform, None if platform in (regions.OUTDOOR, regions.INDOOR) else world]
+            changed = True
+        platform, world = known[a.activity_id]
+        region = regions.label(platform, world or route.place)
+        votes.setdefault(route.route_id, {}).setdefault(region, 0)
+        votes[route.route_id][region] += 1
+    if changed:
+        storage.save_activity_regions(cache)
+    return {route_id: max(v, key=v.get) for route_id, v in votes.items()}
+
+
+def listed_routes() -> list[tuple[Route, int, str]]:
+    """The Routes screen's routes — those with 2+ activities, most used first — with their
+    activity count and region (route_regions)."""
+    import display  # imports services itself
+
+    _, activities = storage.load_index()
+    routes_list = storage.load_routes()
+    region_of = route_regions(activities, routes_list)
+    return [
+        (route, count, region_of.get(route.route_id, regions.label(regions.OUTDOOR, route.place)))
+        for route, count in display.grouped_routes(routes_list, activities)
+    ]
 
 
 def _route_merged_rides(activities: list[ActivitySummary], routes_list: list[Route]) -> None:

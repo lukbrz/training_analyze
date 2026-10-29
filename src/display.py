@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 
 import fit_parser
 import services
+import settings
 import training_load
 from models import (
     SWIM_SPORTS,
@@ -553,7 +554,9 @@ def compare_series(marked_laps: list[Lap], records, utc_offset, attr: str, x_mod
     return series
 
 
-ROUTE_COLUMNS = ("Name", "Sport", "Place", "Activities", "Distance")
+ROUTE_COLUMNS = ("Name", "Sport", "Region", "Activities", "Distance")
+ALL_ROUTES = "__all__"
+PLATFORM_PREFIX = "platform:"
 
 
 def grouped_routes(routes, activities: list[ActivitySummary]) -> list[tuple]:
@@ -567,8 +570,43 @@ def grouped_routes(routes, activities: list[ActivitySummary]) -> list[tuple]:
     return [(r, counts[r.route_id]) for r in sorted(grouped, key=lambda r: (-counts[r.route_id], r.name))]
 
 
-def route_row(route, count: int) -> tuple[str, ...]:
-    return (route.name, route.sport, route.place or "–", str(count), format_distance(route.signature.distance_m))
+def route_row(route, count: int, region: str = "") -> tuple[str, ...]:
+    return (route.name, route.sport, region or route.place or "–", str(count), format_distance(route.signature.distance_m))
+
+
+def route_discipline(route) -> str:
+    return settings.sport_group(route.sport)
+
+
+def route_filter_options(listed: list[tuple]) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """(discipline, region) choices for the Routes screen's filters, as (value, label) with
+    how many routes each holds; `listed`: services.listed_routes()."""
+    disciplines: dict[str, int] = {}
+    regions: dict[str, int] = {}
+    platforms: dict[str, int] = {}
+    for route, _, region in listed:
+        disciplines[route_discipline(route)] = disciplines.get(route_discipline(route), 0) + 1
+        regions[region] = regions.get(region, 0) + 1
+        platform = region.split(" · ")[0]
+        platforms[platform] = platforms.get(platform, 0) + 1
+    region_options = []
+    for platform in sorted(platforms):
+        # A whole platform first ("Zwift · all"), then its worlds / places.
+        region_options.append((PLATFORM_PREFIX + platform, f"{platform} · all ({platforms[platform]})"))
+        region_options += [(r, f"{r} ({n})") for r, n in sorted(regions.items()) if r.split(" · ")[0] == platform]
+    return (
+        [(ALL_ROUTES, "All disciplines")] + [(d, f"{d} ({n})") for d, n in sorted(disciplines.items())],
+        [(ALL_ROUTES, "All regions")] + region_options,
+    )
+
+
+def filter_routes(listed: list[tuple], discipline: str, region: str) -> list[tuple]:
+    return [
+        item for item in listed
+        if (discipline == ALL_ROUTES or route_discipline(item[0]) == discipline)
+        and (region == ALL_ROUTES or item[2] == region
+             or (region.startswith(PLATFORM_PREFIX) and item[2].split(" · ")[0] == region[len(PLATFORM_PREFIX):]))
+    ]
 
 
 # --- Structured stats for the graphical front ends (stat tiles) -----------------
@@ -859,11 +897,22 @@ def leaderboard_rows(efforts, sport: str) -> list[tuple[str, ...]]:
     ]
 
 
-def leaderboard_status(route_name: str, loop_m: float | None, efforts, best_only: bool) -> str:
+LEADERBOARD_KINDS = {"loops": "Loops", "routes": "Whole route"}
+
+
+def leaderboard_status(route_name: str, kind: str, length: float | None, efforts, best_only: bool, other_count: int) -> str:
+    """The leaderboard's caption: which board (loops / whole route), how many efforts, and
+    the keys switching board and filter."""
+    other = "routes" if kind == "loops" else "loops"
+    switch = f"w: {LEADERBOARD_KINDS[other].lower()} ({other_count})"
     if not efforts:
-        return f"{route_name}: no clean loops or passes yet"
+        return f"{route_name} — {LEADERBOARD_KINDS[kind].lower()}: none yet · {switch}"
     rides = len({e.activity_id for e in efforts})
-    what = "best loop of each ride" if best_only else f"{len(efforts)} efforts from {rides} ride(s)"
-    distance = f" of {format_distance(loop_m)}" if loop_m else ""
+    if kind == "loops":
+        what = "best loop of each ride" if best_only else f"{len(efforts)} loops from {rides} ride(s)"
+    else:
+        what = f"{len(efforts)} complete pass(es)"
+    distance = f" of {format_distance(length)}" if length else ""
     paused = " · * = paused inside, moving time shown" if any(e.paused_s >= 10 for e in efforts) else ""
-    return f"{route_name} — {what}{distance}, fastest first (moving time){paused} · o: best per ride / all"
+    best = " · o: best per ride / all" if kind == "loops" else ""
+    return f"{route_name} — {LEADERBOARD_KINDS[kind]}: {what}{distance}, fastest first (moving time){paused} · {switch}{best}"

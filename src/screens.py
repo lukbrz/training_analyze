@@ -1010,11 +1010,15 @@ class RoutesScreen(Screen):
         self.client = client
         self.all_routes: list[Route] = []
         self.routes_by_key: dict[str, Route] = {}
+        self.discipline_filter = display.ALL_ROUTES
+        self.region_filter = display.ALL_ROUTES
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Routes", id="routes_status")
         yield HorizontalGroup(
+            Select([("All disciplines", display.ALL_ROUTES)], value=display.ALL_ROUTES, allow_blank=False, id="discipline_select"),
+            Select([("All regions", display.ALL_ROUTES)], value=display.ALL_ROUTES, allow_blank=False, id="region_select"),
             Input(placeholder="New name", id="rename_input"),
             Button("Rename", id="rename_button"),
             id="rename_bar",
@@ -1033,14 +1037,36 @@ class RoutesScreen(Screen):
 
     def _refresh_table(self) -> None:
         self.all_routes = storage.load_routes()
-        _, activities = storage.load_index()
-        grouped = display.grouped_routes(self.all_routes, activities)
-        self.routes_by_key = {route.route_id: route for route, _ in grouped}
+        self.listed = services.listed_routes()
+        disciplines, regions = display.route_filter_options(self.listed)
+        for select_id, options, attr in (("#discipline_select", disciplines, "discipline_filter"), ("#region_select", regions, "region_filter")):
+            if getattr(self, attr) not in [v for v, _ in options]:
+                setattr(self, attr, display.ALL_ROUTES)
+            select = self.query_one(select_id, Select)
+            with select.prevent(Select.Changed):
+                select.set_options([(text, value) for value, text in options])
+                select.value = getattr(self, attr)
+        self._render_routes()
+
+    def _render_routes(self) -> None:
+        shown = display.filter_routes(self.listed, self.discipline_filter, self.region_filter)
+        # Rename / leaderboard / map look routes up here; keep the same Route objects.
+        by_id = {r.route_id: r for r in self.all_routes}
+        self.routes_by_key = {route.route_id: by_id.get(route.route_id, route) for route, _, _ in shown}
         table = self.query_one(DataTable)
         table.clear()
-        for route, count in grouped:
-            table.add_row(*display.route_row(route, count), key=route.route_id)
-        self.query_one("#routes_status", Static).update(f"{len(grouped)} routes with 2+ activities")
+        for route, count, region in shown:
+            table.add_row(*display.route_row(route, count, region), key=route.route_id)
+        self.query_one("#routes_status", Static).update(f"{len(shown)} of {len(self.listed)} routes with 2+ activities")
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "discipline_select":
+            self.discipline_filter = event.value
+        elif event.select.id == "region_select":
+            self.region_filter = event.value
+        else:
+            return
+        self._render_routes()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         route = self.routes_by_key.get(event.row_key.value) if event.row_key else None
@@ -1106,6 +1132,7 @@ class LeaderboardScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
+        Binding("w", "toggle_kind", "Loops / whole route"),
         Binding("o", "toggle_best", "Best per ride / all"),
         Binding("y", "copy", "Copy table"),
     ]
@@ -1116,8 +1143,8 @@ class LeaderboardScreen(Screen):
         self.client = client
         self.highlight = highlight
         self.best_only = False
-        self.efforts: list = []
-        self.loop_m: float | None = None
+        self.kind = "loops"
+        self.board: leaderboard.Board | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1135,22 +1162,30 @@ class LeaderboardScreen(Screen):
     @work(thread=True)
     def _load(self) -> None:
         status = self.query_one("#leaderboard_status", Static)
-        efforts, loop_m = leaderboard.route_leaderboard(
+        board = leaderboard.route_leaderboard(
             self.route.route_id, progress=lambda m: self.app.call_from_thread(status.update, m),
         )
-        self.app.call_from_thread(self._loaded, efforts, loop_m)
+        self.app.call_from_thread(self._loaded, board)
 
-    def _loaded(self, efforts: list, loop_m: float | None) -> None:
-        self.efforts, self.loop_m = efforts, loop_m
+    def _loaded(self, board: leaderboard.Board) -> None:
+        self.board = board
+        self.kind = "loops" if board.loops else "routes"
         self._render_board()
 
     def _shown(self) -> list:
-        return leaderboard.best_per_activity(self.efforts) if self.best_only else self.efforts
+        if self.board is None:
+            return []
+        if self.kind == "routes":
+            return self.board.routes
+        return leaderboard.best_per_activity(self.board.loops) if self.best_only else self.board.loops
 
     def _render_board(self) -> None:
         shown = self._shown()
+        b = self.board
+        other = len(b.routes if self.kind == "loops" else b.loops) if b else 0
+        length = (b.loop_m if self.kind == "loops" else b.route_m) if b else None
         self.query_one("#leaderboard_status", Static).update(
-            display.leaderboard_status(self.route.name, self.loop_m, shown, self.best_only)
+            display.leaderboard_status(self.route.name, self.kind, length, shown, self.best_only, other)
         )
         table = self.query_one(DataTable)
         table.clear()
@@ -1168,6 +1203,10 @@ class LeaderboardScreen(Screen):
 
     def action_toggle_best(self) -> None:
         self.best_only = not self.best_only
+        self._render_board()
+
+    def action_toggle_kind(self) -> None:
+        self.kind = "routes" if self.kind == "loops" else "loops"
         self._render_board()
 
     def action_copy(self) -> None:

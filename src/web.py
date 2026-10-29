@@ -567,32 +567,49 @@ def laps_page(activity_id: str) -> None:
 @ui.page("/routes")
 def routes_page() -> None:
     frame = Frame("Routes")
-    state = {"grouped": [], "routes": []}
+    state = {"grouped": [], "routes": [], "listed": [], "region_of": {}}
     status = ui.label("").classes("ta-status")
     with ui.row().classes("w-full no-wrap gap-4"):
         with ui.column().classes("gap-2").style("flex: 1 1 45%"):
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                discipline_select = ui.select({display.ALL_ROUTES: "All disciplines"}, value=display.ALL_ROUTES).classes("w-40").props("dense outlined")
+                region_select = ui.select({display.ALL_ROUTES: "All regions"}, value=display.ALL_ROUTES).classes("flex-grow").props("dense outlined")
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 rename_input = ui.input(placeholder="New name").classes("flex-grow").props("dense outlined")
                 ui.button("Rename", on_click=lambda: rename()).props("outline")
-            table = grid(display.ROUTE_COLUMNS, [], height="calc(100vh - 230px)")
+            table = grid(display.ROUTE_COLUMNS, [], height="calc(100vh - 280px)")
         with ui.column().classes("gap-2").style("flex: 1 1 55%"):
             caption = ui.html("")
             leaflet = ui.leaflet(center=(52.0, 19.0), zoom=12).classes("w-full").style("height: calc(100vh - 230px)")
 
     def refresh() -> None:
         state["routes"] = storage.load_routes()
-        _, activities = storage.load_index()
-        state["grouped"] = display.grouped_routes(state["routes"], activities)
-        table.options["rowData"] = grid_rows([display.route_row(r, n) for r, n in state["grouped"]])
+        state["listed"] = services.listed_routes()
+        disciplines, regions = display.route_filter_options(state["listed"])
+        for select, options in ((discipline_select, disciplines), (region_select, regions)):
+            values = [v for v, _ in options]
+            select.set_options(dict(options), value=select.value if select.value in values else display.ALL_ROUTES)
+        render_routes()
+
+    def render_routes() -> None:
+        shown = display.filter_routes(state["listed"], discipline_select.value or display.ALL_ROUTES, region_select.value or display.ALL_ROUTES)
+        # Rename looks routes up here; keep the Route objects that get saved.
+        by_id = {r.route_id: r for r in state["routes"]}
+        state["grouped"] = [(by_id.get(route.route_id, route), count) for route, count, _ in shown]
+        state["region_of"] = {route.route_id: region for route, _, region in state["listed"]}
+        table.options["rowData"] = grid_rows([display.route_row(r, n, region) for r, n, region in shown])
         table.update()
-        status.set_text(f"{len(state['grouped'])} routes with 2+ activities — click one to see it on the map, double-click to list its activities")
+        status.set_text(f"{len(shown)} of {len(state['listed'])} routes with 2+ activities — click one to see it on the map, double-click to list its activities")
+
+    discipline_select.on_value_change(lambda _: render_routes())
+    region_select.on_value_change(lambda _: render_routes())
 
     async def show(row: int) -> None:
         if not 0 <= row < len(state["grouped"]):
             return
         route, count = state["grouped"][row]
         caption.set_content(
-            f"<b>{route.name}</b> <span class='ta-status'>· {route.sport} · {route.place or 'unknown place'} · "
+            f"<b>{route.name}</b> <span class='ta-status'>· {route.sport} · {state['region_of'].get(route.route_id, route.place or 'unknown place')} · "
             f"{format_distance(route.signature.distance_m)} · {count} activities</span>"
         )
         points = [[lat, lon] for lat, lon in route.signature.points]
@@ -642,16 +659,23 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
     frame.bind_back()
     if route is None:
         return
-    state = {"efforts": [], "loop_m": None, "best_only": False}
+    state = {"board": None, "kind": "loops", "best_only": False}
     status = ui.label(f"{route.name} — finding loops...").classes("ta-status")
     table = grid(display.LEADERBOARD_COLUMNS, [], height="calc(100vh - 170px)")
 
     def shown() -> list:
-        return leaderboard.best_per_activity(state["efforts"]) if state["best_only"] else state["efforts"]
+        board = state["board"]
+        if board is None:
+            return []
+        if state["kind"] == "routes":
+            return board.routes
+        return leaderboard.best_per_activity(board.loops) if state["best_only"] else board.loops
 
     def render() -> None:
-        efforts = shown()
-        status.set_text(display.leaderboard_status(route.name, state["loop_m"], efforts, state["best_only"]))
+        efforts, board, kind = shown(), state["board"], state["kind"]
+        other = len(board.routes if kind == "loops" else board.loops) if board else 0
+        length = (board.loop_m if kind == "loops" else board.route_m) if board else None
+        status.set_text(display.leaderboard_status(route.name, kind, length, efforts, state["best_only"], other))
         table.options["rowData"] = grid_rows(display.leaderboard_rows(efforts, route.sport), [{"_mine": e.activity_id == highlight} for e in efforts])
         table.options[":getRowStyle"] = f"params => params.data._mine ? {{fontWeight: 600, color: '{COLORS['yellow']}'}} : {{}}"
         table.update()
@@ -660,17 +684,23 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
         state["best_only"] = not state["best_only"]
         render()
 
+    def toggle_kind() -> None:
+        state["kind"] = "routes" if state["kind"] == "loops" else "loops"
+        render()
+
     def open_row(row: int) -> None:
         efforts = shown()
         if 0 <= row < len(efforts):
             ui.navigate.to(f"/activity/{efforts[row].activity_id}")
 
     table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]))
+    frame.bind("w", "Loops / whole route", toggle_kind)
     frame.bind("o", "Best per ride / all", toggle)
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.LEADERBOARD_COLUMNS, display.leaderboard_rows(shown(), route.sport)), "leaderboard"))
     async def load() -> None:
         # The first time, finding loops on GPS-only activities takes a few seconds.
-        state["efforts"], state["loop_m"] = await run_with_progress(status, lambda progress: leaderboard.route_leaderboard(route_id, progress))
+        board = await run_with_progress(status, lambda progress: leaderboard.route_leaderboard(route_id, progress))
+        state["board"], state["kind"] = board, "loops" if board.loops else "routes"
         render()
 
     ui.timer(0.1, load, once=True)

@@ -447,6 +447,13 @@ def _stopped(a: RecordPoint, b: RecordPoint) -> bool:
     return b.distance_m - a.distance_m < STOPPED_SPEED_MPS * seconds and not b.power and not b.cadence
 
 
+def sub_sport(fit_bytes: bytes) -> str | None:
+    """A FIT file's sub-sport (e.g. "indoor_cycling", "virtual_activity", "treadmill") from
+    its sport message, which Garmin devices write near the start; None without one."""
+    sport = next(fitparse.FitFile(fit_bytes).get_messages("sport"), None)
+    return sport.get_value("sub_sport") if sport is not None else None
+
+
 def recording_name(fit_bytes: bytes) -> str:
     """What recorded a FIT file, for telling one recording of a session from another:
     "Edge 1040", "TrainingPeaks Virtual"... (from its file_id message, the first one)."""
@@ -690,6 +697,7 @@ LOOP_LENGTH_TOLERANCE = 0.15
 # Once the loop length is known, two lap boundaries must be at least this fraction of it
 # apart — which ignores a second pass near the anchor within the same lap.
 MIN_LOOP_GAP_FRACTION = 0.7
+ENDPOINT_RADIUS_FRACTION = 0.025
 # Relative width of the window in which return distances are counted as "the same".
 LOOP_LENGTH_WINDOW = 0.06
 LEAD_IN_LABEL, WAY_BACK_LABEL, OTHER_LABEL = "in", "out", "other"
@@ -761,6 +769,23 @@ def _loop_length(points: list[_TrackPoint], anchors: list[_TrackPoint], radius_m
     return window[len(window) // 2] if best_count >= 2 else None
 
 
+# Loops of one course are this close in length (GPS noise); laps further apart than this
+# aren't the same loop, however near the estimated loop length both are.
+SAME_LOOP_TOLERANCE = 0.03
+
+
+def _matching_loops(distances: list[float]) -> list[float]:
+    """The largest group of laps whose lengths all lie within SAME_LOOP_TOLERANCE of
+    each other."""
+    best: list[float] = []
+    ordered = sorted(distances)
+    for i, low in enumerate(ordered):
+        group = [d for d in ordered[i:] if d <= low * (1 + SAME_LOOP_TOLERANCE)]
+        if len(group) > len(best):
+            best = group
+    return best
+
+
 def detect_physical_laps(
     records: list[RecordPoint],
     offset: timedelta,
@@ -808,12 +833,30 @@ def detect_physical_laps(
     def is_loop(distance: float) -> bool:
         return abs(distance - loop_m) <= loop_m * LOOP_LENGTH_TOLERANCE
 
+    # A recording's start / finish counts as at the anchor a little further out than a pass
+    # does: a race's start and finish lines are often apart (Bydgoszcz: ~390 m on 19.4 km).
+    endpoint_radius = max(close_radius_m, loop_m * ENDPOINT_RADIUS_FRACTION)
+
+    def near_anchor(point: _TrackPoint, anchor: _TrackPoint) -> bool:
+        return math.hypot(point[1] - anchor[1], point[2] - anchor[2]) <= endpoint_radius
+
     best_score, best_visits, best_anchor = None, [], None
     gap = max(min_lap_distance_m, loop_m * MIN_LOOP_GAP_FRACTION)
     for anchor in anchors:
         visits = _anchor_visits(points, anchor, close_radius_m, min_lap_distance_m, gap)
         laps = [b - a for (_, a), (_, b) in zip(visits, visits[1:])]
-        score = (sum(map(is_loop, laps)), -sum(abs(d - loop_m) for d in laps))
+        # Starting / finishing at the anchor opens / closes a loop too.
+        if visits and near_anchor(points[0], anchor):
+            laps.insert(0, visits[0][1] - points[0][3])
+        if visits and near_anchor(points[-1], anchor):
+            laps.append(points[-1][3] - visits[-1][1])
+        loops = _matching_loops([d for d in laps if is_loop(d)])
+        # Most loops of (nearly) the same length; then the most equal; then the least
+        # deviation from the loop length. Counting any lap near the loop length instead lets
+        # a course that passes near its lap line before reaching it (a parallel road, a
+        # hairpin) win with one loop cut short and the next one long.
+        spread = (max(loops) - min(loops)) / loop_m if len(loops) > 1 else 0.0
+        score = (len(loops), -round(spread, 3), -sum(abs(d - loop_m) for d in laps))
         if best_score is None or score > best_score:
             best_score, best_visits, best_anchor = score, visits, anchor
     if best_score[0] < 2:
@@ -828,14 +871,9 @@ def detect_physical_laps(
     # A loop starts and ends at the anchor: the part before the first visit only counts as
     # one when the recording starts there, the part after the last only when it ends there
     # (otherwise e.g. part of a loop plus the way home could pass for a loop by its length).
-    _, ax, ay, _ = best_anchor
-
-    def at_anchor(point: _TrackPoint) -> bool:
-        return math.hypot(point[1] - ax, point[2] - ay) <= close_radius_m
-
     loops = [is_loop(lap.distance_m) for lap in laps]
-    loops[0] = loops[0] and at_anchor(points[0])
-    loops[-1] = loops[-1] and at_anchor(points[-1])
+    loops[0] = loops[0] and near_anchor(points[0], best_anchor)
+    loops[-1] = loops[-1] and near_anchor(points[-1], best_anchor)
     number = 0
     for k, lap in enumerate(laps):
         if loops[k]:
