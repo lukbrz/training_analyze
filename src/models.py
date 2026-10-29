@@ -6,6 +6,17 @@ PACE_SPORTS = {"running", "walking", "hiking"}
 SWIM_SPORTS = {"swimming"}
 
 
+UNKNOWN_SPORT = "other"
+
+
+def sport_name(value) -> str | None:
+    """A FIT sport as text: fitparse gives a sport code its profile doesn't name (newer
+    sports, e.g. Garmin's Stopwatch = 52) as a bare number — that becomes "other"."""
+    if value is None or isinstance(value, str):
+        return value
+    return UNKNOWN_SPORT
+
+
 @dataclass
 class ActivitySummary:
     activity_id: str

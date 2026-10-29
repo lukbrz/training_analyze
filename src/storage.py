@@ -5,7 +5,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-from models import ActivitySummary, Lap, RecordPoint, Route, RouteSignature, ZoneTime
+from models import UNKNOWN_SPORT, ActivitySummary, Lap, RecordPoint, Route, RouteSignature, ZoneTime, sport_name
 
 # Source lives in src/; user data (data/, workouts/, the Garmin session) stays at the project root.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -50,6 +50,8 @@ def load_index(path: Path = INDEX_PATH) -> tuple[str | None, list[ActivitySummar
         return None, []
     data = json.loads(path.read_text(encoding="utf-8"))
     activities = [ActivitySummary(**_filtered(ActivitySummary, a)) for a in data.get("activities", [])]
+    for a in activities:  # saved before unnamed FIT sport codes were turned into text
+        a.sport = sport_name(a.sport) or UNKNOWN_SPORT
     return data.get("last_synced_date"), activities
 
 
@@ -71,7 +73,10 @@ def load_laps(activity_id: str, laps_dir: Path = LAPS_DIR) -> list[Lap]:
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
-    return [Lap(**_filtered(Lap, lap)) for lap in data]
+    laps = [Lap(**_filtered(Lap, lap)) for lap in data]
+    for lap in laps:
+        lap.sport = sport_name(lap.sport)
+    return laps
 
 
 def save_laps(activity_id: str, laps: list[Lap], laps_dir: Path = LAPS_DIR) -> None:

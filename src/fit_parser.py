@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import fitparse
 
 import storage
-from models import ActivitySummary, Lap, RecordPoint
+from models import ActivitySummary, Lap, RecordPoint, sport_name
 
 INTERVAL_INTENSITIES = {"interval", "active"}
 SEMICIRCLE_TO_DEGREES = 180 / 2**31
@@ -45,7 +45,7 @@ def parse(
     if not sessions:
         raise ValueError(f"FIT file for activity {activity_id} has no session message")
     session = sessions[0]
-    session_sport = session.get_value("sport") or "other"
+    session_sport = sport_name(session.get_value("sport")) or "other"
 
     local_start = datetime.fromisoformat(start_time_local)
     offset = _utc_offset(session.get_value("start_time"), local_start)
@@ -88,7 +88,7 @@ def parse(
                 "total_ascent_m": lap_msg.get_value("total_ascent"),
                 "total_descent_m": lap_msg.get_value("total_descent"),
                 "intensity": lap_msg.get_value("intensity"),
-                "sport": lap_msg.get_value("sport") or session_sport,
+                "sport": sport_name(lap_msg.get_value("sport")) or session_sport,
             }
         )
 
@@ -262,7 +262,7 @@ def parse_records(fit_bytes: bytes) -> list[RecordPoint]:
     distance and interval phase-splitting work on them like on any other activity.
     """
     fitfile = fitparse.FitFile(fit_bytes)
-    session_sport = next((m.get_value("sport") for m in fitfile.get_messages("session")), None)
+    session_sport = sport_name(next((m.get_value("sport") for m in fitfile.get_messages("session")), None))
     records = []
     for rec in fitfile.get_messages("record"):
         timestamp = rec.get_value("timestamp")
