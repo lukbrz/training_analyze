@@ -21,6 +21,7 @@ Per week (from the daily TSS / CTL / ATL series):
 import statistics
 from dataclasses import dataclass
 
+import fit_parser
 import training_load as tl
 from models import ActivitySummary, RecordPoint
 
@@ -64,10 +65,16 @@ def _ratio(samples: list[tuple[float, float]]) -> float | None:
     return statistics.fmean(o for o, _ in samples) / hr if hr else None
 
 
+def moving(records: list[RecordPoint]) -> list[RecordPoint]:
+    """The records outside pauses (fit_parser.pause_mask)."""
+    return [r for r, paused in zip(records, fit_parser.pause_mask(records)) if not paused]
+
+
 def activity_metrics(activity: ActivitySummary, stats: dict | None, records: list[RecordPoint]) -> ActivityMetrics:
-    """EF and decoupling of one activity; `stats` is its Garmin list entry (for normalized
-    power, see garmin_client.activity_stats). Fields stay None when the data doesn't allow
-    them (no HR, no power on a ride, a sport they don't apply to)."""
+    """EF and decoupling of one activity, over its moving time; `stats` is its Garmin list
+    entry (for normalized power, see garmin_client.activity_stats). Fields stay None when the
+    data doesn't allow them (no HR, no power on a ride, a sport they don't apply to)."""
+    records = moving(records)
     family = tl.sport_family(activity.sport)
     out = ActivityMetrics()
     # A merged recording's summary can lack HR its stream has (e.g. a virtual ride whose
@@ -172,9 +179,14 @@ def grade_adjusted_speed(records: list[RecordPoint]) -> float | None:
 
 
 def segment_stats(records: list[RecordPoint], foot: bool) -> dict:
-    """Exact statistics of a stretch of the record stream (stopped samples — zero cadence
-    — left out of cadence and dynamics): HR avg/min/max, power avg and NP, cadence and, on
-    foot, running dynamics and grade-adjusted speed. Keys with no data are left out."""
+    """Exact statistics of a stretch of the record stream over its moving time (pauses —
+    fit_parser.pause_mask — left out; zero-cadence samples also left out of cadence and
+    dynamics): HR avg/min/max, power avg and NP, cadence and, on foot, running dynamics and
+    grade-adjusted speed, plus moving and paused seconds. Keys with no data are left out."""
+    elapsed = (records[-1].timestamp_utc - records[0].timestamp_utc).total_seconds() if len(records) > 1 else 0.0
+    mask = fit_parser.pause_mask(records)
+    paused_s = sum((b.timestamp_utc - a.timestamp_utc).total_seconds() for a, b, p in zip(records, records[1:], mask[1:]) if p)
+    all_records, records = records, [r for r, p in zip(records, mask) if not p]
     # Lap / split boundaries are interpolated samples, so values can be fractional: round HR.
     hr = [round(r.heart_rate) for r in records if r.heart_rate]
     power = [r.power for r in records if r.power is not None]
@@ -184,9 +196,14 @@ def segment_stats(records: list[RecordPoint], foot: bool) -> dict:
         "avg_power_w": _mean(power), "np_w": normalized_power(records),
         "cadence": _mean([r.cadence for r in moving]),
     }
+    out["moving_s"] = elapsed - paused_s
+    if paused_s:
+        out["paused_s"] = paused_s
     if foot:
+        gap = grade_adjusted_speed(all_records)
         out.update({
-            "gap_speed_mps": grade_adjusted_speed(records),
+            # GAP's distance over moving time, not elapsed
+            "gap_speed_mps": gap * elapsed / (elapsed - paused_s) if gap and elapsed > paused_s else gap,
             "ground_contact_ms": _mean([r.stance_time_ms for r in moving if r.stance_time_ms]),
             "vertical_oscillation_mm": _mean([r.vertical_oscillation_mm for r in moving if r.vertical_oscillation_mm]),
             "vertical_ratio_pct": _mean([r.vertical_ratio_pct for r in moving if r.vertical_ratio_pct]),

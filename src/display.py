@@ -5,7 +5,7 @@ and the GUIs render the same content. Plain Python — no UI toolkit imports her
 import math
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import fit_parser
 import services
@@ -697,10 +697,20 @@ def week_metrics_text(m) -> str:
     return "  ·  ".join(f"{s.label} {s.value}{(' ' + s.unit) if s.unit and s.value != '–' else ''}" for s in week_metric_stats(m))
 
 
-def activity_metric_stats(m) -> list[Stat]:
-    """Efficiency factor / aerobic decoupling tiles (see metrics.ActivityMetrics); empty when
-    neither applies."""
-    stats = []
+def pause_stat(pauses: list[tuple[datetime, float]], elapsed_s: float, utc_offset) -> Stat | None:
+    """Moving time, with the pauses (fit_parser.pauses) as its hint; None without pauses."""
+    if not pauses:
+        return None
+    paused = sum(s for _, s in pauses)
+    where = ", ".join(f"{format_duration(s)} at {(t + utc_offset):%H:%M}" for t, s in pauses[:3])
+    more = f" +{len(pauses) - 3} more" if len(pauses) > 3 else ""
+    return Stat("Moving time", format_duration(elapsed_s - paused), "", "accent", f"paused {where}{more}")
+
+
+def activity_metric_stats(m, pause: Stat | None = None) -> list[Stat]:
+    """Moving time (when paused) / efficiency factor / aerobic decoupling tiles (see
+    metrics.ActivityMetrics); empty when none applies."""
+    stats = [pause] if pause else []
     if m.efficiency_factor is not None:
         stats.append(Stat("Efficiency factor", f"{m.efficiency_factor:.2f}", m.ef_basis, "accent", "output per heartbeat"))
     if m.decoupling_pct is not None:
@@ -709,8 +719,11 @@ def activity_metric_stats(m) -> list[Stat]:
     return stats
 
 
-def activity_metrics_text(m) -> str:
-    return "  |  ".join(f"{s.label}: {s.value} {s.unit}".rstrip() for s in activity_metric_stats(m))
+def activity_metrics_text(m, pause: Stat | None = None) -> str:
+    return "  |  ".join(
+        f"{s.label}: {s.value} {s.unit}".rstrip() + (f" ({s.hint})" if s is pause else "")
+        for s in activity_metric_stats(m, pause)
+    )
 
 
 def week_strip_stats(view: services.TrainingWeekView) -> tuple[list[Stat], list[Stat], str]:
@@ -791,6 +804,7 @@ def lap_menu(row) -> list[MenuItem]:
         MenuItem("compare", "Compare intervals", "c"),
         MenuItem("phase_metrics", "Phase time / pace / power", "h"),
         MenuItem("physical_laps", "Re-detect loops", "p"),
+        MenuItem("leaderboard", "Route leaderboard", "b"),
         MenuItem("zones", "HR & power zones", "z"),
         MenuItem("copy", "Copy table", "y"),
     ]
@@ -819,3 +833,37 @@ def workout_menu(key: str | None, is_week: bool) -> list[MenuItem]:
         MenuItem("toggle_week", "Expand / collapse week", "x", is_week),
         MenuItem("refresh", "Rescan folder", "r"),
     ]
+
+
+# --- Route leaderboards -----------------------------------------------------------------
+
+LEADERBOARD_COLUMNS = ("#", "Time", "Pace/Speed", "Avg power", "W/kg", "Avg HR", "Date", "Loop", "Activity")
+
+
+def leaderboard_rows(efforts, sport: str) -> list[tuple[str, ...]]:
+    """One row per effort (leaderboard.Effort), fastest first; a time over a pause is
+    moving time, marked with *."""
+    return [
+        (
+            str(n),
+            format_duration(e.duration_s) + (" *" if e.paused_s >= 10 else ""),
+            format_speed_or_pace(sport, e.speed_mps),
+            format_power(e.power_w),
+            f"{e.w_per_kg:.2f}" if e.w_per_kg else "–",
+            format_hr(round(e.hr) if e.hr else None),
+            e.date,
+            "whole route" if e.loop == "whole" else f"loop {e.loop}",
+            e.title,
+        )
+        for n, e in enumerate(efforts, start=1)
+    ]
+
+
+def leaderboard_status(route_name: str, loop_m: float | None, efforts, best_only: bool) -> str:
+    if not efforts:
+        return f"{route_name}: no clean loops or passes yet"
+    rides = len({e.activity_id for e in efforts})
+    what = "best loop of each ride" if best_only else f"{len(efforts)} efforts from {rides} ride(s)"
+    distance = f" of {format_distance(loop_m)}" if loop_m else ""
+    paused = " · * = paused inside, moving time shown" if any(e.paused_s >= 10 for e in efforts) else ""
+    return f"{route_name} — {what}{distance}, fastest first (moving time){paused} · o: best per ride / all"

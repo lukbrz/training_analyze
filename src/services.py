@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+import re
 import uuid
 
 import dedupe
@@ -17,6 +18,7 @@ import metrics
 import routes
 import settings
 import storage
+import tpv
 import training_load as tl
 import workouts
 from models import ActivitySummary, Route
@@ -406,7 +408,7 @@ def unlink(item: tl.WeekItem | None) -> str:
 # --- Activity sync / reprocess -------------------------------------------------
 
 
-def assign_route(activity_id: str, fit_bytes: bytes, sport: str, routes_list: list[Route]) -> str | None:
+def assign_route(activity_id: str, fit_bytes: bytes | None, sport: str, routes_list: list[Route]) -> str | None:
     """Compute an activity's route_id, matching against `routes_list` (mutated in place —
     a newly created route is appended and persisted immediately, so a later activity in the
     same sync/reprocess run can match it). Returns None if there isn't enough GPS data."""
@@ -424,7 +426,7 @@ def assign_route(activity_id: str, fit_bytes: bytes, sport: str, routes_list: li
 
 
 def merge_duplicates(
-    activities: list[ActivitySummary], recompute_existing: bool
+    activities: list[ActivitySummary], recompute_existing: bool, routes_list: list[Route] | None = None,
 ) -> tuple[list[ActivitySummary], int]:
     """Detect activities that are the same physical session recorded by two devices and
     fold each into its primary (see dedupe.py) — filling in HR/power/GPS coverage the
@@ -495,6 +497,9 @@ def merge_duplicates(
         if len(streams) >= 2:
             merged_records = dedupe.merge_records(streams, geo_source)
             storage.save_merged_records(primary_id, merged_records)
+            if primary.route_id is None and routes_list is not None:
+                # A bike computer on a trainer has no GPS; a virtual ride's merged in has.
+                primary.route_id = assign_route(primary_id, None, primary.sport, routes_list)
             if geo_source not in (None, 0):
                 # The primary's device laps carry its own (trainer-estimated) distance.
                 laps = storage.load_laps(primary_id)
@@ -561,6 +566,7 @@ def sync_activities(client, progress: Progress = lambda _: None, full_history: b
     progress(f"Fetching activity list since {start_date}...")
     try:
         raw_activities = garmin_client.list_activities(client, start_date, end_date)
+        _remember_names(raw_activities)
     except garmin_client.GarminConnectTooManyRequestsError:
         return "Rate limited by Garmin — try syncing again later."
     except (garmin_client.GarminConnectAuthenticationError, garmin_client.GarminConnectConnectionError) as e:
@@ -604,7 +610,15 @@ def sync_activities(client, progress: Progress = lambda _: None, full_history: b
         storage.save_index(last_synced_date, activities)
 
     progress("Checking for duplicate recordings...")
-    activities, merged_count = merge_duplicates(activities, recompute_existing=False)
+    activities, merged_count = merge_duplicates(activities, recompute_existing=False, routes_list=routes_list)
+    storage.save_index(last_synced_date, activities)
+    try:
+        backfill_recording_names(client, activities, progress)
+    except Exception:  # names only label TPV routes; the next sync tries again
+        pass
+    refresh_tpv_catalogue(progress)
+    _route_merged_rides(activities, routes_list)
+    name_tpv_routes(activities, routes_list)
     storage.save_index(last_synced_date, activities)
     if full_history and new_count:
         _fetch_history_stats(client, activities, progress)
@@ -620,6 +634,107 @@ def sync_activities(client, progress: Progress = lambda _: None, full_history: b
     if sets_failed:
         message += f" ({sets_failed} not fetched — sync again later)"
     return message
+
+
+# --- Virtual rides (TrainingPeaks Virtual) ------------------------------------------
+
+
+def _remember_names(raw_activities: list[dict]) -> None:
+    names = storage.load_recording_names()
+    names.update({str(r["activityId"]): r["activityName"] for r in raw_activities if r.get("activityName")})
+    storage.save_recording_names(names)
+
+
+def backfill_recording_names(client, activities: list[ActivitySummary], progress: Progress = lambda _: None) -> None:
+    """Fetch Garmin's titles of merged-in recordings (and virtual rides) not known yet —
+    one activity-list request over their dates."""
+    names = storage.load_recording_names()
+    by_id = {a.activity_id: a for a in activities}
+    dates = [by_id[p].start_time_local[:10] for s, p in storage.load_merge_ledger().items() if s not in names and p in by_id]
+    dates += [a.start_time_local[:10] for a in activities if a.virtual and a.activity_id not in names]
+    if dates:
+        progress("Fetching names of merged recordings...")
+        _remember_names(garmin_client.list_activities(client, min(dates), max(dates)))
+
+
+def refresh_tpv_catalogue(progress: Progress = lambda _: None, force: bool = False) -> list[dict]:
+    """TPV's route catalogue, re-fetched from its hub when older than a month (or `force`);
+    the cached copy when the hub can't be reached."""
+    data = storage.load_tpv_routes()
+    fetched = data.get("fetched")
+    if force or not fetched or date.fromisoformat(fetched) < date.today() - timedelta(days=tpv.CATALOGUE_MAX_AGE_DAYS):
+        progress("Fetching the TrainingPeaks Virtual route list...")
+        try:
+            data = {"fetched": date.today().isoformat(), "routes": tpv.fetch_catalogue()}
+            storage.save_tpv_routes(data)
+        except Exception:  # optional: loops of uncatalogued routes are inferred anyway
+            pass
+    return data.get("routes") or []
+
+
+def tpv_recording(activity: ActivitySummary) -> tuple[str, str] | None:
+    """(activity id, Garmin title) of the TrainingPeaks Virtual recording of an activity —
+    itself, or a recording merged into it — or None."""
+    if tpv.route_name(activity.name):
+        return activity.activity_id, activity.name
+    names = storage.load_recording_names()
+    for secondary, primary in storage.load_merge_ledger().items():
+        if primary == activity.activity_id and tpv.route_name(names.get(secondary)):
+            return secondary, names[secondary]
+    if activity.virtual:
+        return activity.activity_id, activity.name
+    return None
+
+
+@dataclass
+class TpvLoops:
+    route: str | None  # TPV route name, None when the title doesn't say
+    catalogued: bool  # the route is in the hub's catalogue (loop length known, not inferred)
+    loop_m: float
+    laps: list  # the TPV recording's laps labelled in / 1..N / out (tpv.route_loops)
+    recording_id: str
+
+
+def tpv_loops(activity: ActivitySummary) -> TpvLoops | None:
+    """The loops of a TPV ride's route, from TPV's own laps (it laps at the route's lap
+    line); None for other activities or when no loop length can be told."""
+    recording = tpv_recording(activity)
+    if recording is None:
+        return None
+    recording_id, title = recording
+    name = tpv.route_name(title)
+    route = tpv.find_route(name, storage.load_tpv_routes().get("routes") or [])
+    result = tpv.route_loops(storage.load_laps(recording_id), route)
+    if result is None:
+        return None
+    laps, loop_m = result
+    return TpvLoops(name, route is not None, loop_m, laps, recording_id)
+
+
+def _route_merged_rides(activities: list[ActivitySummary], routes_list: list[Route]) -> None:
+    """Give a route to merged rides that have none (a trainer ride whose GPS comes from the
+    virtual ride merged in, merged before routes were taken from the merged stream)."""
+    merged = set(storage.load_merge_ledger().values())
+    for a in activities:
+        if a.route_id is None and a.activity_id in merged and storage.has_merged_records(a.activity_id):
+            a.route_id = assign_route(a.activity_id, None, a.sport, routes_list)
+
+
+def name_tpv_routes(activities: list[ActivitySummary], routes_list: list[Route]) -> None:
+    """Name still-default routes ("Route 12") after the TPV route ridden on them."""
+    by_id = {r.route_id: r for r in routes_list}
+    changed = False
+    for a in activities:
+        route = by_id.get(a.route_id)
+        if route is None or not re.fullmatch(r"Route \d+", route.name):
+            continue
+        recording = tpv_recording(a)
+        name = tpv.route_name(recording[1]) if recording else None
+        if name:
+            route.name = f"{name} (TPV)"
+            changed = True
+    if changed:
+        storage.save_routes(routes_list)
 
 
 def _fetch_history_stats(client, activities: list[ActivitySummary], progress: Progress) -> None:
@@ -678,7 +793,8 @@ def reprocess_activities(progress: Progress = lambda _: None) -> str:
         reprocessed += 1
 
     progress("Re-merging duplicate recordings...")
-    merged_activities, merged_count = merge_duplicates(list(by_id.values()), recompute_existing=True)
+    merged_activities, merged_count = merge_duplicates(list(by_id.values()), recompute_existing=True, routes_list=routes_list)
+    name_tpv_routes(merged_activities, routes_list)
     storage.save_index(last_synced_date, merged_activities)
 
     message = f"Reprocessed {reprocessed} activities"

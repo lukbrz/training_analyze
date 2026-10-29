@@ -19,6 +19,7 @@ import garmin_client
 import services
 import settings
 import storage
+import leaderboard
 import training_export
 import training_load
 import workout_library
@@ -435,7 +436,7 @@ class LapsScreen(ContextMenuMixin, Screen):
     MENU_ACTIONS = {
         "toggle_interval": "toggle_interval", "split_intervals": "split_intervals",
         "toggle_filter": "toggle_interval_filter", "compare": "compare", "phase_metrics": "phase_metrics",
-        "physical_laps": "physical_laps", "zones": "zones", "copy": "copy",
+        "physical_laps": "physical_laps", "zones": "zones", "copy": "copy", "leaderboard": "leaderboard",
     }
 
     CSS = """
@@ -472,6 +473,7 @@ class LapsScreen(ContextMenuMixin, Screen):
         Binding("f", "toggle_interval_filter", "Interval-only"),
         Binding("h", "phase_metrics", "Phase time/pace/power"),
         Binding("t", "strength_sets", "Strength sets"),
+        Binding("b", "leaderboard", "Route leaderboard"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -534,7 +536,7 @@ class LapsScreen(ContextMenuMixin, Screen):
         self.track_layers = layers
         self._draw_track()
         if self.session.records is not None:
-            extra = display.activity_metrics_text(self.session.advanced_metrics())
+            extra = display.activity_metrics_text(self.session.advanced_metrics(), self.session.pause_stat())
             if extra:
                 self.query_one("#activity_summary", Static).update(f"{self.session.summary_text()}\n{extra}")
 
@@ -666,6 +668,13 @@ class LapsScreen(ContextMenuMixin, Screen):
 
     def action_zones(self) -> None:
         self.app.push_screen(ZonesScreen(self.activity, self.client))
+
+    def action_leaderboard(self) -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == self.activity.route_id), None)
+        if route is None:
+            self.notify("This activity has no route (no GPS track) — sync or reprocess to match one", severity="warning")
+            return
+        self.app.push_screen(LeaderboardScreen(route, self.client, self.activity.activity_id))
 
     def action_strength_sets(self) -> None:
         if not services.is_strength(self.activity):
@@ -992,6 +1001,7 @@ class RoutesScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back", priority=True),
         Binding("e", "rename", "Rename route"),
+        Binding("b", "leaderboard", "Leaderboard"),
     ]
 
 
@@ -1077,6 +1087,92 @@ class RoutesScreen(Screen):
         route = self.routes_by_key.get(event.row_key.value)
         if route is not None:
             self.app.push_screen(RouteActivitiesScreen(route, self.client))
+
+    def action_leaderboard(self) -> None:
+        table = self.query_one(DataTable)
+        if not table.row_count:
+            return
+        route = self.routes_by_key.get(table.coordinate_to_cell_key((table.cursor_row, 0)).row_key.value)
+        if route is not None:
+            self.app.push_screen(LeaderboardScreen(route, self.client))
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class LeaderboardScreen(Screen):
+    """A route's personal leaderboard (leaderboard.route_leaderboard): the athlete's loops —
+    or whole passes — of it, fastest first; `highlight` (an activity id) shows bold."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("o", "toggle_best", "Best per ride / all"),
+        Binding("y", "copy", "Copy table"),
+    ]
+
+    def __init__(self, route: Route, client, highlight: str | None = None) -> None:
+        super().__init__()
+        self.route = route
+        self.client = client
+        self.highlight = highlight
+        self.best_only = False
+        self.efforts: list = []
+        self.loop_m: float | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"{self.route.name} — finding loops...", id="leaderboard_status")
+        yield DataTable(id="leaderboard_table")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one(DataTable)
+        table.cursor_type = "row"
+        table.add_columns(*display.LEADERBOARD_COLUMNS)
+        table.focus()
+        self._load()
+
+    @work(thread=True)
+    def _load(self) -> None:
+        status = self.query_one("#leaderboard_status", Static)
+        efforts, loop_m = leaderboard.route_leaderboard(
+            self.route.route_id, progress=lambda m: self.app.call_from_thread(status.update, m),
+        )
+        self.app.call_from_thread(self._loaded, efforts, loop_m)
+
+    def _loaded(self, efforts: list, loop_m: float | None) -> None:
+        self.efforts, self.loop_m = efforts, loop_m
+        self._render_board()
+
+    def _shown(self) -> list:
+        return leaderboard.best_per_activity(self.efforts) if self.best_only else self.efforts
+
+    def _render_board(self) -> None:
+        shown = self._shown()
+        self.query_one("#leaderboard_status", Static).update(
+            display.leaderboard_status(self.route.name, self.loop_m, shown, self.best_only)
+        )
+        table = self.query_one(DataTable)
+        table.clear()
+        for effort, row in zip(shown, display.leaderboard_rows(shown, self.route.sport)):
+            style = f"bold {COLORS['yellow']}" if effort.activity_id == self.highlight else ""
+            table.add_row(*(Text(v, style=style) for v in row))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        shown = self._shown()
+        if 0 <= event.cursor_row < len(shown):
+            _, activities = storage.load_index()
+            activity = next((a for a in activities if a.activity_id == shown[event.cursor_row].activity_id), None)
+            if activity is not None:
+                self.app.push_screen(activity_screen(activity, self.client))
+
+    def action_toggle_best(self) -> None:
+        self.best_only = not self.best_only
+        self._render_board()
+
+    def action_copy(self) -> None:
+        table = self.query_one(DataTable)
+        _copy_to_clipboard(self, _table_as_tsv(table), f"{table.row_count} efforts")
 
     def action_back(self) -> None:
         self.app.pop_screen()

@@ -30,6 +30,9 @@ EXPORTS_DIR = BASE_DIR / "exports"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 EXERCISE_SETS_DIR = DATA_DIR / "exercise_sets"
 ATHLETE_PATH = DATA_DIR / "athlete.json"
+RECORDING_NAMES_PATH = DATA_DIR / "recording_names.json"
+TPV_ROUTES_PATH = DATA_DIR / "tpv_routes.json"
+PHYSICAL_LAPS_DIR = DATA_DIR / "physical_laps"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
 
@@ -252,6 +255,38 @@ def load_settings(path: Path = SETTINGS_PATH) -> dict:
 
 def save_settings(values: dict, path: Path = SETTINGS_PATH) -> None:
     _write_json(path, values)
+
+
+def load_recording_names(path: Path = RECORDING_NAMES_PATH) -> dict[str, str]:
+    """Garmin's title of each activity, by id — kept for recordings merged into another
+    (dedupe), whose own index entry is gone (e.g. "TrainingPeaks Virtual - Island Coasts")."""
+    return _read_json(path, {})
+
+
+def save_recording_names(names: dict[str, str], path: Path = RECORDING_NAMES_PATH) -> None:
+    _write_json(path, names)
+
+
+def load_physical_laps(activity_id: str, key: str, laps_dir: Path = PHYSICAL_LAPS_DIR) -> list[Lap] | None:
+    """Loops detected on an activity's GPS track (fit_parser.detect_physical_laps), cached
+    for leaderboards: None unless cached for exactly `key` (its inputs); [] = none found."""
+    data = _read_json(laps_dir / f"{activity_id}.json", None)
+    if not data or data.get("key") != key:
+        return None
+    return [Lap(**_filtered(Lap, lap)) for lap in data["laps"]]
+
+
+def save_physical_laps(activity_id: str, key: str, laps: list[Lap], laps_dir: Path = PHYSICAL_LAPS_DIR) -> None:
+    _write_json(laps_dir / f"{activity_id}.json", {"key": key, "laps": [dataclasses.asdict(lap) for lap in laps]})
+
+
+def load_tpv_routes(path: Path = TPV_ROUTES_PATH) -> dict:
+    """{"fetched": date, "routes": tpv.parse_catalogue output}."""
+    return _read_json(path, {"fetched": None, "routes": []})
+
+
+def save_tpv_routes(data: dict, path: Path = TPV_ROUTES_PATH) -> None:
+    _write_json(path, data)
 
 
 def load_athlete(path: Path = ATHLETE_PATH) -> dict:

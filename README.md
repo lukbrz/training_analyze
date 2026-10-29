@@ -198,6 +198,12 @@ Past plans move to `workouts/archive/` automatically (see Settings). Nothing is 
 
 **Planning with an AI assistant:** give an AI assistant (ChatGPT, Claude, …) the contents of `src/workout_schema.json` and ask it for workouts that follow it. A whole week can come as one `.zip` with one `.json` per workout. Drop the zip into `workouts/`; the app unpacks it and shows it as a collapsible week.
 
+### Pauses, virtual rides and route leaderboards
+
+- **Pauses:** a stop of 10 s or more (no movement, power or cadence) or a gap in the recording counts as a pause. Computed laps, splits and loops, efficiency factor, decoupling and the export use moving time. The activity shows its moving time and where it paused.
+- **A ride recorded twice** (e.g. on your Edge and in TrainingPeaks Virtual) shows each device's laps in its own LAPS section, and you can mark intervals in either. TPV laps at the route's lap line, so for a TPV ride the PHYSICAL section is the route's loops: lead-in, loop 1…N and the way out. The route comes from Garmin's title ("TrainingPeaks Virtual - Island Coasts"), and Sync names the route after it. Loop lengths come from the [TPV hub](https://tpvirtualhub.com/map) route list (fetched at most monthly) or, for other worlds, from the repeated lap distance.
+- **Leaderboard (`b`)** on the Routes screen or in an activity: your own loops of that route (or whole passes, for routes ridden or run once through), fastest first by moving time, with pace/speed, power, W/kg on the day and HR. `o` switches to the best loop per ride.
+
 ### Right-click menus
 
 In the desktop and web apps, and in the terminal app if it gets mouse clicks, right-click a row in the activity list, laps, calendar or workouts list for its actions: move or cancel a planned workout, link a plan with an activity, mark an interval, open the map, upload a week, and so on. Each entry shows its key. Entries that don't apply to that row are greyed out (desktop/web) or left out (terminal). In the calendar, double-click or Enter on a row opens its activity.

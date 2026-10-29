@@ -16,6 +16,7 @@ from datetime import timedelta
 import display
 import fit_parser
 import metrics
+import services
 import settings
 import storage
 from models import ActivitySummary, Lap, format_split_value, parse_split_value
@@ -27,6 +28,24 @@ SPLIT_HELP = "Split size: 400 (metres), 1.5km, or a time like 60s, 1m, 1m30s, 1:
 # their plain number).
 DEVICE, SPLIT, PHYSICAL = "device", "split", "physical"
 INTERVAL_LABEL_PREFIX = {DEVICE: "", SPLIT: "S", PHYSICAL: "P"}
+# Another recording of the same session (merged as a duplicate, see dedupe): its laps are
+# source "device:<its activity id>", prefixed V (a virtual-ride app) or R among intervals.
+OTHER_DEVICE = "device:"
+
+
+def _prefix(source: str, virtual: bool = False) -> str:
+    if source.startswith(OTHER_DEVICE):
+        return "V" if virtual else "R"
+    return INTERVAL_LABEL_PREFIX[source]
+
+
+@dataclass
+class Recording:
+    """One device's recording of the activity, with its own laps (marks saved per file)."""
+    activity_id: str
+    name: str
+    laps: list[Lap]
+    virtual: bool = False
 
 
 class LapsError(Exception):
@@ -69,12 +88,21 @@ class LapsSession:
         self.activity = activity
         self.multisport = activity.sport == fit_parser.MULTISPORT
         self.device_laps: list[Lap] = storage.load_laps(activity.activity_id)
+        self.primary_name = _recording_name(activity.activity_id)
+        # The session's other recordings (e.g. a TrainingPeaks Virtual ride beside the bike
+        # computer's), each shown as its own LAPS section.
+        self.other_recordings = _other_recordings(activity.activity_id)
         self.split_laps: list[Lap] | None = None  # the LAPS section's split, when one is set
         self.split_name = ""
         self.physical_laps: list[Lap] | None = None
         # "pending" until detection has run, then "found", "none" or "no GPS"; "off" when
         # it doesn't run on open (settings) until p is pressed
         self.physical_status = "pending" if settings.get("auto_detect_physical_laps") else "off"
+        # A TrainingPeaks Virtual ride's loops come from TPV's own laps (it laps at the
+        # route's lap line) — exact, and no GPS loop detection needed.
+        self.tpv = services.tpv_loops(activity)
+        if self.tpv is not None:
+            self.physical_laps, self.physical_status = self.tpv.laps, "found"
         # (source, lap_index) -> phase splits of that (marked) lap
         self.interval_splits: dict[tuple[str, int], list[Lap]] = {}
         self.show_intervals_only = False
@@ -102,6 +130,7 @@ class LapsSession:
 
     def _sources(self) -> list[tuple[str, list[Lap]]]:
         sources = [(DEVICE, self.device_laps)]
+        sources += [(OTHER_DEVICE + r.activity_id, r.laps) for r in self.other_recordings]
         if self.split_laps is not None:
             sources.append((SPLIT, self.split_laps))
         if self.physical_laps:
@@ -154,11 +183,16 @@ class LapsSession:
         interval-only filter on, only the INTERVALS section is shown."""
         marked = self._marked()
         rows = [self._header("intervals", "INTERVALS", f"{len(marked)} marked" if marked else "none — m marks a lap")]
-        rows += self._lap_rows("intervals", marked, _interval_label)
+        virtual = {OTHER_DEVICE + r.activity_id for r in self.other_recordings if r.virtual}
+        rows += self._lap_rows("intervals", marked, lambda source, lap: _interval_label(source, lap, source in virtual))
         if not self.show_intervals_only:
             source = SPLIT if self.split_laps is not None else DEVICE
-            rows.append(self._header("laps", "LAPS", self.split_name or "device"))
+            rows.append(self._header("laps", "LAPS", self.split_name or self.primary_name))
             rows += self._lap_rows("laps", [(source, lap) for lap in self.current_laps], _plain_label)
+            for recording in self.other_recordings:
+                section = f"laps:{recording.activity_id}"
+                rows.append(self._header(section, "LAPS", recording.name))
+                rows += self._lap_rows(section, [(OTHER_DEVICE + recording.activity_id, lap) for lap in recording.laps], _plain_label)
             note = {
                 "pending": "detecting...", "none": "none found", "no GPS": "no GPS track", "off": "p finds them",
                 "found": self._physical_note(),
@@ -172,7 +206,10 @@ class LapsSession:
         laps = self.physical_laps or []
         loops = sum(1 for lap in laps if (lap.label or "").isdigit())
         extras = "/".join(lap.label for lap in laps if lap.label in (fit_parser.LEAD_IN_LABEL, fit_parser.WAY_BACK_LABEL))
-        return f"{loops} loops" + (f" + {extras}" if extras else "")
+        note = f"{loops} loop{'s' if loops != 1 else ''}" + (f" + {extras}" if extras else "")
+        if self.tpv is not None and laps is self.tpv.laps:
+            note = f"{self.tpv.route or 'TPV route'} · {note} (TPV laps)"
+        return note
 
     def row(self, row_index: int) -> LapRow | None:
         """A displayed row (as of the last rows() call); None when out of range."""
@@ -244,6 +281,9 @@ class LapsSession:
             self.interval_splits.pop((row.source, lap.lap_index), None)
         if row.source == DEVICE:
             storage.save_laps(self.activity.activity_id, self.device_laps)
+        elif row.source.startswith(OTHER_DEVICE):
+            recording = next(r for r in self.other_recordings if OTHER_DEVICE + r.activity_id == row.source)
+            storage.save_laps(recording.activity_id, recording.laps)
         # Marking adds a row to (unmarking removes one from) the INTERVALS section above, so
         # follow the lap; a lap unmarked in the INTERVALS section just leaves it.
         if row.section != "intervals":
@@ -363,6 +403,14 @@ class LapsSession:
         _, stats = storage.load_activity_stats()
         return metrics.activity_metrics(self.activity, stats.get(self.activity.activity_id), self.records or [])
 
+    def pause_stat(self) -> display.Stat | None:
+        """Moving time and where the pauses were; records must be loaded."""
+        records = self.records or []
+        if len(records) < 2:
+            return None
+        elapsed = (records[-1].timestamp_utc - records[0].timestamp_utc).total_seconds()
+        return display.pause_stat(fit_parser.pauses(records), elapsed, self.utc_offset or timedelta())
+
     def compare_inputs(self) -> tuple[list[Lap], list[fit_parser.RecordPoint], timedelta]:
         marked = self.marked_laps()
         if len(marked) < 2:
@@ -374,11 +422,30 @@ def _plain_label(source: str, lap: Lap) -> str:
     return lap.label or str(lap.lap_index)
 
 
-def _interval_label(source: str, lap: Lap) -> str:
+def _recording_name(activity_id: str) -> str:
+    path = storage.fit_path(activity_id)
+    try:
+        return fit_parser.recording_name(path.read_bytes()) if path.exists() else "device"
+    except Exception:  # an unreadable file just goes unnamed
+        return "device"
+
+
+def _other_recordings(activity_id: str) -> list[Recording]:
+    """The activity's merged-in duplicate recordings that have laps of their own."""
+    out = []
+    for secondary_id, primary_id in storage.load_merge_ledger().items():
+        laps = storage.load_laps(secondary_id) if primary_id == activity_id else []
+        if laps:
+            name = _recording_name(secondary_id)
+            out.append(Recording(secondary_id, name, laps, virtual="virtual" in name.lower()))
+    return out
+
+
+def _interval_label(source: str, lap: Lap, virtual: bool = False) -> str:
     """A marked lap's label among the intervals: its source's prefix, then its own label
-    ("P3", "S2"; "P:in" for a physical lap's lead-in)."""
+    ("P3", "S2", "V2" for a virtual-ride app's lap; "P:in" for a physical lap's lead-in)."""
     label = _plain_label(source, lap)
-    prefix = INTERVAL_LABEL_PREFIX[source]
+    prefix = _prefix(source, virtual)
     return f"{prefix}:{label}" if prefix and not label.isdigit() else f"{prefix}{label}"
 
 

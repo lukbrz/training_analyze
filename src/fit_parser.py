@@ -330,6 +330,12 @@ def _records_cache_key(activity_id: str) -> str:
     return "|".join(parts)
 
 
+def records_cache_key(activity_id: str) -> str:
+    """What an activity's record stream is built from (see _records_cache_key) — for caches
+    of results derived from that stream."""
+    return _records_cache_key(activity_id)
+
+
 def _encode_stream(records: list[RecordPoint], session_start_utc: datetime | None) -> dict:
     """Column-wise arrays of doubles (NaN = no value): ~10x smaller and far faster to load
     than per-record objects."""
@@ -428,7 +434,82 @@ def _ascent_descent(bucket: list[RecordPoint]) -> tuple[float | None, float | No
     return up, down
 
 
+# A pause: the athlete stopped (distance not advancing, no power, no cadence) for at least
+# this long, or the recording itself has a gap this long (auto-pause, a stopped timer).
+MIN_PAUSE_S = 10.0
+STOPPED_SPEED_MPS = 0.3
+
+
+def _stopped(a: RecordPoint, b: RecordPoint) -> bool:
+    if a.distance_m is None or b.distance_m is None:
+        return False  # no distance stream (strength...): nothing to tell a stop by
+    seconds = max((b.timestamp_utc - a.timestamp_utc).total_seconds(), 1.0)
+    return b.distance_m - a.distance_m < STOPPED_SPEED_MPS * seconds and not b.power and not b.cadence
+
+
+def recording_name(fit_bytes: bytes) -> str:
+    """What recorded a FIT file, for telling one recording of a session from another:
+    "Edge 1040", "TrainingPeaks Virtual"... (from its file_id message, the first one)."""
+    file_id = next(fitparse.FitFile(fit_bytes).get_messages("file_id"), None)
+    if file_id is None:
+        return "recording"
+    name = file_id.get_value("product_name") or file_id.get_value("garmin_product") or file_id.get_value("manufacturer")
+    if isinstance(name, str):
+        return name if any(c.isupper() for c in name) else name.replace("_", " ").title()
+    return "recording"
+
+
+def pause_mask(records: list[RecordPoint]) -> list[bool]:
+    """For each record, whether the time since the previous one was paused: part of a stop
+    of at least MIN_PAUSE_S, or a recording gap that long. The first record is never
+    paused."""
+    mask = [False] * len(records)
+    run: list[int] = []
+    run_s = 0.0
+
+    def close_run() -> None:
+        if run_s >= MIN_PAUSE_S:
+            for i in run:
+                mask[i] = True
+
+    for i in range(1, len(records)):
+        a, b = records[i - 1], records[i]
+        gap = (b.timestamp_utc - a.timestamp_utc).total_seconds()
+        if gap >= MIN_PAUSE_S:
+            mask[i] = True
+        if _stopped(a, b):
+            run.append(i)
+            run_s += gap
+        else:
+            close_run()
+            run, run_s = [], 0.0
+    close_run()
+    return mask
+
+
+def pauses(records: list[RecordPoint]) -> list[tuple[datetime, float]]:
+    """(UTC start, seconds) of every pause in a record stream."""
+    mask = pause_mask(records)
+    out: list[tuple[datetime, float]] = []
+    for i in range(1, len(records)):
+        if not mask[i]:
+            continue
+        seconds = (records[i].timestamp_utc - records[i - 1].timestamp_utc).total_seconds()
+        if mask[i - 1] and out:
+            out[-1] = (out[-1][0], out[-1][1] + seconds)
+        else:
+            out.append((records[i - 1].timestamp_utc, seconds))
+    return out
+
+
+def records_to_lap(records: list[RecordPoint], lap_index: int, offset: timedelta) -> Lap:
+    """One lap spanning a whole stretch of records (see _bucket_to_lap)."""
+    return _bucket_to_lap(records, lap_index, offset)
+
+
 def _bucket_to_lap(bucket: list[RecordPoint], lap_index: int, offset: timedelta) -> Lap:
+    """A lap over a stretch of records: elapsed duration, and speed / HR / power over its
+    moving time (pauses — see pause_mask — left out)."""
     start = bucket[0]
     end = bucket[-1]
     duration_s = (end.timestamp_utc - start.timestamp_utc).total_seconds()
@@ -437,20 +518,28 @@ def _bucket_to_lap(bucket: list[RecordPoint], lap_index: int, offset: timedelta)
         if start.distance_m is not None and end.distance_m is not None
         else 0.0
     )
-    hr_values = [r.heart_rate for r in bucket if r.heart_rate is not None]
-    power_values = [r.power for r in bucket if r.power is not None]
+    paused = pause_mask(bucket)
+    paused_s = sum(
+        (b.timestamp_utc - a.timestamp_utc).total_seconds()
+        for a, b, p in zip(bucket, bucket[1:], paused[1:]) if p
+    )
+    moving = [r for r, p in zip(bucket, paused) if not p]
+    moving_s = duration_s - paused_s
+    hr_values = [r.heart_rate for r in moving if r.heart_rate is not None]
+    power_values = [r.power for r in moving if r.power is not None]
     ascent, descent = _ascent_descent(bucket)
     return Lap(
         lap_index=lap_index,
         start_time_local=(start.timestamp_utc + offset).isoformat(),
         duration_s=duration_s,
         distance_m=distance_m,
-        avg_speed_mps=distance_m / duration_s if duration_s else None,
+        avg_speed_mps=distance_m / moving_s if moving_s > 0 else None,
         avg_hr=round(_mean(hr_values)) if hr_values else None,
         avg_power=_mean(power_values),
         is_interval=False,
         total_ascent_m=ascent,
         total_descent_m=descent,
+        paused_s=paused_s,
     )
 
 

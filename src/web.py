@@ -17,6 +17,7 @@ from nicegui import app, background_tasks, run, ui
 import display
 import fit_parser
 import garmin_client
+import leaderboard
 import services
 import settings
 import storage
@@ -377,7 +378,7 @@ def laps_page(activity_id: str) -> None:
         """Track on the side map, then the PHYSICAL section (seconds each on a long ride)."""
         await refresh_side_map(0, fit=True)
         if session.records is not None:
-            extra = display.activity_metric_stats(await run.io_bound(session.advanced_metrics))
+            extra = display.activity_metric_stats(await run.io_bound(session.advanced_metrics), session.pause_stat())
             if extra:
                 with metrics_area:
                     stat_tiles(extra)
@@ -496,6 +497,12 @@ def laps_page(activity_id: str) -> None:
                 ui.label(title).classes("font-semibold")
                 grid(display.ZONE_COLUMNS, grid_rows(display.zone_rows(zones)), height="28vh")
 
+    def open_leaderboard() -> None:
+        if activity.route_id is None:
+            notify("This activity has no route (no GPS track) — sync or reprocess to match one", "warning")
+            return
+        ui.navigate.to(f"/leaderboard/{activity.route_id}?highlight={activity_id}")
+
     async def show_sets() -> None:
         if sets_tab is None:
             notify("Not a strength activity", "warning")
@@ -528,6 +535,7 @@ def laps_page(activity_id: str) -> None:
     frame.bind("m", "Mark interval", toggle_interval)
     frame.bind("z", "Zones", show_zones)
     frame.bind("t", "Strength sets", show_sets)
+    frame.bind("b", "Route leaderboard", lambda: open_leaderboard())
     if sets_tab is not None:  # clicking the tab loads it too, not only the t key
         tabs.on_value_change(lambda e: show_sets() if e.value in (sets_tab, "Sets (t)") and not state.get("sets_loaded") else None)
     frame.bind("c", "Compare intervals", draw_compare)
@@ -543,6 +551,7 @@ def laps_page(activity_id: str) -> None:
         "toggle_interval": toggle_interval, "split_intervals": split_intervals, "toggle_filter": toggle_filter,
         "map": draw_map, "compare": draw_compare, "phase_metrics": show_phases, "physical_laps": physical_laps,
         "zones": show_zones,
+        "leaderboard": lambda: open_leaderboard(),
         "copy": lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"),
     })
     on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
@@ -615,8 +624,56 @@ def routes_page() -> None:
     table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/routes/{state['grouped'][e.args['data']['_row']][0].route_id}"))
     frame.bind_back()
     frame.bind("e", "Rename route", rename)
+
+    async def open_leaderboard() -> None:
+        row = await selected_row(table)
+        if row is not None and row < len(state["grouped"]):
+            ui.navigate.to(f"/leaderboard/{state['grouped'][row][0].route_id}")
+
+    frame.bind("b", "Leaderboard", open_leaderboard)
     refresh()
     ui.timer(0.8, lambda: select_row(table, 0) if state["grouped"] else None, once=True)  # show the top route on the map
+
+
+@ui.page("/leaderboard/{route_id}")
+def leaderboard_page(route_id: str, highlight: str = "") -> None:
+    route = next((r for r in storage.load_routes() if r.route_id == route_id), None)
+    frame = Frame(f"Leaderboard — {route.name}" if route else "Route not found")
+    frame.bind_back()
+    if route is None:
+        return
+    state = {"efforts": [], "loop_m": None, "best_only": False}
+    status = ui.label(f"{route.name} — finding loops...").classes("ta-status")
+    table = grid(display.LEADERBOARD_COLUMNS, [], height="calc(100vh - 170px)")
+
+    def shown() -> list:
+        return leaderboard.best_per_activity(state["efforts"]) if state["best_only"] else state["efforts"]
+
+    def render() -> None:
+        efforts = shown()
+        status.set_text(display.leaderboard_status(route.name, state["loop_m"], efforts, state["best_only"]))
+        table.options["rowData"] = grid_rows(display.leaderboard_rows(efforts, route.sport), [{"_mine": e.activity_id == highlight} for e in efforts])
+        table.options[":getRowStyle"] = f"params => params.data._mine ? {{fontWeight: 600, color: '{COLORS['yellow']}'}} : {{}}"
+        table.update()
+
+    def toggle() -> None:
+        state["best_only"] = not state["best_only"]
+        render()
+
+    def open_row(row: int) -> None:
+        efforts = shown()
+        if 0 <= row < len(efforts):
+            ui.navigate.to(f"/activity/{efforts[row].activity_id}")
+
+    table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]))
+    frame.bind("o", "Best per ride / all", toggle)
+    frame.bind("y", "Copy table", lambda: copy(display.tsv(display.LEADERBOARD_COLUMNS, display.leaderboard_rows(shown(), route.sport)), "leaderboard"))
+    async def load() -> None:
+        # The first time, finding loops on GPS-only activities takes a few seconds.
+        state["efforts"], state["loop_m"] = await run_with_progress(status, lambda progress: leaderboard.route_leaderboard(route_id, progress))
+        render()
+
+    ui.timer(0.1, load, once=True)
 
 
 @ui.page("/routes/{route_id}")

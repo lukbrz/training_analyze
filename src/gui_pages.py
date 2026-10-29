@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 import display
 import fit_parser
 import garmin_client
+import leaderboard
 import services
 import settings
 import storage
@@ -431,6 +432,7 @@ class LapsPage(Page):
         self.bind("f", "Interval-only", self.toggle_filter)
         self.bind("h", "Phase time/pace/power", self.histograms)
         self.bind("t", "Strength sets", self.strength_sets)
+        self.bind("b", "Route leaderboard", self.leaderboard)
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         attach_context_menu(self.table, lambda row: display.lap_menu(self.session.row(row)), {
@@ -438,6 +440,7 @@ class LapsPage(Page):
             "toggle_filter": self.toggle_filter, "map": self.open_map, "compare": self.compare,
             "phase_metrics": self.histograms, "physical_laps": self.physical_laps,
             "zones": lambda: self.window_.push(ZonesPage(self.window_, activity, client)),
+            "leaderboard": self.leaderboard,
             "copy": lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"),
         })
         self._rebuild()
@@ -447,7 +450,7 @@ class LapsPage(Page):
 
     def _track_loaded(self, _) -> None:
         self._refresh_side_map(refit=True)
-        stats = display.activity_metric_stats(self.session.advanced_metrics())
+        stats = display.activity_metric_stats(self.session.advanced_metrics(), self.session.pause_stat())
         if stats:
             self.metric_tiles.set_stats(stats)
             self.metric_tiles.setVisible(True)
@@ -562,6 +565,13 @@ class LapsPage(Page):
         # First open of this activity: parsing a long FIT file takes seconds — keep the UI live.
         self.notify("Loading track...")
         run_background(self.session.ensure_records, show, lambda e: self.notify(str(e), "warning"))
+
+    def leaderboard(self) -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == self.activity.route_id), None)
+        if route is None:
+            self.notify("This activity has no route (no GPS track) — sync or reprocess to match one", "warning")
+            return
+        self.window_.push(LeaderboardPage(self.window_, route, self.client, self.activity.activity_id))
 
     def strength_sets(self) -> None:
         if not services.is_strength(self.activity):
@@ -808,6 +818,7 @@ class RoutesPage(Page):
         self.layout_.addWidget(splitter, 1)
         self.bind_back()
         self.bind("e", "Rename route", self.rename)
+        self.bind("b", "Leaderboard", self.leaderboard)
         self.bind("0", "Fit map", self.map.fit)
         self._refresh()
 
@@ -850,6 +861,11 @@ class RoutesPage(Page):
 
         run_background(load_track, show, lambda e: None)
 
+    def leaderboard(self) -> None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self.grouped):
+            self.window_.push(LeaderboardPage(self.window_, self.grouped[row][0], self.client))
+
     def rename(self) -> None:
         row = self.table.currentRow()
         if not 0 <= row < len(self.grouped):
@@ -866,6 +882,59 @@ class RoutesPage(Page):
     def _open(self, row: int) -> None:
         if 0 <= row < len(self.grouped):
             self.window_.push(RouteActivitiesPage(self.window_, self.grouped[row][0], self.client))
+
+
+class LeaderboardPage(Page):
+    """A route's personal leaderboard (leaderboard.route_leaderboard), fastest first; the
+    `highlight` activity's efforts in yellow."""
+
+    def __init__(self, window, route, client, highlight: str | None = None) -> None:
+        super().__init__(window)
+        self.title = f"Leaderboard — {route.name}"
+        self.route, self.client, self.highlight = route, client, highlight
+        self.best_only = False
+        self.efforts: list = []
+        self.loop_m = None
+        self.status = label(f"{route.name} — finding loops...", "status")
+        self.table = make_table(display.LEADERBOARD_COLUMNS, stretch_column=8)
+        self.table.cellActivated.connect(lambda row, _: self._open(row))
+        self.layout_.addWidget(self.status)
+        self.layout_.addWidget(self.table, 1)
+        self.bind_back()
+        self.bind("o", "Best per ride / all", self.toggle_best)
+        self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} efforts"))
+        run_background(
+            lambda: leaderboard.route_leaderboard(route.route_id, progress=lambda m: on_ui(self.status.setText, m)),
+            self._loaded, lambda e: self.notify(f"Leaderboard failed: {e}", "error"),
+        )
+
+    def focus_widget(self):
+        return self.table
+
+    def _loaded(self, result) -> None:
+        self.efforts, self.loop_m = result
+        self._render()
+
+    def _shown(self) -> list:
+        return leaderboard.best_per_activity(self.efforts) if self.best_only else self.efforts
+
+    def _render(self) -> None:
+        shown = self._shown()
+        self.status.setText(display.leaderboard_status(self.route.name, self.loop_m, shown, self.best_only))
+        styles = [{"bold": True, "color": COLORS["yellow"]} if e.activity_id == self.highlight else {} for e in shown]
+        fill_table(self.table, display.leaderboard_rows(shown, self.route.sport), styles, right_aligned={0, 1, 3, 4, 5})
+
+    def toggle_best(self) -> None:
+        self.best_only = not self.best_only
+        self._render()
+
+    def _open(self, row: int) -> None:
+        shown = self._shown()
+        if 0 <= row < len(shown):
+            _, activities = storage.load_index()
+            activity = next((a for a in activities if a.activity_id == shown[row].activity_id), None)
+            if activity is not None:
+                self.window_.push(activity_page(self.window_, activity, self.client))
 
 
 class RouteActivitiesPage(Page):

@@ -36,6 +36,7 @@ UNITS = {
     "tss": "training stress score (100 = one hour at threshold)",
     "age": "whole years, from the birth year only",
     "laps": "an activity's structure: the device's own laps (auto-lap / lap button / workout steps) in order, 'interval' = marked by the user as a work interval",
+    "paused_s": "time within a lap / split / activity spent stopped (no movement, power or cadence for 10 s or more) or not recording; pace, HR, power and NP are over the moving time",
     "splits": "inside a lap: that lap cut every 300 m (runs) or 1 km (rides) from the recorded stream, the last one possibly shorter; a leftover under 30% of a split joins the one before; laps under 1.5 splits long have none",
 }
 ATHLETE_HELP = (
@@ -200,12 +201,12 @@ MIN_SPLITS_PER_LAP = 1.5
 MIN_LAST_SPLIT = 0.3
 # Columns of a lap / split, per kind of sport (laps carry the same keys as objects).
 FOOT_COLUMNS = (
-    "split", "start_local", "duration_s", "distance_m", "pace", "gap_pace", "avg_hr", "min_hr", "max_hr",
+    "split", "start_local", "duration_s", "paused_s", "distance_m", "pace", "gap_pace", "avg_hr", "min_hr", "max_hr",
     "avg_power_w", "np_w", "cadence_spm", "ground_contact_ms", "vertical_oscillation_mm",
     "vertical_ratio_pct", "step_length_m", "ascent_m", "descent_m",
 )
 RIDE_COLUMNS = (
-    "split", "start_local", "duration_s", "distance_m", "speed", "avg_hr", "min_hr", "max_hr",
+    "split", "start_local", "duration_s", "paused_s", "distance_m", "speed", "avg_hr", "min_hr", "max_hr",
     "avg_power_w", "np_w", "cadence_rpm", "ascent_m", "descent_m",
 )
 
@@ -222,12 +223,16 @@ def _segment(segment: Lap, sport: str, records: list) -> dict:
     stats = metrics.segment_stats(records, foot) if records else {}
     hr = stats.get("avg_hr") or segment.avg_hr
     power = stats.get("avg_power_w") or segment.avg_power
+    paused = stats.get("paused_s") or 0.0
+    # Pace / speed over the moving time when the segment holds a pause.
+    speed = segment.distance_m / stats["moving_s"] if paused and stats.get("moving_s") else segment.avg_speed_mps
     out = {
         "split": segment.lap_index,
         "start_local": _iso(segment.start_time_local),
         "duration_s": _r(segment.duration_s),
+        "paused_s": _r(paused, 0) if paused else None,
         "distance_m": _r(segment.distance_m),
-        ("pace" if foot else "speed"): _pace_text(segment.avg_speed_mps, sport),
+        ("pace" if foot else "speed"): _pace_text(speed, sport),
         "gap_pace": _pace_text(stats.get("gap_speed_mps"), "running") if foot else None,
         "avg_hr": _r(hr, 0), "min_hr": stats.get("min_hr"), "max_hr": stats.get("max_hr"),
         "avg_power_w": _r(power, 0), "np_w": _r(stats.get("np_w"), 0),
@@ -349,6 +354,13 @@ def _activity(a: ActivitySummary, item: tl.WeekItem, ctx: _Context) -> dict:
         out["virtual"] = True
     records = _records(a)
     whole = metrics.segment_stats(records, _is_foot(a.sport)) if records else {}
+    if whole.get("paused_s"):
+        offset = fit_parser.load_utc_offset(a.activity_id, a.start_time_local)
+        out["moving_time_s"] = _r(whole["moving_s"], 0)
+        out["pauses"] = [
+            {"at_local": (t + offset).isoformat(timespec="seconds"), "duration_s": _r(s, 0)}
+            for t, s in fit_parser.pauses(records)
+        ]
     # A merged recording's summary can lack the HR / power its stream has (a virtual ride
     # whose HR and power came from the bike computer): take them from the stream.
     for key, value in (("avg_hr", whole.get("avg_hr")), ("avg_power_w", whole.get("avg_power_w"))):
