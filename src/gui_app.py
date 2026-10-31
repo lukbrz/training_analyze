@@ -2,6 +2,8 @@
 the same order with the same keys, drawn with real widgets and vector charts. Run with
 run_gui.sh. All behaviour is shared with the TUI (see gui_pages.py)."""
 
+import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -144,15 +146,51 @@ def app_icon() -> QIcon:
     return icon
 
 
+def server_window(url: str) -> QMainWindow:
+    """Client mode: the server's web app (server/SETUP.md) in an app window instead of the
+    local pages — same data as every other device using that server. Its sign-in is kept
+    between runs; downloads (exports) go to the Downloads folder."""
+    from PySide6.QtCore import QStandardPaths, QUrl
+    from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+
+    window = QMainWindow()
+    window.setWindowTitle(f"{APP_TITLE} — {url}")
+    window.resize(1400, 900)
+    # A named profile keeps cookies on disk, so the server's sign-in survives a restart. It
+    # belongs to the application, which outlives the window: a profile must outlive its pages.
+    profile = QWebEngineProfile("training-analyze", QApplication.instance())
+    downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+
+    def download(item) -> None:
+        item.setDownloadDirectory(downloads)
+        item.accept()
+        window.statusBar().showMessage(f"Saved {item.downloadFileName()} to {downloads}", 8000)
+
+    profile.downloadRequested.connect(download)
+    view = QWebEngineView(window)
+    view.setPage(QWebEnginePage(profile, view))
+    view.load(QUrl(url))
+    window.setCentralWidget(view)
+    return window
+
+
 def main() -> None:
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Training Analyze desktop app")
+    parser.add_argument("--server", default=os.environ.get("TA_SERVER_URL", ""),
+                        help="open a Training Analyze server (e.g. http://192.168.88.10:8080) instead of local data")
+    args, qt_args = parser.parse_known_args()
+    app = QApplication([sys.argv[0], *qt_args])
     app.setApplicationName(APP_TITLE)
     app.setDesktopFileName("training-analyze")  # lets Linux docks match a .desktop launcher
     app.setWindowIcon(app_icon())
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setStyleSheet(STYLESHEET)
-    init_bridge()
-    window = MainWindow()
+    if args.server:
+        window = server_window(args.server)
+    else:
+        init_bridge()
+        window = MainWindow()
     window.show()
     sys.exit(app.exec())
 

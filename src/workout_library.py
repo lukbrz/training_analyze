@@ -26,8 +26,8 @@ WEEK_KEY_PREFIX = "week:"
 ARCHIVE = "archive"
 COLUMNS = ("File", "Date", "Name", "Sport", "Status", "Uploaded")
 EMPTY_HINT = (
-    "Put workout .json files, or a week's plan as a .zip of them, in the folders above "
-    "(see workout_schema.json), then press r."
+    "Put workout .json files, or a week's plan as a .zip of them, in the workouts folder "
+    "(in the web app: the upload box below) — see workout_schema.json — then press r."
 )
 
 

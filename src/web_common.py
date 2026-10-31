@@ -15,7 +15,10 @@ APP_TITLE = "Training Analyze"
 
 
 class State:
-    client = None  # logged-in Garmin client, shared by all browser tabs (single-user app)
+    client = None  # logged-in Garmin client, shared by all browser tabs (one athlete per server)
+    server = False  # --server: nightly sync + reprocess, and a sync when the app is opened
+    background_message = ""  # what the background sync / nightly run is doing or last did
+    data_version = 0  # bumped when a background job changed the data, so pages redraw
 
 
 CSS = f"""
@@ -228,7 +231,18 @@ def select_row(table, row: int | None) -> None:
 
 
 def copy(text: str, what: str) -> None:
-    ui.clipboard.write(text)
+    # navigator.clipboard only exists on https or localhost; over a VPN to http://<server>
+    # fall back to the old select-and-copy way, which browsers still allow there.
+    ui.run_javascript(f"""
+        const text = {json.dumps(text)};
+        if (window.isSecureContext && navigator.clipboard) {{
+            navigator.clipboard.writeText(text);
+        }} else {{
+            const area = document.createElement('textarea');
+            area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
+            document.body.appendChild(area); area.select(); document.execCommand('copy'); area.remove();
+        }}
+    """)
     notify(f"Copied {what}")
 
 

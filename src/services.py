@@ -2,13 +2,20 @@
 to Garmin, storage and the parsers, and report progress through a plain callback, so no UI
 code lives here and no front end re-implements them."""
 
+import os
+import re
+import threading
+import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import re
-import uuid
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 
 import dedupe
 import fit_parser
@@ -25,6 +32,47 @@ import workouts
 from models import ActivitySummary, Route
 
 Progress = Callable[[str], None]
+
+
+# --- One data-changing job at a time ---------------------------------------------------
+
+
+class Busy(Exception):
+    """Another sync / reprocess / export is running (in this or another process)."""
+
+
+@contextmanager
+def exclusive_job(what: str):
+    """Run a job that rewrites the athlete's files alone — across processes too (a web
+    server and a terminal app over SSH share one data folder), with a lock file. Raises
+    Busy when another job holds it."""
+    storage.JOB_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(storage.JOB_LOCK_PATH, "a+") as handle:
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif not _THREAD_LOCK.acquire(blocking=False):
+                raise BlockingIOError
+        except BlockingIOError:
+            handle.seek(0)
+            running = handle.read().strip() or "another job"
+            raise Busy(f"{running} is running — try again when it's done") from None
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(what)
+            handle.flush()
+            yield
+        finally:
+            handle.seek(0)
+            handle.truncate()
+            if fcntl is not None:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            else:
+                _THREAD_LOCK.release()
+
+
+_THREAD_LOCK = threading.Lock()  # Windows has no fcntl: a lock for this process only
 
 INITIAL_SYNC_DAYS = 365
 # Where a full-history sync starts looking (Garmin Connect launched in 2007-08).
@@ -227,6 +275,12 @@ def refresh_athlete(client, start: date, end: date) -> None:
 
 
 def export_training(client, choice: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
+    """See _export_training; one job at a time (raises Busy while another runs)."""
+    with exclusive_job("An export"):
+        return _export_training(client, choice, progress)
+
+
+def _export_training(client, choice: int, progress: Progress = lambda _: None) -> tuple[Path, list[str]]:
     """Write a training_export.CHOICES period (0 = this week so far, else that many full
     weeks ending last Sunday) to one JSON file in exports/ and return (its path, warnings).
     Logged in, it first fetches from Garmin what the period is missing locally: thresholds
@@ -281,6 +335,65 @@ def export_training(client, choice: int, progress: Progress = lambda _: None) ->
     document = training_export.build(choice, today, notes=list(warnings))
     path = storage.save_export(training_export.file_name(choice, today), document)
     return path, warnings
+
+
+# --- Server: sync on access, nightly maintenance --------------------------------------
+
+SYNC_ON_ACCESS_MINUTES = 60
+
+
+def sync_is_stale(max_age_minutes: int = SYNC_ON_ACCESS_MINUTES) -> bool:
+    """Whether the last sync is older than `max_age_minutes` (or never happened)."""
+    last = storage.load_server_state().get("last_sync")
+    return not last or datetime.fromisoformat(last) < datetime.now() - timedelta(minutes=max_age_minutes)
+
+
+# The code a reprocess re-runs: when any of it changes (an app update), stored activities
+# are stale until reprocessed.
+REPROCESS_SOURCES = ("fit_parser.py", "dedupe.py", "models.py", "routes.py", "services.py")
+
+
+def parser_fingerprint() -> str:
+    """A hash of the code that turns FIT files into stored activities."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    for name in REPROCESS_SOURCES:
+        digest.update((Path(__file__).parent / name).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def nightly(client, progress: Progress = lambda _: None, reprocess: str = "") -> str:
+    """The server's nightly run: sync (if logged in to Garmin), reprocess every activity
+    when the parsing code changed since the last reprocess (an app update — or every night
+    with reprocess="always", TA_NIGHTLY_REPROCESS), and refresh this week's calendar and
+    load data. Returns a summary; each step's failure is reported, not raised."""
+    reprocess = reprocess or os.environ.get("TA_NIGHTLY_REPROCESS", "when-changed")
+    messages = []
+    if client is not None:
+        messages.append(sync_activities(client, progress))
+    else:
+        messages.append("not logged in to Garmin — sync skipped")
+    fingerprint = parser_fingerprint()
+    if reprocess == "always" or storage.load_server_state().get("reprocessed_with") != fingerprint:
+        message = reprocess_activities(progress)
+        messages.append(message)
+        if message.startswith("Reprocessed"):
+            state = storage.load_server_state()
+            state["reprocessed_with"] = fingerprint
+            storage.save_server_state(state)
+    else:
+        messages.append("reprocess not needed (parsing code unchanged)")
+    if client is not None:
+        try:
+            with exclusive_job("A calendar refresh"):
+                refresh_training_data(client, tl.week_start(date.today()), progress)
+        except Exception as e:  # Busy or network trouble: the next run catches up
+            messages.append(f"calendar refresh skipped: {e}")
+    state = storage.load_server_state()
+    state.update(last_nightly=date.today().isoformat(), last_nightly_message="; ".join(messages))
+    storage.save_server_state(state)
+    return "; ".join(messages)
 
 
 # --- Planned-workout changes (move / cancel in Garmin, link to an activity locally) ----
@@ -552,7 +665,19 @@ def fetch_missing_exercise_sets(client, activities: list[ActivitySummary], progr
 def sync_activities(client, progress: Progress = lambda _: None, full_history: bool = False) -> str:
     """Download every new Garmin activity since the last sync — or, with `full_history`,
     every activity in the account not downloaded yet — (FIT file, laps, route), merge
-    duplicate recordings, and return a summary message."""
+    duplicate recordings, and return a summary message. One job at a time (exclusive_job)."""
+    try:
+        with exclusive_job("A full-history sync" if full_history else "A sync"):
+            message = _sync_activities(client, progress, full_history)
+    except Busy as e:
+        return str(e)
+    state = storage.load_server_state()
+    state.update(last_sync=datetime.now().isoformat(timespec="seconds"), last_message=message)
+    storage.save_server_state(state)
+    return message
+
+
+def _sync_activities(client, progress: Progress, full_history: bool) -> str:
     last_synced_date, activities = storage.load_index()
     routes_list = storage.load_routes()
     # Also treat any activity already folded into another as "known" — otherwise a
@@ -835,7 +960,15 @@ def _fetch_history_stats(client, activities: list[ActivitySummary], progress: Pr
 
 def reprocess_activities(progress: Progress = lambda _: None) -> str:
     """Re-parse every downloaded FIT file with the current parser (no network), keeping
-    interval marks made by hand, and return a summary message."""
+    interval marks made by hand, and return a summary message. One job at a time."""
+    try:
+        with exclusive_job("A reprocess"):
+            return _reprocess_activities(progress)
+    except Busy as e:
+        return str(e)
+
+
+def _reprocess_activities(progress: Progress) -> str:
     last_synced_date, activities = storage.load_index()
     routes_list = storage.load_routes()
     by_id = {a.activity_id: a for a in activities}

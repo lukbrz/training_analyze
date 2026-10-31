@@ -1,0 +1,7 @@
+# The server image (server/Containerfile): the web app and the terminal app, no Qt.
+textual
+garminconnect>=0.3.8,<0.4
+python-fitparse
+textual-plotext==1.0.1
+jsonschema
+nicegui

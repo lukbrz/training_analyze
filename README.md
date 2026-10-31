@@ -209,6 +209,12 @@ Past plans move to `workouts/archive/` automatically (see Settings). Nothing is 
 
 In the desktop and web apps, and in the terminal app if it gets mouse clicks, right-click a row in the activity list, laps, calendar or workouts list for its actions: move or cancel a planned workout, link a plan with an activity, mark an interval, open the map, upload a week, and so on. Each entry shows its key. Entries that don't apply to that row are greyed out (desktop/web) or left out (terminal). In the calendar, double-click or Enter on a row opens its activity.
 
+## Running it on a home server
+
+The web app can run on a home server, reachable from your phone and laptop over a VPN. Each athlete gets their own container, password, Garmin login and data. It syncs whenever you open it, and every night it syncs, reprocesses after app updates, and refreshes the calendar. Setup, step by step (Arch Linux, rootless Podman, WireGuard on the router): [`server/SETUP.md`](server/SETUP.md).
+
+The desktop app can show the server instead of the laptop's own data: `./run_gui.sh --server http://<server>:8080`.
+
 ## Options
 
 ```bash

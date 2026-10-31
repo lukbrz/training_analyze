@@ -1,5 +1,6 @@
 import dataclasses
 import json
+import os
 import pickle
 import zlib
 from datetime import datetime
@@ -8,7 +9,10 @@ from pathlib import Path
 from models import UNKNOWN_SPORT, ActivitySummary, Lap, RecordPoint, Route, RouteSignature, ZoneTime, sport_name
 
 # Source lives in src/; user data (data/, workouts/, the Garmin session) stays at the project root.
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Where the athlete's files live: the project folder on a laptop; on a server, the folder
+# TA_HOME names (the container's /data volume — see server/SETUP.md), so code and data
+# stay apart and one image can serve several athletes, each with their own TA_HOME.
+BASE_DIR = Path(os.environ.get("TA_HOME") or Path(__file__).resolve().parent.parent)
 DATA_DIR = BASE_DIR / "data"
 INDEX_PATH = DATA_DIR / "activities_index.json"
 LAPS_DIR = DATA_DIR / "laps"
@@ -36,6 +40,8 @@ PHYSICAL_LAPS_DIR = DATA_DIR / "physical_laps"
 ACTIVITY_REGIONS_PATH = DATA_DIR / "activity_regions.json"
 TILE_CACHE_DIR = DATA_DIR / "tile_cache"
 RECORDS_CACHE_DIR = DATA_DIR / "records_cache"
+SERVER_STATE_PATH = DATA_DIR / "server_state.json"
+JOB_LOCK_PATH = DATA_DIR / ".job.lock"
 
 
 def _filtered(cls, raw: dict) -> dict:
@@ -302,6 +308,16 @@ def load_tpv_routes(path: Path = TPV_ROUTES_PATH) -> dict:
 
 def save_tpv_routes(data: dict, path: Path = TPV_ROUTES_PATH) -> None:
     _write_json(path, data)
+
+
+def load_server_state(path: Path = SERVER_STATE_PATH) -> dict:
+    """{"last_sync": ISO datetime, "last_nightly": date, "last_message": str} — see
+    services.sync_if_stale / services.nightly."""
+    return _read_json(path, {})
+
+
+def save_server_state(state: dict, path: Path = SERVER_STATE_PATH) -> None:
+    _write_json(path, state)
 
 
 def load_athlete(path: Path = ATHLETE_PATH) -> dict:

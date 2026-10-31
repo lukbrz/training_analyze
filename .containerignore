@@ -1,0 +1,5 @@
+# Only src/ goes into the server image (server/Containerfile); keep personal data out.
+*
+!src/
+!server/
+src/__pycache__/

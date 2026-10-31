@@ -3,16 +3,34 @@ charts, Leaflet maps, stat tiles — and the same single-key shortcuts, shown in
 footer. All behaviour comes from the shared modules (services, laps_session,
 workout_library, display); this file is only presentation.
 
-Served on 127.0.0.1 only: the app holds a logged-in Garmin session, so it must not be
-reachable from the network. Map tiles are loaded by the browser straight from
-OpenStreetMap (with the attribution Leaflet shows).
+On a laptop it's served on 127.0.0.1 only: the app holds a logged-in Garmin session, so
+it must not be reachable from the network. On a server (see server/SETUP.md) it listens
+on the network behind a password (TA_PASSWORD), and with --server it keeps itself up to
+date: a sync whenever the app is opened and the last one is over an hour old, and a
+nightly sync + reprocess. Map tiles are loaded by the browser straight from OpenStreetMap
+(with the attribution Leaflet shows).
 """
 
 import argparse
+import asyncio
+import hmac
+import os
+import secrets
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from datetime import date, timedelta
+from urllib.parse import quote
 
-from nicegui import app, background_tasks, run, ui
+# NiceGUI keeps browser sessions (sign-ins) in NICEGUI_STORAGE_PATH, by default ./.nicegui —
+# keep them with the athlete's data instead (the server's volume), so they survive updates.
+os.environ.setdefault(
+    "NICEGUI_STORAGE_PATH",
+    str(Path(os.environ.get("TA_HOME") or Path(__file__).resolve().parent.parent) / "data" / ".nicegui"),
+)
+
+from fastapi.responses import RedirectResponse  # noqa: E402 (after the storage path is set)
+from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+
+from nicegui import app, background_tasks, run, ui  # noqa: E402
 
 import display
 import fit_parser
@@ -54,6 +72,7 @@ from web_common import (
 from workout_library import LibraryError, WorkoutLibrary
 
 ALL_SPORTS = "__all__"
+MAX_WORKOUT_UPLOAD_BYTES = 5_000_000
 
 
 # --- Login ---------------------------------------------------------------------------
@@ -204,6 +223,22 @@ def main_page() -> None:
         "copy": lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"),
     })
     render()
+
+    if State.server:
+        # The server keeps itself up to date: show what its background sync is doing, and
+        # redraw the list when one finishes.
+        background = ui.label("").classes("ta-status")
+        seen = {"version": State.data_version}
+
+        def watch_background() -> None:
+            background.set_text(State.background_message)
+            if State.data_version != seen["version"]:
+                seen["version"] = State.data_version
+                render()
+
+        ui.timer(1.0, watch_background)
+        if State.client is not None and services.sync_is_stale():
+            background_tasks.create(_background("Sync", services.sync_activities, State.client))
 
 
 # --- Settings --------------------------------------------------------------------------
@@ -735,6 +770,21 @@ def workouts_page() -> None:
     with ui.card().classes("ta-card w-full p-4"):
         preview = ui.html("").classes("ta-pre")
 
+    async def uploaded(e) -> None:
+        # The planning agent's week zip or single workout JSON, into workouts/ (the folder
+        # isn't at hand on a server); refresh() unpacks and validates it.
+        name = Path(e.file.name).name
+        if Path(name).suffix.lower() not in (".zip", ".json"):
+            notify(f"{name}: only .zip week plans and .json workouts", "warning")
+            return
+        storage.WORKOUTS_DIR.mkdir(parents=True, exist_ok=True)
+        (storage.WORKOUTS_DIR / name).write_bytes(await e.file.read())
+        notify(f"Added {name}")
+        refresh()
+
+    ui.upload(label="Add a week plan (.zip) or workout (.json)", on_upload=uploaded, auto_upload=True, multiple=True,
+              max_file_size=MAX_WORKOUT_UPLOAD_BYTES).props("accept=.zip,.json flat bordered").classes("w-full")
+
     def fill(select_key: str | None = None) -> None:
         rows = library.rows
         table.options["rowData"] = grid_rows([r.values for r in rows], [{"_kind": r.kind, "_key": r.key} for r in rows])
@@ -1093,14 +1143,114 @@ async def _cached_login() -> None:
     State.client = await run.io_bound(garmin_client.try_cached_login)
 
 
+# --- Server mode: background jobs, sign-in ------------------------------------------------
+
+PASSWORD = os.environ.get("TA_PASSWORD", "")
+OPEN_PATHS = ("/signin", "/health", "/favicon.ico")
+NIGHTLY_WINDOW_HOURS = 3  # a nightly run missed by more than this (server was off) waits a day
+
+
+async def _background(what: str, job, *args) -> None:
+    """Run a data-changing job off the event loop, reporting its progress to every open
+    page (State.background_message) and bumping State.data_version when it's done."""
+    def progress(message: str) -> None:
+        State.background_message = f"{what}: {message}"
+
+    State.background_message = f"{what}..."
+    try:
+        result = await run.io_bound(job, *args, progress=progress)
+        State.background_message = f"{what} done{': ' + result if isinstance(result, str) else ''}"
+    except Exception as e:  # a background job must never take the server down
+        State.background_message = f"{what} failed: {e}"
+    State.data_version += 1
+
+
+async def _nightly_loop(at: tuple[int, int]) -> None:
+    """Once a day, at `at` (hour, minute) local time: sync + reprocess + calendar refresh."""
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now()
+        start = now.replace(hour=at[0], minute=at[1], second=0, microsecond=0)
+        due = start <= now < start + timedelta(hours=NIGHTLY_WINDOW_HOURS)
+        if due and storage.load_server_state().get("last_nightly") != date.today().isoformat():
+            await _background("Nightly sync and reprocess", services.nightly, State.client)
+
+
+class _SignInRequired(BaseHTTPMiddleware):
+    """With TA_PASSWORD set, every page but the sign-in page asks for it first."""
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if PASSWORD and not path.startswith("/_nicegui") and path not in OPEN_PATHS and not app.storage.user.get("signed_in"):
+            return RedirectResponse(f"/signin?next={quote(path)}")
+        return await call_next(request)
+
+
+@ui.page("/signin")
+def signin_page(next: str = "/") -> None:
+    target = next if next.startswith("/") and not next.startswith("//") else "/"
+    if not PASSWORD or app.storage.user.get("signed_in"):
+        ui.navigate.to(target)
+        return
+    Frame("Sign in")
+    with ui.card().classes("ta-card p-6 gap-3").style("width: 380px"):
+        ui.label(APP_TITLE).classes("text-lg font-semibold")
+        password = ui.input("Password", password=True, password_toggle_button=True).classes("w-full")
+        message = ui.label("").classes("ta-status")
+
+        async def submit() -> None:
+            if hmac.compare_digest(password.value.encode(), PASSWORD.encode()):
+                app.storage.user["signed_in"] = True
+                ui.navigate.to(target)
+            else:
+                await asyncio.sleep(1)  # slows down guessing
+                message.set_text("Wrong password")
+
+        password.on("keydown.enter", submit)
+        ui.button("Sign in", on_click=submit).classes("w-full")
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok", "garmin": State.client is not None}
+
+
+def _storage_secret() -> str:
+    """Signs the browser's session cookie: TA_SECRET, else a random one kept in the data
+    folder (so sign-ins survive restarts)."""
+    if os.environ.get("TA_SECRET"):
+        return os.environ["TA_SECRET"]
+    path = storage.DATA_DIR / ".web_secret"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(secrets.token_hex(32))
+        path.chmod(0o600)
+    return path.read_text().strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve Training Analyze in the browser")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="address to listen on (default: this computer only; 0.0.0.0 on a server, with TA_PASSWORD set)")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
+    parser.add_argument("--server", action="store_true",
+                        help="keep up to date unattended: sync when the app is opened, and a nightly sync + reprocess")
+    parser.add_argument("--nightly-at", default=os.environ.get("TA_NIGHTLY_AT", "03:00"),
+                        help="time of the nightly run with --server (HH:MM, local time; or TA_NIGHTLY_AT)")
     args = parser.parse_args()
+    if args.host not in ("127.0.0.1", "localhost") and not PASSWORD:
+        parser.error("listening on the network needs a password: set TA_PASSWORD")
+    State.server = args.server
     app.on_startup(_cached_login)
-    ui.run(host="127.0.0.1", port=args.port, title=APP_TITLE, dark=True, reload=False, show=not args.no_browser,
-           favicon=Path(__file__).parent / "assets" / "icon-64.png", show_welcome_message=False)
+    if args.server:
+        hour, minute = (int(x) for x in args.nightly_at.split(":"))
+        app.on_startup(lambda: background_tasks.create(_nightly_loop((hour, minute))))
+    if PASSWORD:
+        app.add_middleware(_SignInRequired)
+    ui.run(host=args.host, port=args.port, title=APP_TITLE, dark=True, reload=False, show=not args.no_browser,
+           favicon=Path(__file__).parent / "assets" / "icon-64.png", show_welcome_message=False,
+           storage_secret=_storage_secret())
 
 
 if __name__ in {"__main__", "__mp_main__"}:
