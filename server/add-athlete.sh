@@ -28,6 +28,8 @@ if [ ! -f "$envfile" ]; then
         echo "TA_NIGHTLY_REPROCESS=when-changed"
     } > "$envfile"
     echo "Sign-in password for $name: $password   (kept in $envfile)"
+else
+    echo "Keeping the existing settings and password in $envfile"
 fi
 
 publish="${bind:+$bind:}$port:8080"
@@ -60,4 +62,17 @@ UNIT
 
 systemctl --user daemon-reload
 systemctl --user restart "training-analyze-$name"
-echo "Started training-analyze-$name on port $port — open http://<server>:$port"
+
+# "restart" returns once the container is created; wait until the app actually answers.
+echo -n "Starting training-analyze-$name "
+for _ in $(seq 60); do
+    if curl -fsS -o /dev/null "http://${bind:-127.0.0.1}:$port/health" 2>/dev/null; then
+        echo " up — open http://<server>:$port"
+        exit 0
+    fi
+    echo -n "."
+    sleep 2
+done
+echo " no answer on port $port after 2 minutes. Last log lines:" >&2
+journalctl --user -u "training-analyze-$name" -n 30 --no-pager >&2
+exit 1
