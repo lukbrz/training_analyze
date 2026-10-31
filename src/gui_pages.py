@@ -433,6 +433,7 @@ class LapsPage(Page):
         self.bind("h", "Phase time/pace/power", self.histograms)
         self.bind("t", "Strength sets", self.strength_sets)
         self.bind("b", "Route leaderboard", self.leaderboard)
+        self.bind("e", "Rename route", self.rename_route)
         self.bind("g", "Map", self.open_map)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"))
         attach_context_menu(self.table, lambda row: display.lap_menu(self.session.row(row)), {
@@ -440,7 +441,7 @@ class LapsPage(Page):
             "toggle_filter": self.toggle_filter, "map": self.open_map, "compare": self.compare,
             "phase_metrics": self.histograms, "physical_laps": self.physical_laps,
             "zones": lambda: self.window_.push(ZonesPage(self.window_, activity, client)),
-            "leaderboard": self.leaderboard,
+            "leaderboard": self.leaderboard, "rename_route": self.rename_route,
             "copy": lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} laps"),
         })
         self._rebuild()
@@ -572,6 +573,19 @@ class LapsPage(Page):
             self.notify("This activity has no route (no GPS track) — sync or reprocess to match one", "warning")
             return
         self.window_.push(LeaderboardPage(self.window_, route, self.client, self.activity.activity_id))
+
+    def rename_route(self) -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == self.activity.route_id), None)
+        if route is None:
+            self.notify("This activity has no route (no GPS track) — sync or reprocess to match one", "warning")
+            return
+        name, ok = QInputDialog.getText(self, "Rename route", f"New name for the route \"{route.name}\":", text=route.name)
+        if not ok or name.strip() == route.name:
+            return
+        try:
+            self.notify(f"Route renamed to {services.rename_route(route.route_id, name).name}")
+        except ValueError as e:
+            self.notify(str(e), "warning")
 
     def strength_sets(self) -> None:
         if not services.is_strength(self.activity):

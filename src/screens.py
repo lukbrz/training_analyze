@@ -429,6 +429,41 @@ def _switch_screen(screen: Screen, other_type: type, make) -> None:
         screen.app.push_screen(make())
 
 
+class TextPromptScreen(ModalScreen[str | None]):
+    """Asks for one line of text: dismisses with it on Enter, None on Escape."""
+
+    CSS = """
+    TextPromptScreen {
+        align: center middle;
+    }
+
+    #prompt_box {
+        width: 70;
+        max-width: 95%;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, prompt_text: str, value: str = "") -> None:
+        super().__init__()
+        self.prompt_text = prompt_text
+        self.value = value
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(Static(self.prompt_text), Input(value=self.value, id="prompt_input"), Static("Enter: save · Esc: cancel"), id="prompt_box")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class LapsScreen(ContextMenuMixin, Screen):
     """One activity's laps — a Textual shell around laps_session.LapsSession, which owns all
     the state and behaviour (shared with the Qt GUI)."""
@@ -437,6 +472,7 @@ class LapsScreen(ContextMenuMixin, Screen):
         "toggle_interval": "toggle_interval", "split_intervals": "split_intervals",
         "toggle_filter": "toggle_interval_filter", "compare": "compare", "phase_metrics": "phase_metrics",
         "physical_laps": "physical_laps", "zones": "zones", "copy": "copy", "leaderboard": "leaderboard",
+        "rename_route": "rename_route",
     }
 
     CSS = """
@@ -474,6 +510,7 @@ class LapsScreen(ContextMenuMixin, Screen):
         Binding("h", "phase_metrics", "Phase time/pace/power"),
         Binding("t", "strength_sets", "Strength sets"),
         Binding("b", "leaderboard", "Route leaderboard"),
+        Binding("e", "rename_route", "Rename route"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -681,6 +718,22 @@ class LapsScreen(ContextMenuMixin, Screen):
             self.notify("Not a strength activity", severity="warning")
             return
         _switch_screen(self, StrengthSetsScreen, lambda: StrengthSetsScreen(self.activity, self.client))
+
+    def action_rename_route(self) -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == self.activity.route_id), None)
+        if route is None:
+            self.notify("This activity has no route (no GPS track) — sync or reprocess to match one", severity="warning")
+            return
+
+        def renamed(name: str | None) -> None:
+            if name is None or name.strip() == route.name:
+                return
+            try:
+                self.notify(f"Route renamed to {services.rename_route(route.route_id, name).name}")
+            except ValueError as e:
+                self.notify(str(e), severity="warning")
+
+        self.app.push_screen(TextPromptScreen(f"New name for the route \"{route.name}\":", route.name), renamed)
 
     def action_compare(self) -> None:
         try:

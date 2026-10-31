@@ -14,8 +14,10 @@ nightly sync + reprocess. Map tiles are loaded by the browser straight from Open
 import argparse
 import asyncio
 import hmac
+import logging
 import os
 import secrets
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -27,11 +29,13 @@ os.environ.setdefault(
     str(Path(os.environ.get("TA_HOME") or Path(__file__).resolve().parent.parent) / "data" / ".nicegui"),
 )
 
-from fastapi.responses import RedirectResponse  # noqa: E402 (after the storage path is set)
+from fastapi import Request  # noqa: E402 (after the storage path is set)
+from fastapi.responses import RedirectResponse  # noqa: E402
 from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
 
 from nicegui import app, background_tasks, run, ui  # noqa: E402
 
+import applog
 import display
 import fit_parser
 import garmin_client
@@ -57,11 +61,15 @@ from web_common import (
     escape,
     grid,
     grid_rows,
+    instrument_events,
+    phone_activity_columns,
     layers_payload,
     legend_html,
     notify,
     on_row_change,
+    open_on_tap,
     row_context_menu,
+    run_job,
     run_with_progress,
     select_row,
     selected_row,
@@ -133,13 +141,15 @@ def main_page() -> None:
     status = ui.label("").classes("ta-status")
     with ui.row().classes("items-center gap-2"):
         sync_button = ui.button("Sync (s)")
-        reprocess_button = ui.button("Reprocess (r)").props("outline")
-        ui.button("Routes (o)", on_click=lambda: ui.navigate.to("/routes")).props("outline")
-        ui.button("Workouts (w)", on_click=lambda: ui.navigate.to("/workouts")).props("outline")
-        ui.button("Calendar (c)", on_click=lambda: ui.navigate.to("/calendar")).props("outline")
-        period_select = ui.select(dict(settings.PERIOD_CHOICES), value=settings.get("activity_period_days")).classes("w-40").props("dense outlined")
-        sport_select = ui.select({ALL_SPORTS: "All sports"}, value=ALL_SPORTS).classes("w-48").props("dense outlined")
+        # On a phone these are in the actions menu (Frame), which leaves room for the list.
+        reprocess_button = ui.button("Reprocess (r)").props("outline").classes("ta-wide-only")
+        ui.button("Routes (o)", on_click=lambda: ui.navigate.to("/routes")).props("outline").classes("ta-wide-only")
+        ui.button("Workouts (w)", on_click=lambda: ui.navigate.to("/workouts")).props("outline").classes("ta-wide-only")
+        ui.button("Calendar (c)", on_click=lambda: ui.navigate.to("/calendar")).props("outline").classes("ta-wide-only")
+        period_select = ui.select(dict(settings.PERIOD_CHOICES), value=settings.get("activity_period_days")).classes("w-36").props("dense outlined")
+        sport_select = ui.select({ALL_SPORTS: "All sports"}, value=ALL_SPORTS).classes("w-36").props("dense outlined")
     table = grid(display.ACTIVITY_COLUMNS, [], height="calc(100vh - 230px)")
+    phone_activity_columns(table)
 
     def render() -> None:
         activities, hidden = services.listed_activities(period_select.value or 0)
@@ -171,6 +181,7 @@ def main_page() -> None:
             ui.navigate.to(f"/activity/{state['shown'][row].activity_id}")
 
     table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]), args=ROW_EVENT_ARGS)
+    open_on_tap(table, open_row)
 
     async def open_selected() -> None:
         open_row(await selected_row(table))
@@ -238,7 +249,7 @@ def main_page() -> None:
                 render()
 
         ui.timer(1.0, watch_background)
-        if State.client is not None and services.sync_is_stale():
+        if State.client is not None and not State.background_running and services.sync_is_stale():
             background_tasks.create(_background("Sync", services.sync_activities, State.client))
 
 
@@ -304,10 +315,45 @@ def laps_page(activity_id: str) -> None:
     with ui.row().classes("items-center gap-2"):
         ui.html(f"<span style='color:{SPORT_COLORS.get(activity.sport, COLORS['fg'])}; font-weight:600'>{activity.sport}</span>")
         ui.label(f"·  {activity.start_time_local.replace('T', ' ')[:16]}").classes("ta-status")
+        route_label = ui.label("").classes("ta-status")
+        rename_button = ui.button(icon="edit", on_click=lambda: rename_route()).props("flat dense round size=sm").tooltip("Rename this route (e)")
+
+    def show_route() -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == activity.route_id), None)
+        route_label.set_text(f"·  {route.name}" if route else "·  no route")
+        rename_button.set_visibility(route is not None)
+
+    async def rename_route() -> None:
+        route = next((r for r in storage.load_routes() if r.route_id == activity.route_id), None)
+        if route is None:
+            notify("This activity has no route (no GPS track) — sync or reprocess to match one", "warning")
+            return
+        shared = sum(a.route_id == route.route_id for a in activities)
+        with ui.dialog() as dialog, ui.card().classes("ta-card p-6 gap-3").style("width: 400px; max-width: 92vw"):
+            ui.label("Rename route").classes("text-lg font-semibold")
+            ui.label(f"The new name shows on all {shared} activities on this route." if shared > 1 else "").classes("ta-status")
+            name_input = ui.input("Name", value=route.name).classes("w-full").props("autofocus")
+            name_input.on("keydown.enter", lambda: dialog.submit(name_input.value))
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("outline")
+                ui.button("Rename", on_click=lambda: dialog.submit(name_input.value))
+        new_name = await dialog
+        dialog.delete()
+        if new_name is None or new_name.strip() == route.name:
+            return
+        try:
+            renamed = services.rename_route(route.route_id, new_name)
+        except ValueError as e:
+            notify(str(e), "warning")
+            return
+        show_route()
+        notify(f"Route renamed to {renamed.name}")
+
+    show_route()
     stat_tiles(display.activity_stats(activity))
     metrics_area = ui.column().classes("w-full")  # filled once the record stream is loaded
     if session.multisport:
-        with ui.row().classes("w-full gap-3 no-wrap"):
+        with ui.row().classes("w-full gap-3 ta-tiles"):
             for name, sport, stats in display.leg_stats(storage.load_laps(activity_id)):
                 lines = "".join(
                     f"<div><span class='unit' style='margin:0'>{s.label}</span> <b style='color:{COLORS.get(s.color, COLORS['fg']) if s.color else COLORS['fg']}'>{s.value}</b><span class='unit'>{s.unit}</span></div>"
@@ -325,22 +371,22 @@ def laps_page(activity_id: str) -> None:
     # A gym session opens on its sets; everything else on its laps.
     with ui.tab_panels(tabs, value=sets_tab or laps_tab).classes("w-full").style("background: transparent"):
         with ui.tab_panel(laps_tab).classes("p-0 gap-2"):
-            with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                split_input = ui.input(placeholder="400 = metres · 60s / 1m / 1:30 = time").classes("flex-grow").props("dense outlined")
+            with ui.row().classes("w-full items-center gap-2 no-wrap ta-wrap"):
+                split_input = ui.input(placeholder="400 = metres · 60s / 1m / 1:30 = time").classes("flex-grow").style("min-width: 220px").props("dense outlined")
                 ui.button("Split", on_click=lambda: run_op(lambda: session.split(split_input.value or ""))).props("outline")
                 ui.button("Split intervals (i)", on_click=lambda: split_intervals()).props("outline")
                 filter_button = ui.button("Interval only (f)", on_click=lambda: toggle_filter()).props("outline")
                 ui.button("Reset", on_click=lambda: run_op(session.reset)).props("outline")
             # The table only needs part of the width: the rest shows the track, with the selected
             # row's lap highlighted (g opens the big map tab).
-            with ui.row().classes("w-full no-wrap gap-3"):
-                table = grid(session.columns, [], height="calc(100vh - 470px)", row_style=LAP_ROW_STYLE).style("flex: 3 1 0")
-                side_map = ui.leaflet(center=(52.0, 19.0), zoom=13).style("flex: 2 1 0; height: calc(100vh - 470px)")
+            with ui.row().classes("w-full no-wrap gap-3 ta-split"):
+                table = grid(session.columns, [], height="calc(100vh - 470px)", row_style=LAP_ROW_STYLE).style("flex: 3 1 0").classes("ta-table")
+                side_map = ui.leaflet(center=(52.0, 19.0), zoom=13).style("flex: 2 1 0; height: calc(100vh - 470px)").classes("ta-map")
             interval_area = ui.column().classes("w-full")
         with ui.tab_panel(map_tab).classes("p-0 gap-2"):
             with ui.row().classes("items-center gap-2"):
                 map_buttons = {attr: ui.button(f"{text} ({key})", on_click=lambda a=attr: draw_map(a)).props("outline") for key, text, attr in MAP_MODES}
-            leaflet = ui.leaflet(center=(52.0, 19.0), zoom=13).classes("w-full").style("height: calc(100vh - 420px)")
+            leaflet = ui.leaflet(center=(52.0, 19.0), zoom=13).classes("w-full ta-map").style("height: calc(100vh - 420px)")
             map_legend = ui.html("")
         with ui.tab_panel(phases_tab).classes("p-0"):
             phases_area = ui.column().classes("w-full gap-2")
@@ -412,16 +458,20 @@ def laps_page(activity_id: str) -> None:
 
     async def initial_load() -> None:
         """Track on the side map, then the PHYSICAL section (seconds each on a long ride)."""
-        await refresh_side_map(0, fit=True)
+        what = f"activity {activity_id} ({activity.sport}, {display.format_duration(activity.duration_s)})"
+        with applog.timed(f"{what}: track on the side map", page_log):
+            await refresh_side_map(0, fit=True)
         if session.records is not None:
-            extra = display.activity_metric_stats(await run.io_bound(session.advanced_metrics), session.pause_stat())
+            with applog.timed(f"{what}: advanced metrics", page_log):
+                extra = display.activity_metric_stats(await run.io_bound(session.advanced_metrics), session.pause_stat())
             if extra:
                 with metrics_area:
                     stat_tiles(extra)
         if not session.auto_detect:
             return
         try:
-            laps = await run.io_bound(session.detect_physical_laps)
+            with applog.timed(f"{what}: loop detection", page_log):
+                laps = await run.io_bound(session.detect_physical_laps)
         except LapsError:
             session.physical_laps_failed()
             rebuild(await selected_row(table))
@@ -572,6 +622,7 @@ def laps_page(activity_id: str) -> None:
     frame.bind("z", "Zones", show_zones)
     frame.bind("t", "Strength sets", show_sets)
     frame.bind("b", "Route leaderboard", lambda: open_leaderboard())
+    frame.bind("e", "Rename route", rename_route)
     if sets_tab is not None:  # clicking the tab loads it too, not only the t key
         tabs.on_value_change(lambda e: show_sets() if e.value in (sets_tab, "Sets (t)") and not state.get("sets_loaded") else None)
     frame.bind("c", "Compare intervals", draw_compare)
@@ -587,7 +638,7 @@ def laps_page(activity_id: str) -> None:
         "toggle_interval": toggle_interval, "split_intervals": split_intervals, "toggle_filter": toggle_filter,
         "map": draw_map, "compare": draw_compare, "phase_metrics": show_phases, "physical_laps": physical_laps,
         "zones": show_zones,
-        "leaderboard": lambda: open_leaderboard(),
+        "leaderboard": lambda: open_leaderboard(), "rename_route": rename_route,
         "copy": lambda: copy(display.tsv(session.columns, [r.values for r in state["rows"]]), f"{len(state['rows'])} laps"),
     })
     on_row_change(table, lambda row: set_selected(side_map, session.lap_coords(session.row_lap(row))))
@@ -605,7 +656,7 @@ def routes_page() -> None:
     frame = Frame("Routes")
     state = {"grouped": [], "routes": [], "listed": [], "region_of": {}}
     status = ui.label("").classes("ta-status")
-    with ui.row().classes("w-full no-wrap gap-4"):
+    with ui.row().classes("w-full no-wrap gap-4 ta-split"):
         with ui.column().classes("gap-2").style("flex: 1 1 45%"):
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 discipline_select = ui.select({display.ALL_ROUTES: "All disciplines"}, value=display.ALL_ROUTES).classes("w-40").props("dense outlined")
@@ -613,10 +664,10 @@ def routes_page() -> None:
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 rename_input = ui.input(placeholder="New name").classes("flex-grow").props("dense outlined")
                 ui.button("Rename", on_click=lambda: rename()).props("outline")
-            table = grid(display.ROUTE_COLUMNS, [], height="calc(100vh - 280px)")
+            table = grid(display.ROUTE_COLUMNS, [], height="calc(100vh - 280px)").classes("ta-table")
         with ui.column().classes("gap-2").style("flex: 1 1 55%"):
             caption = ui.html("")
-            leaflet = ui.leaflet(center=(52.0, 19.0), zoom=12).classes("w-full").style("height: calc(100vh - 230px)")
+            leaflet = ui.leaflet(center=(52.0, 19.0), zoom=12).classes("w-full ta-map").style("height: calc(100vh - 230px)")
 
     def refresh() -> None:
         state["routes"] = storage.load_routes()
@@ -730,6 +781,7 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
             ui.navigate.to(f"/activity/{efforts[row].activity_id}")
 
     table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]), args=ROW_EVENT_ARGS)
+    open_on_tap(table, open_row)
     frame.bind("w", "Loops / whole route", toggle_kind)
     frame.bind("o", "Best per ride / all", toggle)
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.LEADERBOARD_COLUMNS, display.leaderboard_rows(shown(), route.sport)), "leaderboard"))
@@ -753,7 +805,9 @@ def route_activities_page(route_id: str) -> None:
     matching = sorted((a for a in activities if a.route_id == route_id), key=lambda a: a.start_time_local, reverse=True)
     ui.label(f"Route: {route.name}  |  {len(matching)} activities").classes("ta-status")
     table = grid(display.ACTIVITY_COLUMNS, grid_rows([display.activity_row(a, route.name) for a in matching]), height="calc(100vh - 180px)")
+    phone_activity_columns(table)
     table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/activity/{matching[e.args['data']['_row']].activity_id}"), args=ROW_EVENT_ARGS)
+    open_on_tap(table, lambda row: ui.navigate.to(f"/activity/{matching[row].activity_id}"))
 
 
 # --- Workouts ------------------------------------------------------------------------
@@ -880,12 +934,12 @@ def workouts_page() -> None:
 def calendar_page() -> None:
     frame = Frame("Calendar & training load")
     state = {"week": training_load.week_start(date.today()), "view": None}
-    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+    with ui.row().classes("w-full items-center gap-2 no-wrap ta-wrap"):
         ui.button("◀ Previous ([)", on_click=lambda: change(-7)).props("outline")
-        week_title = ui.label("").classes("text-lg font-semibold flex-grow text-center")
+        week_title = ui.label("").classes("text-lg font-semibold flex-grow text-center ta-week-title")
         ui.button("Next (]) ▶", on_click=lambda: change(7)).props("outline")
         ui.button("This week (t)", on_click=lambda: this_week()).props("outline")
-        ui.button("Refresh (r)", on_click=lambda: refresh()).props("outline")
+        ui.button("Refresh (r)", on_click=lambda: refresh()).props("outline").classes("ta-wide-only")
     # The week's rows are the page's main part: a one-line stat strip and a slim TSS bar
     # above them, a shorter fitness chart below.
     tiles_area = ui.column().classes("w-full gap-1")
@@ -1141,13 +1195,17 @@ def calendar_page() -> None:
 
 
 async def _cached_login() -> None:
-    State.client = await run.io_bound(garmin_client.try_cached_login)
+    with applog.timed("Garmin login from the saved session", page_log):
+        State.client = await run.io_bound(garmin_client.try_cached_login)
+    if State.client is None:
+        page_log.info("Not logged in to Garmin: log in on the /login page")
 
 
 # --- Server mode: background jobs, sign-in ------------------------------------------------
 
 PASSWORD = os.environ.get("TA_PASSWORD", "")
-OPEN_PATHS = ("/signin", "/health", "/favicon.ico")
+page_log = logging.getLogger("ta.page")
+OPEN_PATHS = ("/signin", "/health", "/favicon.ico", "/_ta/timing")  # timing: the sign-in page reports too
 NIGHTLY_WINDOW_HOURS = 3  # a nightly run missed by more than this (server was off) waits a day
 
 
@@ -1158,11 +1216,14 @@ async def _background(what: str, job, *args) -> None:
         State.background_message = f"{what}: {message}"
 
     State.background_message = f"{what}..."
+    State.background_running = True
     try:
-        result = await run.io_bound(job, *args, progress=progress)
+        result = await run_job(f"background {what.lower()}", job, *args, progress=progress)
         State.background_message = f"{what} done{': ' + result if isinstance(result, str) else ''}"
-    except Exception as e:  # a background job must never take the server down
+    except Exception as e:  # a background job must never take the server down (run_job logged it)
         State.background_message = f"{what} failed: {e}"
+    finally:
+        State.background_running = False
     State.data_version += 1
 
 
@@ -1175,6 +1236,34 @@ async def _nightly_loop(at: tuple[int, int]) -> None:
         due = start <= now < start + timedelta(hours=NIGHTLY_WINDOW_HOURS)
         if due and storage.load_server_state().get("last_nightly") != date.today().isoformat():
             await _background("Nightly sync and reprocess", services.nightly, State.client)
+
+
+class _RequestLog(BaseHTTPMiddleware):
+    """Log each page request (not NiceGUI's own assets and socket) with how long the server
+    took to build and send it."""
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if path.startswith("/_nicegui") or path == "/favicon.ico":
+            return await call_next(request)
+        start = time.perf_counter()
+        response = await call_next(request)
+        level = logging.DEBUG if path in ("/health", "/_ta/timing") else logging.INFO
+        page_log.log(level, "%s %s -> %s in %s", request.method, path, response.status_code, applog.duration(time.perf_counter() - start))
+        return response
+
+
+@app.post("/_ta/timing")
+async def browser_timing(request: Request) -> dict:
+    """The browser's own page-load timing (web_common.BROWSER_TIMING_JS)."""
+    try:
+        t = await request.json()
+        page_log.info("browser %s (%spx wide): first byte %s ms, page ready %s ms, loaded %s ms, %s kB",
+                      str(t.get("path"))[:80].encode("unicode_escape").decode(), int(t.get("width") or 0), round(t.get("ttfb") or 0), round(t.get("dom") or 0),
+                      round(t.get("load") or 0), round((t.get("bytes") or 0) / 1000))
+    except Exception:  # a malformed report isn't worth an error
+        pass
+    return {}
 
 
 class _SignInRequired(BaseHTTPMiddleware):
@@ -1243,12 +1332,20 @@ def main() -> None:
     if args.host not in ("127.0.0.1", "localhost") and not PASSWORD:
         parser.error("listening on the network needs a password: set TA_PASSWORD")
     State.server = args.server
+    applog.setup("web")
+    _, activities = storage.load_index()
+    logging.getLogger("ta").info(
+        "Training Analyze %s starting on %s:%s%s — data in %s, %d activities", os.environ.get("TA_VERSION", "(local)"),
+        args.host, args.port, " (server mode)" if args.server else "", storage.BASE_DIR, len(activities))
+    instrument_events()
+    app.on_startup(lambda: background_tasks.create(applog.watch_event_loop()))
     app.on_startup(_cached_login)
     if args.server:
         hour, minute = (int(x) for x in args.nightly_at.split(":"))
         app.on_startup(lambda: background_tasks.create(_nightly_loop((hour, minute))))
     if PASSWORD:
         app.add_middleware(_SignInRequired)
+    app.add_middleware(_RequestLog)  # added last, so it runs first and times the sign-in check too
     ui.run(host=args.host, port=args.port, title=APP_TITLE, dark=True, reload=False, show=not args.no_browser,
            favicon=Path(__file__).parent / "assets" / "icon-64.png", show_welcome_message=False,
            storage_secret=_storage_secret())

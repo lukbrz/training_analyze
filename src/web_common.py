@@ -4,20 +4,28 @@ drawing. Presentation only — mirrors gui_common.py for the Qt GUI."""
 
 import inspect
 import json
+import logging
+import time
 from collections.abc import Callable
 
 from nicegui import run, ui
 
+import applog
 import display
 from theme import COLORS
 
+ui_log = logging.getLogger("ta.ui")
+job_log = logging.getLogger("ta.job")
+
 APP_TITLE = "Training Analyze"
+PHONE_MAX_WIDTH = 700  # px: narrower screens get the phone layout (CSS below)
 
 
 class State:
     client = None  # logged-in Garmin client, shared by all browser tabs (one athlete per server)
     server = False  # --server: nightly sync + reprocess, and a sync when the app is opened
     background_message = ""  # what the background sync / nightly run is doing or last did
+    background_running = False  # a background job is running (so opening a page starts no second one)
     data_version = 0  # bumped when a background job changed the data, so pages redraw
 
 
@@ -45,6 +53,28 @@ body {{ background: {COLORS['bg']}; color: {COLORS['fg']}; }}
 .leaflet-tile-pane {{ filter: brightness(0.82) saturate(0.85); }}
 .leaflet-tooltip.lap-label {{ background: {COLORS['fg']}; color: {COLORS['bg_dark']}; border: none; border-radius: 9px;
               font-weight: 700; font-size: 10px; padding: 0 5px; box-shadow: none; }}
+.ta-tiles {{ flex-wrap: nowrap; }}
+.ta-phone-only {{ display: none !important; }}
+/* Phones: no keyboard, so the actions move from the key footer into a menu button; rows
+   that sit side by side (table | map) stack; toolbars and tiles wrap. */
+@media (max-width: {PHONE_MAX_WIDTH}px) {{
+    .q-footer, .ta-wide-only {{ display: none !important; }}
+    .ta-phone-only {{ display: flex !important; }}
+    .q-header {{ padding: 6px 12px !important; }}
+    .q-header .ta-title, .q-header .ta-dot {{ display: none; }}
+    .nicegui-content {{ padding: 10px !important; }}
+    .ta-wrap {{ flex-wrap: wrap !important; }}
+    .ta-split {{ flex-wrap: wrap !important; }}
+    .ta-split > * {{ flex: 1 1 100% !important; min-width: 0; }}
+    .ta-map {{ height: 45vh !important; }}
+    .ta-table {{ height: 55vh !important; }}
+    .ta-week-title {{ flex-basis: 100%; order: -1; }}
+    .ta-tiles {{ flex-wrap: wrap !important; gap: 6px !important; }}
+    .ta-tile {{ min-width: 0; flex: 1 1 30%; padding: 6px 10px; }}
+    .ta-tile .val {{ font-size: 1.25rem; }}
+    .ta-tile .hint {{ display: none; }}
+    .q-tab {{ padding: 0 8px; }}
+}}
 [data-ag-theme-mode="dark"] {{
     --ag-background-color: {COLORS['bg_dark']}; --ag-odd-row-background-color: {COLORS['surface']};
     --ag-header-background-color: {COLORS['surface2']}; --ag-header-text-color: {COLORS['accent']};
@@ -54,32 +84,106 @@ body {{ background: {COLORS['bg']}; color: {COLORS['fg']}; }}
 """
 
 
+# Button and tab labels end in their key, e.g. "Sync (s)"; phones have no keyboard, so drop
+# that suffix there. It edits the text nodes' values in place, which Vue keeps updating.
+STRIP_KEY_HINTS_JS = f"""
+<script>
+(() => {{
+  const phone = matchMedia("(max-width: {PHONE_MAX_WIDTH}px)");
+  const strip = () => {{
+    if (!phone.matches) return;
+    document.querySelectorAll(".q-btn__content .block, .q-tab__label").forEach(el => el.childNodes.forEach(node => {{
+      if (node.nodeType !== 3) return;
+      const text = node.nodeValue.replace(/ \\([^()]{{1,6}}\\)( ▶)?$/, (_, arrow) => arrow || "");
+      if (text !== node.nodeValue) node.nodeValue = text;
+    }}));
+  }};
+  new MutationObserver(strip).observe(document.body, {{childList: true, subtree: true, characterData: true}});
+  strip();
+}})();
+</script>
+"""
+
+
+# Once a page has loaded, the browser reports how long that took (see web.py's
+# /_ta/timing): what a phone over the VPN really sees, beyond the server's share.
+BROWSER_TIMING_JS = """
+<script>
+window.addEventListener("load", () => setTimeout(() => {
+  const nav = performance.getEntriesByType("navigation")[0];
+  if (!nav || !navigator.sendBeacon) return;
+  const report = {path: location.pathname, width: window.innerWidth, ttfb: nav.responseStart,
+                  dom: nav.domContentLoadedEventEnd, load: nav.loadEventEnd, bytes: nav.transferSize};
+  navigator.sendBeacon("/_ta/timing", new Blob([JSON.stringify(report)], {type: "application/json"}));
+}, 0));
+</script>
+"""
+
+QUIET_EVENTS = {"key"}  # the Frame logs its keys itself, by name
+
+
+def instrument_events() -> None:
+    """Log how long each UI event's handler ran on the event loop (a click, a grid event, a
+    select's change...): slow ones at INFO, the rest at DEBUG. Work a handler awaits (off
+    the loop) isn't included; the Frame's actions and run_job log that."""
+    from nicegui.element import Element
+
+    original = Element._handle_event
+
+    def handle_event(self, msg: dict) -> None:
+        listener = self._event_listeners.get(msg.get("listener_id"))
+        if listener is None or listener.type in QUIET_EVENTS:
+            return original(self, msg)
+        start = time.perf_counter()
+        try:
+            return original(self, msg)
+        finally:
+            elapsed = time.perf_counter() - start
+            if ui_log.isEnabledFor(logging.INFO if elapsed >= applog.SLOW_ACTION_S else logging.DEBUG):
+                text = str(getattr(self, "text", "") or self.props.get("label", "") or "")[:40]
+                path = getattr(getattr(self.client, "page", None), "path", "?")
+                ui_log.log(logging.INFO if elapsed >= applog.SLOW_ACTION_S else logging.DEBUG, "%s: %s on %s%s: %s",
+                           path, listener.type, self.tag, f' "{text}"' if text else "", applog.duration(elapsed))
+
+    Element._handle_event = handle_event
+
+
 # --- Page frame: header, footer key chips, keyboard ---------------------------------
 
 
 class Frame:
     """The common page frame. `bind()` registers a TUI-style single-key binding: it's shown as
-    a clickable chip in the footer and triggered by the key itself."""
+    a clickable chip in the footer and triggered by the key itself. On a phone the footer is
+    hidden and the same actions are in a menu behind a round button at the bottom right."""
 
     def __init__(self, title: str) -> None:
         ui.dark_mode(True)
         ui.colors(primary=COLORS["accent"], positive=COLORS["green"], negative=COLORS["red"], warning=COLORS["yellow"])
         ui.add_css(CSS)
+        ui.add_body_html(STRIP_KEY_HINTS_JS + BROWSER_TIMING_JS)
         ui.page_title(f"{title} · {APP_TITLE}")
-        with ui.header().classes("items-center px-4 py-2"):
+        self.page = title
+        with ui.header().classes("items-center px-4 py-2 no-wrap"):
             ui.label(APP_TITLE).classes("ta-title")
-            ui.label("·").classes("ta-status")
-            self.title = ui.label(title).classes("text-lg font-semibold")
+            ui.label("·").classes("ta-status ta-dot")
+            self.title = ui.label(title).classes("text-lg font-semibold ellipsis")
         with ui.footer().classes("px-3 py-1"):
             self.footer = ui.row().classes("gap-1 items-center")
+        with ui.page_sticky("bottom-right", x_offset=16, y_offset=16).classes("ta-phone-only"):
+            with ui.button(icon="menu").props("round size=lg").classes("shadow-lg"):
+                self.menu = ui.menu().props("anchor='top right' self='bottom right'")
         self.keys: dict[str, Callable] = {}
+        self.labels: dict[str, str] = {}
         ui.keyboard(on_key=self._on_key)
 
     def bind(self, key: str, label: str, action: Callable, shown_key: str | None = None) -> None:
         self.keys[key] = action
+        self.labels[key] = label
         with self.footer:
-            with ui.button(on_click=lambda: _call(action)).props("flat dense no-caps").classes("ta-chip"):
+            with ui.button(on_click=lambda: self._run(key, action)).props("flat dense no-caps").classes("ta-chip"):
                 ui.html(f"<span class='cap'>{shown_key or key}</span>{label}")
+        with self.menu:
+            ui.menu_item(label, on_click=lambda: self._run(key, action))
 
     def bind_back(self, action: Callable | None = None) -> None:
         self.bind("Escape", "Back", action or ui.navigate.back, shown_key="esc")
@@ -87,8 +191,14 @@ class Frame:
     async def _on_key(self, e) -> None:
         if not e.action.keydown or e.action.repeat:
             return
-        action = self.keys.get(str(e.key.name))
+        key = str(e.key.name)
+        action = self.keys.get(key)
         if action is not None:
+            await self._run(key, action)
+
+    async def _run(self, key: str, action: Callable) -> None:
+        """Run a bound action, logging how long it took (all of it, awaited work included)."""
+        with applog.timed(f"{self.page}: {self.labels.get(key, key)} ({key})", ui_log, applog.SLOW_ACTION_S):
             await _call(action)
 
 
@@ -104,7 +214,7 @@ def notify(message: str, severity: str = "information") -> None:
 
 
 def stat_tiles(stats) -> None:
-    with ui.row().classes("w-full gap-3 no-wrap"):
+    with ui.row().classes("w-full gap-3 ta-tiles"):
         for stat in stats:
             color = COLORS.get(stat.color, COLORS["fg"]) if stat.color else COLORS["fg"]
             hint = f"<div class='hint'>{stat.hint}</div>" if stat.hint else ""
@@ -206,6 +316,30 @@ def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_s
     return table
 
 
+PHONE_JS = f"window.matchMedia('(max-width: {PHONE_MAX_WIDTH}px)').matches"
+
+
+def phone_activity_columns(table) -> None:
+    """A display.ACTIVITY_COLUMNS grid on a phone: a short date ("Sat 31.10", with the year
+    when it isn't this one), the name narrower and in its sport's colour (rows' _sport_color)
+    in place of the Sport column; the other columns follow, a sideways swipe away."""
+    date, name, sport = table.options["columnDefs"][:3]
+    date[":valueFormatter"] = f"""p => !({PHONE_JS}) || !p.value ? p.value : (() => {{
+        const d = new Date(p.value.slice(0, 10) + 'T12:00:00');
+        const year = d.getFullYear() === new Date().getFullYear() ? '' : '.' + String(d.getFullYear()).slice(2);
+        return d.toLocaleDateString('en-GB', {{weekday: 'short'}}) + ' ' + p.value.slice(8, 10) + '.' + p.value.slice(5, 7) + year;
+    }})()"""
+    name[":maxWidth"] = f"{PHONE_JS} ? 190 : undefined"
+    name[":cellStyle"] = f"p => {PHONE_JS} && p.data._sport_color ? {{color: p.data._sport_color}} : null"
+    sport[":hide"] = PHONE_JS
+
+
+def open_on_tap(table, open_row: Callable[[int], object]) -> None:
+    """On a phone, a tap on a list's row opens it (`open_row(row)`), as double-click does
+    elsewhere; on a computer a click only selects the row."""
+    table.on("rowClicked", lambda e: _call(lambda: open_row(e.args)), js_handler=f"e => {{ if ({PHONE_JS}) emit(e.data._row) }}")
+
+
 def on_row_change(table, callback: Callable[[int], object]) -> None:
     """Call `callback(row)` whenever the selected row changes. AG Grid also fires a selection
     event for the row being *de*selected, and its event no longer says which kind it is, so
@@ -279,11 +413,35 @@ class Progress:
         self.text = message
 
 
+def job_name(job: Callable) -> str:
+    return getattr(job, "__name__", "job").replace("<lambda>", "job").strip("_")
+
+
+async def run_job(name: str, job: Callable, *args, progress: Callable[[str], None]):
+    """`job(*args, progress=...)` off the event loop, logging its start, each progress
+    step (DEBUG, with the time since the start), its result and how long it took."""
+    start = time.perf_counter()
+
+    def logged_progress(message: str) -> None:
+        job_log.debug("%s [%s] %s", name, applog.duration(time.perf_counter() - start), message)
+        progress(message)
+
+    job_log.info("%s started", name)
+    try:
+        result = await run.io_bound(job, *args, progress=logged_progress)
+    except Exception as e:
+        job_log.exception("%s failed after %s: %s", name, applog.duration(time.perf_counter() - start), e)
+        raise
+    summary = f": {result}" if isinstance(result, str) else ""
+    job_log.info("%s done in %s%s", name, applog.duration(time.perf_counter() - start), summary)
+    return result
+
+
 async def run_with_progress(label, job: Callable, *args):
     progress = Progress()
     timer = ui.timer(0.3, lambda: label.set_text(progress.text) if progress.text else None)
     try:
-        return await run.io_bound(job, *args, progress=progress)
+        return await run_job(job_name(job), job, *args, progress=progress)
     finally:
         timer.cancel()
 

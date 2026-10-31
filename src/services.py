@@ -905,6 +905,21 @@ def route_regions(activities: list[ActivitySummary], routes_list: list[Route]) -
     return {route_id: max(v, key=v.get) for route_id, v in votes.items()}
 
 
+def rename_route(route_id: str, name: str) -> Route:
+    """Give a route a name (from the routes list or an activity on it); ValueError when the
+    name is empty or the route is gone."""
+    name = name.strip()
+    if not name:
+        raise ValueError("Enter a name for the route")
+    routes_list = storage.load_routes()
+    route = next((r for r in routes_list if r.route_id == route_id), None)
+    if route is None:
+        raise ValueError("This route no longer exists — sync or reprocess to match one")
+    route.name = name
+    storage.save_routes(routes_list)
+    return route
+
+
 def listed_routes() -> list[tuple[Route, int, str]]:
     """The Routes screen's routes — those with 2+ activities, most used first — with their
     activity count and region (route_regions)."""

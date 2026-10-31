@@ -17,6 +17,9 @@ WORKDIR /app
 COPY src/requirements-server.txt src/
 RUN pip install --no-cache-dir -r src/requirements-server.txt
 COPY src/ src/
+# The commit the image was built from (server/update.sh); the app logs it at startup.
+ARG TA_VERSION=unknown
+ENV TA_VERSION=$TA_VERSION
 
 # Unprivileged user 1000; the server's quadlet maps the host account onto it (UserNS=keep-id)
 # so files in the data folder belong to that account on the host too.

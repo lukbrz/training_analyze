@@ -198,11 +198,24 @@ The VPN ends on the router, so the server needs no VPN of its own. VPN clients j
 
 ## 9. Updates
 
+**Automatically, every night** (turn it on once):
+
 ```bash
-~/training_analyze/server/update.sh
+~/training_analyze/server/enable-auto-update.sh          # at 02:30; or give a time: ... 01:45
 ```
 
-This pulls the code, rebuilds the image and restarts every athlete's service. If the update changed how activities are read, the next nightly run reprocesses them.
+At that time the server pulls the code. If there are new commits, it rebuilds the image and restarts every athlete's service, then checks that each one answers. If one doesn't, it goes back to the previous image, so a broken update can't leave the app down. The 03:00 nightly run then reprocesses activities if the update changed how they're read.
+
+- See what the last run did: `journalctl --user -u training-analyze-update -n 30`
+- Next run: `systemctl --user list-timers training-analyze-update.timer`
+- Turn it off: `~/training_analyze/server/enable-auto-update.sh off`
+
+**By hand**, any time:
+
+```bash
+~/training_analyze/server/update.sh            # only if the code changed
+~/training_analyze/server/update.sh --force    # rebuild and restart anyway
+```
 
 ## 10. Backups
 
@@ -248,6 +261,7 @@ Each athlete's settings are in `~/.config/training-analyze/<name>.env`. Restart 
 | `TA_NIGHTLY_REPROCESS` | `when-changed` | `always` reprocesses every night (takes long with many activities) |
 | `TA_SECRET` | (generated) | Signs the sign-in cookie; by default a random value kept in `data/.web_secret` |
 | `TZ` | `Europe/Warsaw` | Time zone; dates in the calendar and exports follow it |
+| `TA_LOG_LEVEL` | `INFO` | `DEBUG` also logs fast clicks and every step of a sync (see [What the log shows](#what-the-log-shows)) |
 
 ## 12. Troubleshooting
 
@@ -260,4 +274,21 @@ Each athlete's settings are in `~/.config/training-analyze/<name>.env`. Restart 
 | "A sync is running — try again" | Another job (e.g. the nightly run) is busy; wait or watch the main page's status line |
 | Garmin asks to log in again | Garmin login tokens expired or didn't move; log in on the page shown |
 | Files in the data folder owned by a strange user | The unit needs `UserNS=keep-id:uid=1000,gid=1000` (add-athlete.sh writes it); rerun add-athlete.sh |
-| Logs | `journalctl --user -u training-analyze-lukasz -f`, or `podman logs -f training-analyze-lukasz` |
+| Logs | `journalctl --user -u training-analyze-lukasz -f`, or the file `~/training-analyze/lukasz/data/logs/web.log` (see below) |
+| Update failed | `journalctl --user -u training-analyze-update -n 50`; the app keeps running on the previous image |
+
+### What the log shows
+
+Each athlete's app logs to the journal and to `~/training-analyze/<name>/data/logs/web.log`, which keeps the last 5 × 2 MB. Every line has a time, a level and a topic:
+
+| Topic | What | Example |
+| --- | --- | --- |
+| `ta` | Startup: version (git commit), data folder, number of activities | `Training Analyze 1a2b3c4 starting on 0.0.0.0:8080 (server mode)` |
+| `ta.page` | Each page the server sent, and how long it took | `GET /activity/248… -> 200 in 125 ms` |
+| `ta.page` | The browser's own timing of the same page, with the screen width (≤ 700 px is a phone) | `browser /activity/248… (412px wide): first byte 142 ms, page ready 554 ms, loaded 856 ms` |
+| `ta.page` | Slow steps of an activity page | `activity 248… (running, 2:12:43): loop detection: 1.42 s` |
+| `ta.ui` | Actions (keys, footer, ☰ menu) and clicks slower than 0.1 s | `Activities: Sync (s): 4.40 s` |
+| `ta.job` | Sync, reprocess, export and nightly runs: start, end, duration, result | `background sync done in 4.40 s: Sync complete: 0 new activities` |
+| `ta.stall` | The server was busy and **every open page froze** meanwhile | `event loop blocked for 1.20 s` |
+
+To see every click and each sync step too, add `TA_LOG_LEVEL=DEBUG` to `~/.config/training-analyze/<name>.env` and restart the service. To find what's slow: `grep -E "stall| [0-9.]+ s" ~/training-analyze/lukasz/data/logs/web.log`.

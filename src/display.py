@@ -843,6 +843,7 @@ def lap_menu(row) -> list[MenuItem]:
         MenuItem("phase_metrics", "Phase time / pace / power", "h"),
         MenuItem("physical_laps", "Re-detect loops", "p"),
         MenuItem("leaderboard", "Route leaderboard", "b"),
+        MenuItem("rename_route", "Rename route…", "e"),
         MenuItem("zones", "HR & power zones", "z"),
         MenuItem("copy", "Copy table", "y"),
     ]
