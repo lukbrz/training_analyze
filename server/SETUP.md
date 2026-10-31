@@ -44,6 +44,13 @@ Let the user's services run without anyone logged in, and start at boot:
 sudo loginctl enable-linger training
 ```
 
+If the server runs a firewall (`systemctl is-active ufw`), open the app's ports to your LAN and to the WireGuard clients. Use your own subnets:
+
+```bash
+sudo ufw allow from 192.168.88.0/23 to any port 8080:8089 proto tcp   # LAN (88.x and 89.x)
+sudo ufw allow from <wireguard-subnet> to any port 8080:8089 proto tcp
+```
+
 That's the last root step.
 
 ## 2. Log in as `training`
@@ -108,7 +115,7 @@ Check it:
 
 ```bash
 systemctl --user status training-analyze-lukasz
-curl http://localhost:8080/health          # → {"status":"ok","garmin":false}
+curl http://127.0.0.1:8080/health          # → {"status":"ok","garmin":false}
 ```
 
 **More athletes:** one command each, with their own port, password, Garmin account and data:
@@ -248,7 +255,8 @@ Each athlete's settings are in `~/.config/training-analyze/<name>.env`. Restart 
 | --- | --- |
 | Service won't start | `journalctl --user -u training-analyze-lukasz -e`; is the image built (`podman images`)? |
 | "Unit not found" after add-athlete | `/usr/lib/systemd/system-generators/podman-system-generator --user --dryrun` shows quadlet errors |
-| Page doesn't open over VPN | `curl http://localhost:8080/health` on the server, then the router's forward rule (§8) |
+| Page doesn't open (browser waits forever) | `curl http://127.0.0.1:8080/health` on the server. If that works, the server's firewall drops the port: open 8080-8089/tcp for the LAN and VPN (`ufw allow`, `firewall-cmd --add-port`, or an `accept` line in `/etc/nftables.conf`). Over the VPN, also check the router's forward rule (§8) |
+| `curl localhost:8080` gives "connection reset" | `localhost` tries IPv6 first and the container forwards it, but the app listens on IPv4; use `127.0.0.1` |
 | "A sync is running — try again" | Another job (e.g. the nightly run) is busy; wait or watch the main page's status line |
 | Garmin asks to log in again | Garmin login tokens expired or didn't move; log in on the page shown |
 | Files in the data folder owned by a strange user | The unit needs `UserNS=keep-id:uid=1000,gid=1000` (add-athlete.sh writes it); rerun add-athlete.sh |

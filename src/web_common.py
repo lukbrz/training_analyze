@@ -136,6 +136,12 @@ def stat_strip(groups: list[tuple[list, bool]], caption: str = ""):
     return ui.html(f" &nbsp;<span style='color:{COLORS['border2']}'>│</span>&nbsp; ".join(html_groups)).classes("w-full")
 
 
+# Grid events are sent to the server with only these fields. Some AG Grid events (e.g.
+# rowDoubleClicked) carry its internal, circular context object; sent whole, the browser
+# fails to serialise them and the event never reaches the server.
+ROW_EVENT_ARGS = ["rowIndex", "data"]
+
+
 def row_context_menu(table, menu_for_row: Callable[[int], list], handlers: dict[str, Callable]) -> None:
     """Right-click on a grid row selects it and opens its menu (display.*_menu) at the
     cursor: every item a handler is given for, greyed out where it doesn't apply to that
@@ -169,7 +175,7 @@ def row_context_menu(table, menu_for_row: Callable[[int], list], handlers: dict[
         select_row(table, row)
         fill(row)
 
-    table.on("cellContextMenu", clicked)
+    table.on("cellContextMenu", clicked, args=ROW_EVENT_ARGS)
 
 
 def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_style: str | None = None, **options):
@@ -196,7 +202,7 @@ def grid(columns: tuple[str, ...], rows: list[dict], height: str = "60vh", row_s
     # Keyboard navigation (arrow keys move the focused cell) also selects the row, so the
     # "current row" works like the TUI's cursor whether you click or use the keyboard.
     table.on("cellFocused", lambda e: table.run_row_method(str(e.args["rowIndex"]), "setSelected", True)
-             if e.args.get("rowIndex") is not None else None)
+             if e.args.get("rowIndex") is not None else None, args=ROW_EVENT_ARGS)
     return table
 
 
@@ -212,7 +218,7 @@ def on_row_change(table, callback: Callable[[int], object]) -> None:
             state["row"] = row
             await _call(lambda: callback(row))
 
-    table.on("rowSelected", changed)
+    table.on("rowSelected", changed, args=ROW_EVENT_ARGS)
 
 
 def grid_rows(rows: list[tuple[str, ...]], extra: list[dict] | None = None) -> list[dict]:

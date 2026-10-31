@@ -48,6 +48,7 @@ from models import format_distance
 from web_common import (
     APP_TITLE,
     ECHART_BASE,
+    ROW_EVENT_ARGS,
     Frame,
     State,
     axis_style,
@@ -169,7 +170,7 @@ def main_page() -> None:
         if row is not None and 0 <= row < len(state["shown"]):
             ui.navigate.to(f"/activity/{state['shown'][row].activity_id}")
 
-    table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]))
+    table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]), args=ROW_EVENT_ARGS)
 
     async def open_selected() -> None:
         open_row(await selected_row(table))
@@ -673,7 +674,7 @@ def routes_page() -> None:
         refresh()
 
     on_row_change(table, show)
-    table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/routes/{state['grouped'][e.args['data']['_row']][0].route_id}"))
+    table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/routes/{state['grouped'][e.args['data']['_row']][0].route_id}"), args=ROW_EVENT_ARGS)
     frame.bind_back()
     frame.bind("e", "Rename route", rename)
 
@@ -728,7 +729,7 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
         if 0 <= row < len(efforts):
             ui.navigate.to(f"/activity/{efforts[row].activity_id}")
 
-    table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]))
+    table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]), args=ROW_EVENT_ARGS)
     frame.bind("w", "Loops / whole route", toggle_kind)
     frame.bind("o", "Best per ride / all", toggle)
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.LEADERBOARD_COLUMNS, display.leaderboard_rows(shown(), route.sport)), "leaderboard"))
@@ -752,7 +753,7 @@ def route_activities_page(route_id: str) -> None:
     matching = sorted((a for a in activities if a.route_id == route_id), key=lambda a: a.start_time_local, reverse=True)
     ui.label(f"Route: {route.name}  |  {len(matching)} activities").classes("ta-status")
     table = grid(display.ACTIVITY_COLUMNS, grid_rows([display.activity_row(a, route.name) for a in matching]), height="calc(100vh - 180px)")
-    table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/activity/{matching[e.args['data']['_row']].activity_id}"))
+    table.on("rowDoubleClicked", lambda e: ui.navigate.to(f"/activity/{matching[e.args['data']['_row']].activity_id}"), args=ROW_EVENT_ARGS)
 
 
 # --- Workouts ------------------------------------------------------------------------
@@ -849,7 +850,7 @@ def workouts_page() -> None:
             await upload(items)
 
     on_row_change(table, lambda row: show_preview(library.rows[row].key if row < len(library.rows) else None))
-    table.on("rowDoubleClicked", lambda e: toggle(e.args["data"]["_key"]) if e.args["data"]["_kind"] == "week" else None)
+    table.on("rowDoubleClicked", lambda e: toggle(e.args["data"]["_key"]) if e.args["data"]["_kind"] == "week" else None, args=ROW_EVENT_ARGS)
 
     async def toggle_selected() -> None:
         toggle(await selected_key())
@@ -1118,7 +1119,7 @@ def calendar_page() -> None:
         if item is not None and item.activity_id:
             ui.navigate.to(f"/activity/{item.activity_id}")
 
-    table.on("rowDoubleClicked", lambda e: open_activity())
+    table.on("rowDoubleClicked", lambda e: open_activity(), args=ROW_EVENT_ARGS)
 
     def week_menu(row: int) -> list:
         items = state["view"].visible_items
