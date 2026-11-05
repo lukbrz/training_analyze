@@ -13,6 +13,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Checkbox, DataTable, Footer, Header, Input, OptionList, Select, Static
 from textual_plotext import PlotextPlot
 
+import compare
 import display
 import fit_parser
 import garmin_client
@@ -25,7 +26,7 @@ import training_load
 import workout_library
 from laps_session import LapsError, LapsSession
 from models import ActivitySummary, Lap, Route, ZoneTime
-from theme import COLORS
+from theme import COLORS, SERIES_COLORS
 from workout_library import LibraryError, WorkoutLibrary
 
 ALL_SPORTS = "__all__"
@@ -34,6 +35,11 @@ ALL_SPORTS = "__all__"
 def _rgb(name: str) -> tuple[int, int, int]:
     """A theme palette colour as the (r, g, b) tuple plotext accepts."""
     value = COLORS[name].lstrip("#")
+    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _series_rgb(n: int) -> tuple[int, int, int]:
+    value = SERIES_COLORS[n % len(SERIES_COLORS)].lstrip("#")
     return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
 
 
@@ -824,14 +830,56 @@ class ZonesScreen(Screen):
         self.app.pop_screen()
 
 
-class CompareScreen(Screen):
-    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+class ChartPlot(PlotextPlot):
+    """A plot drawing a compare.Chart; a click fills the screen with it, another click
+    brings the other charts back (the screen's `toggle_maximized`)."""
 
-    X_MODE_BUTTONS = {
-        "x_mode_time_button": "time",
-        "x_mode_distance_button": "distance",
-        "x_mode_percent_button": "percent",
-    }
+    def draw(self, chart: "compare.Chart") -> None:
+        plt = self.plt
+        plt.clear_figure()  # also drops a previous chart's zero line / bar layout
+        if chart.kind == "bar" and not chart.empty:
+            # Colour 0 is the reference effort's (its line on the gap chart), as in the GUIs.
+            plt.multiple_bar(chart.categories, [s.ys for s in chart.series], labels=[s.label for s in chart.series],
+                             color=[_series_rgb(n + 1) for n in range(len(chart.series))])
+        else:
+            for n, s in enumerate(chart.series):
+                plt.plot(s.xs, s.ys, label=s.label, color=_series_rgb(n))
+            if chart.zero_line and not chart.empty:
+                plt.hline(0, _rgb("comment"))
+        plt.title(chart.title if not chart.empty else f"{chart.title} — no data")
+        plt.xlabel(chart.x_label)
+        self.refresh()
+
+    def on_click(self) -> None:
+        toggle = getattr(self.screen, "toggle_maximized", None)
+        if toggle is not None:
+            toggle(self)
+
+
+class ChartsScreen(Screen):
+    """Charts stacked one above the other (ChartPlot); subclasses fill them in `_redraw`."""
+
+    def toggle_maximized(self, plot: ChartPlot) -> None:
+        plots = list(self.query(ChartPlot))
+        maximized = any(not p.display for p in plots)
+        for p in plots:
+            p.display = maximized or p is plot
+
+    def action_back(self) -> None:
+        plots = list(self.query(ChartPlot))
+        if any(not p.display for p in plots):  # a maximized chart: esc brings the others back
+            for p in plots:
+                p.display = True
+            return
+        self.app.pop_screen()
+
+
+class CompareScreen(ChartsScreen):
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("v", "toggle_values", "Values / vs best"),
+        Binding("s", "cycle_smoothing", "Smoothing"),
+    ]
 
     def __init__(
         self,
@@ -846,53 +894,60 @@ class CompareScreen(Screen):
         self.records = records
         self.utc_offset = offset
         self.x_mode = "time"
+        self.value_mode = "absolute"
+        self.smoothing_s = compare.DEFAULT_SMOOTHING_S
+        self.speed_note = services.speed_note(activity)
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(
-            f"Comparing {len(self.marked_laps)} intervals — {self.activity.name}", id="compare_status"
+            f"Comparing {len(self.marked_laps)} intervals — {self.activity.name} · click a chart to enlarge it", id="compare_status"
         )
         yield HorizontalGroup(
-            Button("Time", id="x_mode_time_button", variant="primary"),
-            Button("Distance", id="x_mode_distance_button"),
-            Button("%", id="x_mode_percent_button"),
+            *(Button(text, id=f"x_{mode}") for mode, text in compare.X_MODES),
+            Static("  "),
+            *(Button(text, id=f"value_{mode}") for mode, text in compare.VALUE_MODES),
+            Static("  "),
+            *(Button(text, id=f"smooth_{seconds}") for seconds, text in compare.SMOOTHING_CHOICES),
             id="x_mode_bar",
         )
-        yield Vertical(
-            PlotextPlot(id="power_plot"),
-            PlotextPlot(id="hr_plot"),
-            PlotextPlot(id="speed_plot"),
-        )
+        yield Vertical(*(ChartPlot(id=f"{attr}_plot") for attr, *_ in compare.METRICS))
         yield Footer()
 
     def on_mount(self) -> None:
         self._redraw()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        mode = self.X_MODE_BUTTONS.get(event.button.id)
-        if mode is None:
+        kind, _, value = (event.button.id or "").partition("_")
+        if kind == "x":
+            self.x_mode = value
+        elif kind == "value":
+            self.value_mode = value
+        elif kind == "smooth":
+            self.smoothing_s = int(value)
+        else:
             return
-        self.x_mode = mode
-        for button_id in self.X_MODE_BUTTONS:
-            self.query_one(f"#{button_id}", Button).variant = (
-                "primary" if button_id == event.button.id else "default"
-            )
+        self._redraw()
+
+    def action_toggle_values(self) -> None:
+        self.value_mode = "relative" if self.value_mode == "absolute" else "absolute"
+        self._redraw()
+
+    def action_cycle_smoothing(self) -> None:
+        choices = [seconds for seconds, _ in compare.SMOOTHING_CHOICES]
+        self.smoothing_s = choices[(choices.index(self.smoothing_s) + 1) % len(choices)]
         self._redraw()
 
     def _redraw(self) -> None:
-        for widget_id, (attr, title, scale) in zip(("power_plot", "hr_plot", "speed_plot"), display.COMPARE_METRICS):
-            plot = self.query_one(f"#{widget_id}", PlotextPlot)
-            plt = plot.plt
-            plt.clear_data()
-            series = display.compare_series(self.marked_laps, self.records, self.utc_offset, attr, self.x_mode, scale)
-            for label, xs, ys in series:
-                plt.plot(xs, ys, label=label)
-            plt.title(title if series else f"{title} — no data")
-            plt.xlabel(display.COMPARE_X_AXIS_LABELS[self.x_mode])
-            plot.refresh()
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
+        chosen = {f"x_{self.x_mode}", f"value_{self.value_mode}", f"smooth_{self.smoothing_s}"}
+        for button in self.query("#x_mode_bar Button").results(Button):
+            button.variant = "primary" if button.id in chosen else "default"
+        charts = compare.interval_charts(
+            self.marked_laps, compare.interval_labels(self.marked_laps), self.records, self.utc_offset,
+            self.x_mode, self.value_mode, self.smoothing_s, self.speed_note,
+        )
+        for plot, chart in zip(self.query(ChartPlot).results(ChartPlot), charts):
+            plot.draw(chart)
 
 
 class StrengthSetsScreen(Screen):
@@ -1187,6 +1242,8 @@ class LeaderboardScreen(Screen):
         Binding("escape", "back", "Back", priority=True),
         Binding("w", "toggle_kind", "Loops / whole route"),
         Binding("o", "toggle_best", "Best per ride / all"),
+        Binding("m", "mark", "Mark to compare"),
+        Binding("c", "compare", "Compare with #1"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -1198,6 +1255,7 @@ class LeaderboardScreen(Screen):
         self.best_only = False
         self.kind = "loops"
         self.board: leaderboard.Board | None = None
+        self.marked: set[tuple[str, str]] = set()  # Effort.key of efforts marked to compare
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1241,10 +1299,31 @@ class LeaderboardScreen(Screen):
             display.leaderboard_status(self.route.name, self.kind, length, shown, self.best_only, other)
         )
         table = self.query_one(DataTable)
+        cursor = table.cursor_row
         table.clear()
-        for effort, row in zip(shown, display.leaderboard_rows(shown, self.route.sport)):
+        for effort, row in zip(shown, display.leaderboard_rows(shown, self.route.sport, self.marked)):
             style = f"bold {COLORS['yellow']}" if effort.activity_id == self.highlight else ""
             table.add_row(*(Text(v, style=style) for v in row))
+        if shown:
+            table.move_cursor(row=min(cursor, len(shown) - 1))
+
+    def action_mark(self) -> None:
+        shown = self._shown()
+        row = self.query_one(DataTable).cursor_row
+        if 0 <= row < len(shown):
+            self.marked ^= {shown[row].key}
+            self._render_board()
+            self.query_one(DataTable).move_cursor(row=min(row + 1, len(shown) - 1))
+
+    def action_compare(self) -> None:
+        b = self.board
+        length = (b.loop_m if self.kind == "loops" else b.route_m) if b else None
+        try:
+            charts = leaderboard.compare_charts(self._shown(), self.marked, self.query_one(DataTable).cursor_row, length)
+        except ValueError as e:
+            self.notify(str(e), severity="warning")
+            return
+        self.app.push_screen(EffortCompareScreen(f"{self.route.name} — {display.LEADERBOARD_KINDS[self.kind].lower()}", charts))
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         shown = self._shown()
@@ -1268,6 +1347,27 @@ class LeaderboardScreen(Screen):
 
     def action_back(self) -> None:
         self.app.pop_screen()
+
+
+class EffortCompareScreen(ChartsScreen):
+    """Leaderboard efforts against the fastest one along the route (compare.effort_charts)."""
+
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    def __init__(self, title: str, charts: list) -> None:
+        super().__init__()
+        self.title_text = title
+        self.charts = charts
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static(f"{self.title_text} · click a chart to enlarge it", id="compare_status")
+        yield Vertical(*(ChartPlot() for _ in self.charts))
+        yield Footer()
+
+    def on_mount(self) -> None:
+        for plot, chart in zip(self.query(ChartPlot).results(ChartPlot), self.charts):
+            plot.draw(chart)
 
 
 class RouteActivitiesScreen(Screen):

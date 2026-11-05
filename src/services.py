@@ -813,6 +813,21 @@ def tpv_recording(activity: ActivitySummary) -> tuple[str, str] | None:
     return None
 
 
+
+def speed_note(activity: ActivitySummary) -> str:
+    """Where an activity's speed comes from, when a chart should say so: the virtual ride's
+    (TPV's) speed for a ride merged with one, or a bike computer's trainer estimate for an
+    indoor ride without one (its TPV recording never synced — e.g. deleted from Garmin
+    Connect before this instance downloaded it)."""
+    recording = tpv_recording(activity)
+    if recording is not None:
+        return "from TPV" if tpv.route_name(recording[1]) else "from the virtual ride"
+    if activity.sport != "cycling" or not _indoor(activity.activity_id):
+        return ""
+    if activity.activity_id in set(storage.load_merge_ledger().values()):
+        return "from the merged recording"
+    return "trainer estimate (no TPV recording)"
+
 @dataclass
 class TpvLoops:
     route: str | None  # TPV route name, None when the title doesn't say

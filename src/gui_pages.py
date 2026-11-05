@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import compare
 import display
 import fit_parser
 import garmin_client
@@ -34,6 +35,7 @@ import workout_library
 from gui_common import (
     COLORS,
     SPORT_COLORS,
+    ChartStack,
     LegCard,
     Page,
     StackedBar,
@@ -47,7 +49,6 @@ from gui_common import (
     on_ui,
     plot_bars,
     plot_dated_lines,
-    plot_lines,
     run_background,
     table_as_tsv,
 )
@@ -740,42 +741,70 @@ class StrengthSetsPage(Page):
 
 
 class ComparePage(Page):
-    X_MODES = (("Time", "time"), ("Distance", "distance"), ("%", "percent"))
-
     def __init__(self, window, activity, marked_laps, records, utc_offset) -> None:
         super().__init__(window)
         self.title = f"Comparing {len(marked_laps)} intervals — {activity.name}"
         self.marked_laps, self.records, self.utc_offset = marked_laps, records, utc_offset
-        self.x_mode = "time"
-        self.layout_.addWidget(label(self.title, "status"))
-        group = QButtonGroup(self)
-        buttons = []
-        for text, mode in self.X_MODES:
-            b = button(text, lambda _=False, m=mode: self._set_mode(m), checkable=True)
-            b.setChecked(mode == self.x_mode)
-            group.addButton(b)
-            buttons.append(b)
-        self.layout_.addLayout(row_layout(*buttons))
-        self.charts = []
-        for _ in display.COMPARE_METRICS:
-            view, chart = make_chart_view()
-            chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
-            self.layout_.addWidget(view, 1)
-            self.charts.append(chart)
-        self.bind_back()
+        self.labels = compare.interval_labels(marked_laps)
+        self.speed_note = services.speed_note(activity)
+        self.choice = {"x": "time", "value": "absolute", "smooth": compare.DEFAULT_SMOOTHING_S}
+        self.layout_.addWidget(label(f"{self.title} · click a chart to enlarge it", "status"))
+        self.buttons: dict[tuple[str, object], QPushButton] = {}
+        widgets = []
+        for kind, choices in (("x", compare.X_MODES), ("value", compare.VALUE_MODES), ("smooth", compare.SMOOTHING_CHOICES)):
+            if widgets:
+                widgets.append(label("  "))
+            group = QButtonGroup(self)
+            for value, text in choices:
+                b = button(text, lambda _=False, k=kind, v=value: self._choose(k, v), checkable=True)
+                group.addButton(b)
+                self.buttons[(kind, value)] = b
+                widgets.append(b)
+        self.layout_.addLayout(row_layout(*widgets))
+        self.stack = ChartStack(len(compare.METRICS))
+        self.layout_.addWidget(self.stack, 1)
+        self.bind("Escape", "Back", self.back, display_key="esc")
+        self.bind("v", "Values / vs best", lambda: self._choose("value", "relative" if self.choice["value"] == "absolute" else "absolute"))
+        self.bind("s", "Smoothing", self.cycle_smoothing)
         self._redraw()
 
-    def _set_mode(self, mode: str) -> None:
-        self.x_mode = mode
+    def back(self) -> None:
+        if self.stack.maximized:
+            self.stack.restore()
+        else:
+            self.window_.pop()
+
+    def cycle_smoothing(self) -> None:
+        choices = [seconds for seconds, _ in compare.SMOOTHING_CHOICES]
+        self._choose("smooth", choices[(choices.index(self.choice["smooth"]) + 1) % len(choices)])
+
+    def _choose(self, kind: str, value) -> None:
+        self.choice[kind] = value
         self._redraw()
 
     def _redraw(self) -> None:
-        last = len(self.charts) - 1
-        for i, (chart, (attr, title, scale)) in enumerate(zip(self.charts, display.COMPARE_METRICS)):
-            series = display.compare_series(self.marked_laps, self.records, self.utc_offset, attr, self.x_mode, scale)
-            # Same laps on every chart: one legend (top) and one x-axis title (bottom) are enough,
-            # leaving each plot the height its axis labels need.
-            plot_lines(chart, title, series, display.COMPARE_X_AXIS_LABELS[self.x_mode] if i == last else "", legend=i == 0)
+        for (kind, value), b in self.buttons.items():
+            b.setChecked(self.choice[kind] == value)
+        charts = compare.interval_charts(
+            self.marked_laps, self.labels, self.records, self.utc_offset,
+            self.choice["x"], self.choice["value"], self.choice["smooth"], self.speed_note,
+        )
+        # Same laps on every chart: one legend (top) and one x-axis title (bottom) are enough,
+        # leaving each plot the height its axis labels need.
+        self.stack.draw(charts, legend_on_first_only=True, x_title_on_last_only=True)
+
+
+class EffortComparePage(Page):
+    """Leaderboard efforts against the fastest one along the route (compare.effort_charts)."""
+
+    def __init__(self, window, title: str, charts: list) -> None:
+        super().__init__(window)
+        self.title = title
+        self.layout_.addWidget(label(f"{title} · click a chart to enlarge it", "status"))
+        self.stack = ChartStack(len(charts))
+        self.layout_.addWidget(self.stack, 1)
+        self.stack.draw(charts)
+        self.bind("Escape", "Back", lambda: self.stack.restore() if self.stack.maximized else self.window_.pop(), display_key="esc")
 
 
 class PhaseMetricsPage(Page):
@@ -934,6 +963,7 @@ class LeaderboardPage(Page):
         self.best_only = False
         self.kind = "loops"
         self.board = None
+        self.marked: set[tuple[str, str]] = set()  # Effort.key of efforts marked to compare
         self.status = label(f"{route.name} — finding loops...", "status")
         self.table = make_table(display.LEADERBOARD_COLUMNS, stretch_column=8)
         self.table.cellActivated.connect(lambda row, _: self._open(row))
@@ -942,6 +972,8 @@ class LeaderboardPage(Page):
         self.bind_back()
         self.bind("w", "Loops / whole route", self.toggle_kind)
         self.bind("o", "Best per ride / all", self.toggle_best)
+        self.bind("m", "Mark to compare", self.mark)
+        self.bind("c", "Compare with #1", self.compare)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} efforts"))
         run_background(
             lambda: leaderboard.route_leaderboard(route.route_id, progress=lambda m: on_ui(self.status.setText, m)),
@@ -970,7 +1002,25 @@ class LeaderboardPage(Page):
         length = (b.loop_m if self.kind == "loops" else b.route_m) if b else None
         self.status.setText(display.leaderboard_status(self.route.name, self.kind, length, shown, self.best_only, other))
         styles = [{"bold": True, "color": COLORS["yellow"]} if e.activity_id == self.highlight else {} for e in shown]
-        fill_table(self.table, display.leaderboard_rows(shown, self.route.sport), styles, right_aligned={0, 1, 3, 4, 5})
+        fill_table(self.table, display.leaderboard_rows(shown, self.route.sport, self.marked), styles, right_aligned={0, 1, 3, 4, 5})
+
+    def mark(self) -> None:
+        shown, row = self._shown(), self.table.currentRow()
+        if 0 <= row < len(shown):
+            self.marked ^= {shown[row].key}
+            self._render()
+            self.table.selectRow(min(row + 1, len(shown) - 1))
+
+    def compare(self) -> None:
+        b = self.board
+        length = (b.loop_m if self.kind == "loops" else b.route_m) if b else None
+        try:
+            charts = leaderboard.compare_charts(self._shown(), self.marked, self.table.currentRow(), length)
+        except ValueError as e:
+            self.notify(str(e), "warning")
+            return
+        title = f"{self.route.name} — {display.LEADERBOARD_KINDS[self.kind].lower()} vs fastest"
+        self.window_.push(EffortComparePage(self.window_, title, charts))
 
     def toggle_best(self) -> None:
         self.best_only = not self.best_only

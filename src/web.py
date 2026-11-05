@@ -36,6 +36,7 @@ from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
 from nicegui import app, background_tasks, run, ui  # noqa: E402
 
 import applog
+import compare
 import display
 import fit_parser
 import garmin_client
@@ -56,6 +57,7 @@ from web_common import (
     Frame,
     State,
     axis_style,
+    chart_panel,
     copy,
     draw_track,
     escape,
@@ -310,7 +312,7 @@ def laps_page(activity_id: str) -> None:
         frame.bind_back()
         return
     session = LapsSession(activity)
-    state = {"rows": [], "map_mode": "speed_mps", "x_mode": "time"}
+    state = {"rows": [], "map_mode": "speed_mps", "x": "time", "value": "absolute", "smooth": compare.DEFAULT_SMOOTHING_S, "speed_note": None}
 
     with ui.row().classes("items-center gap-2"):
         ui.html(f"<span style='color:{SPORT_COLORS.get(activity.sport, COLORS['fg'])}; font-weight:600'>{activity.sport}</span>")
@@ -391,8 +393,13 @@ def laps_page(activity_id: str) -> None:
         with ui.tab_panel(phases_tab).classes("p-0"):
             phases_area = ui.column().classes("w-full gap-2")
         with ui.tab_panel(compare_tab).classes("p-0"):
-            with ui.row().classes("items-center gap-2"):
-                x_buttons = {mode: ui.button(text, on_click=lambda m=mode: draw_compare(m)).props("outline") for text, mode in (("Time", "time"), ("Distance", "distance"), ("%", "percent"))}
+            with ui.row().classes("items-center gap-2 ta-wrap"):
+                compare_buttons = {}
+                for kind, choices in (("x", compare.X_MODES), ("value", compare.VALUE_MODES), ("smooth", compare.SMOOTHING_CHOICES)):
+                    for value, text in choices:
+                        compare_buttons[(kind, value)] = ui.button(text, on_click=lambda k=kind, v=value: draw_compare(**{k: v})).props("outline")
+                    ui.element("div").style("width: 12px")
+                ui.label("click a chart to enlarge it").classes("ta-status")
             compare_area = ui.column().classes("w-full gap-2")
         with ui.tab_panel(zones_tab).classes("p-0"):
             zones_area = ui.column().classes("w-full gap-2")
@@ -530,29 +537,36 @@ def laps_page(activity_id: str) -> None:
                     ], "itemStyle": {"borderRadius": [4, 4, 0, 0]}}],
                 }).classes("w-full").style("height: 30vh")
 
-    def draw_compare(mode: str | None = None) -> None:
+    def draw_compare(x: str | None = None, value: str | None = None, smooth: int | None = None) -> None:
         try:
             marked, records, offset = session.compare_inputs()
         except LapsError as e:
             notify(str(e), "warning")
             return
         tabs.set_value(compare_tab)
-        state["x_mode"] = mode or state["x_mode"]
-        for m, b in x_buttons.items():
-            b.props(remove="outline") if m == state["x_mode"] else b.props("outline")
+        for kind, chosen in (("x", x), ("value", value), ("smooth", smooth)):
+            if chosen is not None:
+                state[kind] = chosen
+        if state["speed_note"] is None:
+            state["speed_note"] = services.speed_note(activity)
+        for (kind, choice), b in compare_buttons.items():
+            b.props(remove="outline") if state[kind] == choice else b.props("outline")
+        charts = compare.interval_charts(
+            marked, compare.interval_labels(marked), records, offset, state["x"], state["value"], state["smooth"], state["speed_note"],
+        )
         compare_area.clear()
         with compare_area:
-            for i, (attr, title, scale) in enumerate(display.COMPARE_METRICS):
-                series = display.compare_series(marked, records, offset, attr, state["x_mode"], scale)
-                ui.echart({
-                    **ECHART_BASE, "title": {"text": title, "left": "center", "textStyle": {"color": COLORS["fg"], "fontSize": 13}},
-                    "legend": {"show": i == 0, "top": 22, "textStyle": {"color": COLORS["fg"]}},
-                    "grid": {**ECHART_BASE["grid"], "top": 55 if i == 0 else 40},
-                    "xAxis": axis_style(type="value", name=display.COMPARE_X_AXIS_LABELS[state["x_mode"]], nameLocation="middle", nameGap=25),
-                    "yAxis": axis_style(type="value", scale=True),
-                    "series": [{"type": "line", "name": label, "showSymbol": False, "data": [[x, round(y, 1)] for x, y in zip(xs, ys)],
-                                "lineStyle": {"width": 1.6}, "color": SERIES_COLORS[n % len(SERIES_COLORS)]} for n, (label, xs, ys) in enumerate(series)],
-                }).classes("w-full").style("height: 30vh")
+            for i, chart in enumerate(charts):
+                chart_panel(frame, chart, legend=i == 0)
+
+    def compare_key(kind: str) -> None:
+        if tabs.value not in (compare_tab, "Compare (c)"):
+            return
+        if kind == "value":
+            draw_compare(value="relative" if state["value"] == "absolute" else "absolute")
+        else:
+            choices = [seconds for seconds, _ in compare.SMOOTHING_CHOICES]
+            draw_compare(smooth=choices[(choices.index(state["smooth"]) + 1) % len(choices)])
 
     async def show_zones() -> None:
         tabs.set_value(zones_tab)
@@ -626,6 +640,8 @@ def laps_page(activity_id: str) -> None:
     if sets_tab is not None:  # clicking the tab loads it too, not only the t key
         tabs.on_value_change(lambda e: show_sets() if e.value in (sets_tab, "Sets (t)") and not state.get("sets_loaded") else None)
     frame.bind("c", "Compare intervals", draw_compare)
+    frame.keys["v"] = lambda: compare_key("value")  # compare tab: values / vs best
+    frame.keys["s"] = lambda: compare_key("smooth")  # compare tab: next smoothing
     frame.bind("p", "Re-detect loops", physical_laps)
     frame.bind("i", "Split intervals", split_intervals)
     frame.bind("f", "Interval-only", toggle_filter)
@@ -743,12 +759,14 @@ def routes_page() -> None:
 def leaderboard_page(route_id: str, highlight: str = "") -> None:
     route = next((r for r in storage.load_routes() if r.route_id == route_id), None)
     frame = Frame(f"Leaderboard — {route.name}" if route else "Route not found")
-    frame.bind_back()
+    frame.bind_back(lambda: back() if route else ui.navigate.back())
     if route is None:
         return
-    state = {"board": None, "kind": "loops", "best_only": False}
+    state = {"board": None, "kind": "loops", "best_only": False, "marked": set()}
     status = ui.label(f"{route.name} — finding loops...").classes("ta-status")
     table = grid(display.LEADERBOARD_COLUMNS, [], height="calc(100vh - 170px)")
+    compare_area = ui.column().classes("w-full gap-2")  # replaces the table while comparing (c)
+    compare_area.set_visibility(False)
 
     def shown() -> list:
         board = state["board"]
@@ -763,7 +781,7 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
         other = len(board.routes if kind == "loops" else board.loops) if board else 0
         length = (board.loop_m if kind == "loops" else board.route_m) if board else None
         status.set_text(display.leaderboard_status(route.name, kind, length, efforts, state["best_only"], other))
-        table.options["rowData"] = grid_rows(display.leaderboard_rows(efforts, route.sport), [{"_mine": e.activity_id == highlight} for e in efforts])
+        table.options["rowData"] = grid_rows(display.leaderboard_rows(efforts, route.sport, state["marked"]), [{"_mine": e.activity_id == highlight} for e in efforts])
         table.options[":getRowStyle"] = f"params => params.data._mine ? {{fontWeight: 600, color: '{COLORS['yellow']}'}} : {{}}"
         table.update()
 
@@ -780,8 +798,40 @@ def leaderboard_page(route_id: str, highlight: str = "") -> None:
         if 0 <= row < len(efforts):
             ui.navigate.to(f"/activity/{efforts[row].activity_id}")
 
+    async def mark() -> None:
+        efforts, row = shown(), await selected_row(table)
+        if row is not None and 0 <= row < len(efforts):
+            state["marked"] ^= {efforts[row].key}
+            render()
+            select_row(table, min(row + 1, len(efforts) - 1))
+
+    async def compare_efforts() -> None:
+        board, kind = state["board"], state["kind"]
+        length = (board.loop_m if kind == "loops" else board.route_m) if board else None
+        try:
+            charts = leaderboard.compare_charts(shown(), state["marked"], await selected_row(table), length)
+        except ValueError as e:
+            notify(str(e), "warning")
+            return
+        compare_area.clear()
+        with compare_area:
+            ui.label(f"{display.LEADERBOARD_KINDS[kind]} vs the fastest · click a chart to enlarge it · esc: back to the board").classes("ta-status")
+            for chart in charts:
+                chart_panel(frame, chart, height="38vh")
+        table.set_visibility(False)
+        compare_area.set_visibility(True)
+
+    def back() -> None:
+        if compare_area.visible:
+            compare_area.set_visibility(False)
+            table.set_visibility(True)
+        else:
+            ui.navigate.back()
+
     table.on("rowDoubleClicked", lambda e: open_row(e.args["data"]["_row"]), args=ROW_EVENT_ARGS)
     open_on_tap(table, open_row)
+    frame.bind("m", "Mark to compare", mark)
+    frame.bind("c", "Compare with #1", compare_efforts)
     frame.bind("w", "Loops / whole route", toggle_kind)
     frame.bind("o", "Best per ride / all", toggle)
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.LEADERBOARD_COLUMNS, display.leaderboard_rows(shown(), route.sport)), "leaderboard"))

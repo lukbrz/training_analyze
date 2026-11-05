@@ -512,7 +512,7 @@ def strength_summary(sets: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# --- Zones, compare charts, routes ------------------------------------------------
+# --- Zones, routes ------------------------------------------------
 
 ZONE_COLUMNS = ("#", "Range", "Time", "%")
 
@@ -531,27 +531,6 @@ def zone_rows(zones) -> list[tuple[str, ...]]:
             zone_range = "–"
         rows.append((str(zone.zone_number), zone_range, format_duration(zone.seconds), f"{zone.seconds / total * 100:.0f}%"))
     return rows
-
-
-# (record attribute, chart title, scale applied to values)
-COMPARE_METRICS = (
-    ("power", "Power (W)", 1.0),
-    ("heart_rate", "Heart Rate (bpm)", 1.0),
-    ("speed_mps", "Speed (km/h)", 3.6),
-)
-COMPARE_X_AXIS_LABELS = {"time": "Elapsed seconds", "distance": "Elapsed meters", "percent": "% of interval"}
-
-
-def compare_series(marked_laps: list[Lap], records, utc_offset, attr: str, x_mode: str, scale: float = 1.0):
-    """[(label, xs, ys)] — one line per marked interval, aligned to a common origin."""
-    series = []
-    for lap in marked_laps:
-        lap_records = fit_parser.lap_record_slice(records, lap, utc_offset)
-        x_values = fit_parser.lap_x_values(lap_records, lap, x_mode)
-        xs, ys = fit_parser.metric_series(lap_records, x_values, attr)
-        if xs:
-            series.append((f"Lap {lap.lap_index}", xs, [y * scale for y in ys]))
-    return series
 
 
 ROUTE_COLUMNS = ("Name", "Sport", "Region", "Activities", "Distance")
@@ -879,12 +858,16 @@ def workout_menu(key: str | None, is_week: bool) -> list[MenuItem]:
 LEADERBOARD_COLUMNS = ("#", "Time", "Pace/Speed", "Avg power", "W/kg", "Avg HR", "Date", "Loop", "Activity")
 
 
-def leaderboard_rows(efforts, sport: str) -> list[tuple[str, ...]]:
+LEADERBOARD_MARK = "●"
+
+
+def leaderboard_rows(efforts, sport: str, marked=frozenset()) -> list[tuple[str, ...]]:
     """One row per effort (leaderboard.Effort), fastest first; a time over a pause is
-    moving time, marked with *."""
+    moving time, marked with *; an effort marked for comparing (its key in `marked`) has
+    a dot before its rank."""
     return [
         (
-            str(n),
+            f"{LEADERBOARD_MARK} {n}" if e.key in marked else str(n),
             format_duration(e.duration_s) + (" *" if e.paused_s >= 10 else ""),
             format_speed_or_pace(sport, e.speed_mps),
             format_power(e.power_w),
@@ -916,4 +899,5 @@ def leaderboard_status(route_name: str, kind: str, length: float | None, efforts
     distance = f" of {format_distance(length)}" if length else ""
     paused = " · * = paused inside, moving time shown" if any(e.paused_s >= 10 for e in efforts) else ""
     best = " · o: best per ride / all" if kind == "loops" else ""
-    return f"{route_name} — {LEADERBOARD_KINDS[kind]}: {what}{distance}, fastest first (moving time){paused} · {switch}{best}"
+    return (f"{route_name} — {LEADERBOARD_KINDS[kind]}: {what}{distance}, fastest first (moving time){paused} · {switch}{best}"
+            " · m: mark, c: compare with #1")

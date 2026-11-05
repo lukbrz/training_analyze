@@ -11,8 +11,9 @@ the athlete's weight on the day. Each activity is also a whole pass of the route
 inside, no cut-short ride): tight for TPV's exact virtual distances, looser for GPS ones.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import compare
 import fit_parser
 import metrics
 import services
@@ -38,6 +39,12 @@ class Effort:
     w_per_kg: float | None
     paused_s: float = 0.0
     exact: bool = False  # distance from TPV's virtual course (exact), not GPS
+    # (metres, moving seconds) from the effort's start, for the gap charts (compare.py)
+    curve: list[tuple[float, float]] = field(default_factory=list, repr=False)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.activity_id, self.loop
 
 
 def _gps_loops(activity: ActivitySummary, records: list) -> list[Lap]:
@@ -66,6 +73,7 @@ def _effort(activity: ActivitySummary, records: list, offset, lap: Lap, weight: 
         activity.activity_id, activity.start_time_local[:10], activity.name, lap.label, moving, lap.distance_m,
         lap.distance_m / moving if moving else None, power, stats.get("avg_hr"),
         power / weight if power and weight else None, stats.get("paused_s") or 0.0, exact,
+        compare.distance_time_curve(stretch),
     )
 
 
@@ -142,3 +150,21 @@ def best_per_activity(efforts: list[Effort]) -> list[Effort]:
             seen.add(effort.activity_id)
             out.append(effort)
     return out
+
+
+def compare_charts(shown: list[Effort], marked: set[tuple[str, str]], selected: int | None, length_m: float | None) -> list:
+    """Charts comparing the marked efforts of a board (`shown`, fastest first) — or the
+    selected one when none is marked — with its fastest effort (compare.effort_charts).
+    Raises ValueError with a message for the user when there's nothing to compare."""
+    if not shown or not length_m:
+        raise ValueError("No efforts on this board")
+    picked = [(rank, e) for rank, e in enumerate(shown, start=1) if e.key in marked]
+    if not picked and selected is not None and 0 <= selected < len(shown):
+        picked = [(selected + 1, shown[selected])]
+    picked = [(rank, e) for rank, e in picked if rank != 1]
+    if not picked:
+        raise ValueError("Mark efforts (m) to compare with the fastest one")
+    charts = compare.effort_charts(shown[0], 1, picked, length_m)
+    if not charts:
+        raise ValueError("These efforts have no distance stream to compare along")
+    return charts

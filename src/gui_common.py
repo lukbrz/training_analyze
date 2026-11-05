@@ -11,6 +11,7 @@ from datetime import date
 
 from PySide6.QtCharts import (
     QBarCategoryAxis,
+    QBarSeries,
     QBarSet,
     QChart,
     QChartView,
@@ -298,7 +299,27 @@ def table_as_tsv(table: QTableWidget) -> str:
 # --- Charts ---------------------------------------------------------------------------
 
 
-def make_chart_view(title: str = "") -> tuple[QChartView, QChart]:
+class _ClickableChartView(QChartView):
+    def __init__(self, chart: QChart, on_click: Callable) -> None:
+        super().__init__(chart)
+        self._on_click = on_click
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._on_click(self)
+
+
+def make_chart_view(title: str = "", on_click: Callable | None = None) -> tuple[QChartView, QChart]:
+    chart = new_chart(title)
+    view = _ClickableChartView(chart, on_click) if on_click else QChartView(chart)
+    view.setRenderHint(QPainter.RenderHint.Antialiasing)
+    view.setMinimumHeight(170)
+    view.setStyleSheet(f"background: {COLORS['bg']}; border: none;")
+    return view, chart
+
+
+def new_chart(title: str = "") -> QChart:
     chart = QChart()
     chart.setTitle(title)
     chart.setBackgroundBrush(QBrush(QColor(COLORS["bg_dark"])))
@@ -312,11 +333,7 @@ def make_chart_view(title: str = "") -> tuple[QChartView, QChart]:
     chart.legend().setAlignment(Qt.AlignmentFlag.AlignBottom)
     chart.setMargins(QMargins(6, 4, 10, 4))
     chart.layout().setContentsMargins(0, 0, 0, 0)
-    view = QChartView(chart)
-    view.setRenderHint(QPainter.RenderHint.Antialiasing)
-    view.setMinimumHeight(170)
-    view.setStyleSheet(f"background: {COLORS['bg']}; border: none;")
-    return view, chart
+    return chart
 
 
 def style_axis(axis) -> None:
@@ -347,6 +364,7 @@ def line_series(name: str, xs, ys, color: str, width: float = 2.0, dashed: bool 
 
 def plot_lines(
     chart: QChart, title: str, series_list: list[tuple[str, list, list]], x_title: str = "", legend: bool = True,
+    zero_line: bool = False,
 ) -> None:
     reset_chart(chart, title if series_list else f"{title} — no data")
     chart.legend().setVisible(legend)
@@ -364,13 +382,120 @@ def plot_lines(
         chart.addSeries(series)
         series.attachAxis(x_axis)
         series.attachAxis(y_axis)
-    x_axis.setRange(min(all_x), max(all_x))
-    pad = (max(all_y) - min(all_y)) * 0.05 or 1.0
-    y_axis.setRange(min(all_y) - pad, max(all_y) + pad)
-    for axis in (x_axis, y_axis):
-        axis.setTickCount(5)
-        axis.applyNiceNumbers()
-        axis.setLabelFormat("%.0f")
+    if zero_line:  # a difference chart's reference level, left out of the legend
+        zero = line_series("", [min(all_x), max(all_x)], [0, 0], COLORS["comment"], width=1.0, dashed=True)
+        chart.addSeries(zero)
+        zero.attachAxis(x_axis)
+        zero.attachAxis(y_axis)
+        for marker in chart.legend().markers(zero):
+            marker.setVisible(False)
+        all_y.append(0.0)
+    # The data's own x range (nice numbers would stretch a 620 s lap to 800 s), with ticks
+    # at round values inside it.
+    lo, hi = min(all_x), max(all_x)
+    x_axis.setRange(lo, hi if hi > lo else lo + 1)
+    step = _nice_step((hi - lo) / 5) if hi > lo else 1.0
+    x_axis.setTickType(QValueAxis.TickType.TicksDynamic)
+    x_axis.setTickAnchor(0.0)
+    x_axis.setTickInterval(step)
+    x_axis.setLabelFormat("%.1f" if step < 1 else "%.0f")
+    _set_value_range(y_axis, all_y)
+
+
+def _nice_step(raw: float) -> float:
+    """The 1 / 2 / 2.5 / 5 × 10^n step nearest above `raw`."""
+    magnitude = 10 ** math.floor(math.log10(raw))
+    return next(m * magnitude for m in (1, 2, 2.5, 5, 10) if m * magnitude >= raw)
+
+
+def _set_value_range(axis: QValueAxis, values: list[float]) -> None:
+    pad = (max(values) - min(values)) * 0.05 or 1.0
+    axis.setRange(min(values) - pad, max(values) + pad)
+    axis.setTickCount(5)
+    axis.applyNiceNumbers()
+    # Small spans (a speed difference of ±1.5 km/h) need a decimal to tell the ticks apart.
+    axis.setLabelFormat("%.1f" if axis.max() - axis.min() < 10 else "%.0f")
+
+
+def plot_chart(chart: QChart, spec, legend: bool = True, x_title: str | None = None) -> None:
+    """Draw a compare.Chart: lines, or grouped bars over its categories."""
+    if spec.kind != "bar":
+        plot_lines(
+            chart, spec.title, [(s.label, s.xs, s.ys) for s in spec.series],
+            spec.x_label if x_title is None else x_title, legend, spec.zero_line,
+        )
+        return
+    reset_chart(chart, spec.title if not spec.empty else f"{spec.title} — no data")
+    chart.legend().setVisible(legend)
+    if spec.empty:
+        return
+    series = QBarSeries()
+    for i, s in enumerate(spec.series):
+        bar_set = QBarSet(s.label)
+        bar_set.append([float(y) for y in s.ys])
+        bar_set.setColor(QColor(SERIES_COLORS[(i + 1) % len(SERIES_COLORS)]))  # colour 0 = the reference line
+        bar_set.setBorderColor(QColor(SERIES_COLORS[(i + 1) % len(SERIES_COLORS)]))
+        series.append(bar_set)
+    chart.addSeries(series)
+    x_axis, y_axis = QBarCategoryAxis(), QValueAxis()
+    x_axis.append(spec.categories)
+    x_axis.setTitleText(spec.x_label if x_title is None else x_title)
+    for axis, align in ((x_axis, Qt.AlignmentFlag.AlignBottom), (y_axis, Qt.AlignmentFlag.AlignLeft)):
+        style_axis(axis)
+        chart.addAxis(axis, align)
+        series.attachAxis(axis)
+    _set_value_range(y_axis, [y for s in spec.series for y in s.ys] + [0.0])
+
+
+class ChartStack(QWidget):
+    """Charts one above another; a click on one fills the stack with it (legend shown),
+    another click — or `restore()` — brings the rest back."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.views: list[QChartView] = []
+        self.charts: list[QChart] = []
+        self.legends: list[bool] = [True] * count  # each chart's legend when not maximized
+        for _ in range(count):
+            view, chart = make_chart_view(on_click=self._clicked)
+            layout.addWidget(view, 1)
+            self.views.append(view)
+            self.charts.append(chart)
+
+    @property
+    def maximized(self) -> bool:
+        return any(view.isHidden() for view in self.views)
+
+    def draw(self, specs: list, legend_on_first_only: bool = False, x_title_on_last_only: bool = False) -> None:
+        last = len(specs) - 1
+        for i, (view, spec) in enumerate(zip(self.views, specs)):
+            # A fresh chart each time: axes removed from a reused QChart kept being painted
+            # under the new ones (ghost tick labels after switching modes).
+            old, chart = view.chart(), new_chart()
+            chart.legend().setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.legends[i] = i == 0 or not legend_on_first_only
+            maximized_here = self.maximized and not view.isHidden()
+            plot_chart(chart, spec, self.legends[i] or maximized_here, "" if x_title_on_last_only and i != last else None)
+            view.setChart(chart)
+            self.charts[i] = chart
+            old.deleteLater()
+
+    def _clicked(self, view: QChartView) -> None:
+        if self.maximized:
+            self.restore()
+            return
+        for i, other in enumerate(self.views):
+            other.setVisible(other is view)
+            if other is view:
+                self.charts[i].legend().setVisible(True)
+
+    def restore(self) -> None:
+        for i, view in enumerate(self.views):
+            view.setVisible(True)
+            self.charts[i].legend().setVisible(self.legends[i])
 
 
 def plot_bars(chart: QChart, title: str, bars, color: str, y_title: str = "") -> None:

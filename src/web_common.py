@@ -12,7 +12,7 @@ from nicegui import run, ui
 
 import applog
 import display
-from theme import COLORS
+from theme import COLORS, SERIES_COLORS
 
 ui_log = logging.getLogger("ta.ui")
 job_log = logging.getLogger("ta.job")
@@ -174,6 +174,9 @@ class Frame:
                 self.menu = ui.menu().props("anchor='top right' self='bottom right'")
         self.keys: dict[str, Callable] = {}
         self.labels: dict[str, str] = {}
+        # While a full-screen overlay is open (show_fullscreen_chart): esc closes it, and the
+        # page's other keys wait.
+        self.overlay_close: Callable | None = None
         ui.keyboard(on_key=self._on_key)
 
     def bind(self, key: str, label: str, action: Callable, shown_key: str | None = None) -> None:
@@ -192,6 +195,10 @@ class Frame:
         if not e.action.keydown or e.action.repeat:
             return
         key = str(e.key.name)
+        if self.overlay_close is not None:
+            if key == "Escape":
+                self.overlay_close()
+            return
         action = self.keys.get(key)
         if action is not None:
             await self._run(key, action)
@@ -401,6 +408,61 @@ def axis_style(**extra) -> dict:
         "splitLine": {"lineStyle": {"color": COLORS["border"]}},
         **extra,
     }
+
+
+def chart_options(spec, legend: bool = True, x_name: bool = True) -> dict:
+    """ECharts options drawing a compare.Chart (lines, or grouped bars over categories)."""
+    title = spec.title if not spec.empty else f"{spec.title} — no data"
+    options = {
+        **ECHART_BASE,
+        "title": {"text": title, "left": "center", "textStyle": {"color": COLORS["fg"], "fontSize": 13}},
+        "legend": {"show": legend, "top": 30, "textStyle": {"color": COLORS["fg"]}},
+        "grid": {**ECHART_BASE["grid"], "top": 70 if legend else 45},
+    }
+    x_label = spec.x_label if x_name else ""
+    zero = {"silent": True, "symbol": "none", "label": {"show": False}, "data": [{"yAxis": 0}],
+            "lineStyle": {"color": COLORS["comment"], "type": "dashed", "width": 1}}
+    if spec.kind == "bar":
+        options["xAxis"] = axis_style(type="category", data=spec.categories, name=x_label, nameLocation="middle", nameGap=25)
+        options["yAxis"] = axis_style(type="value", name=spec.y_label)
+        # Colour 0 is the reference effort's (its line on the gap chart).
+        options["series"] = [{"type": "bar", "name": s.label, "data": [round(y, 1) for y in s.ys],
+                              "color": SERIES_COLORS[(n + 1) % len(SERIES_COLORS)]} for n, s in enumerate(spec.series)]
+    else:
+        # The data's own x range; its odd end value (596.56 s) left unlabelled.
+        options["xAxis"] = {**axis_style(type="value", name=x_label, nameLocation="middle", nameGap=25, min="dataMin", max="dataMax"),
+                            "axisLabel": {"color": COLORS["comment"], "showMaxLabel": False}}
+        options["yAxis"] = axis_style(type="value", scale=not spec.zero_line, name=spec.y_label)
+        options["series"] = [{"type": "line", "name": s.label, "showSymbol": False, "data": [[round(x, 3), round(y, 2)] for x, y in zip(s.xs, s.ys)],
+                              "lineStyle": {"width": 1.6}, "color": SERIES_COLORS[n % len(SERIES_COLORS)]} for n, s in enumerate(spec.series)]
+    if spec.zero_line and options["series"]:
+        options["series"][0]["markLine"] = zero
+    return options
+
+
+def chart_panel(frame: Frame, spec, height: str = "30vh", legend: bool = True, x_name: bool = True) -> None:
+    """An echart of a compare.Chart; a click on it opens it full screen."""
+    with ui.element("div").classes("w-full").style("cursor: zoom-in") as wrapper:
+        ui.echart(chart_options(spec, legend, x_name)).classes("w-full").style(f"height: {height}")
+    wrapper.on("click", lambda: show_fullscreen_chart(frame, chart_options(spec)))
+
+
+async def show_fullscreen_chart(frame: Frame, options: dict) -> None:
+    """One chart filling the window; esc, the close button or a click on it closes it."""
+    with ui.dialog().props("maximized persistent no-esc-dismiss") as dialog:
+        with ui.card().classes("w-full h-full p-2 gap-1").style(f"background: {COLORS['bg']}"):
+            with ui.row().classes("w-full justify-end"):
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense").tooltip("Close (esc)")
+            with ui.element("div").classes("w-full").style("cursor: zoom-out") as wrapper:
+                ui.echart(options).classes("w-full").style("height: calc(100vh - 70px)")
+            wrapper.on("click", dialog.close)
+    frame.overlay_close = dialog.close
+    dialog.open()
+    try:
+        await dialog
+    finally:
+        frame.overlay_close = None
+        dialog.delete()
 
 
 class Progress:

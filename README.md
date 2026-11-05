@@ -139,6 +139,13 @@ Marks on the watch's laps are saved. Marks on a split or on physical laps last u
 | `t` | Strength sets: exercise, reps, weight, volume and rest of each set (strength sessions) |
 | `y` | Copy the table |
 
+**Comparing intervals (`c`)** draws power, HR and speed of the marked intervals over time, distance or % of the interval:
+
+- **Values / vs best** (`v`): the values themselves, or each interval minus the best one (the fastest) at the same point, so progress or fading shows as a line above or below zero.
+- **Smoothing** (`s`): raw, or a 5 / 15 / 30 / 60 s moving average (15 s at first).
+- Click a chart to fill the screen with it. Click again or press `esc` to bring the others back.
+- On a ride merged with its TrainingPeaks Virtual recording, speed is TPV's. An indoor ride without one shows the bike computer's trainer estimate, and the chart title says so.
+
 The split length is typed as a plain number for **metres** (`300`) or with a time unit for **time** (`60s`, `1m`, `1:30`). The **Total** column shows the running time after each lap. It restarts in each section. "Interval only" (`f`) hides the other two sections.
 
 A multisport activity (e.g. a triathlon) shows one section per leg. You can split pool swims the same way as runs and rides. If an activity varies in intensity (a structured workout), the app joins splits that your watch's Auto Lap cut in the middle of a planned interval.
@@ -202,7 +209,7 @@ Past plans move to `workouts/archive/` automatically (see Settings). Nothing is 
 
 - **Pauses:** a stop of 10 s or more (no movement, power or cadence) or a gap in the recording counts as a pause. Computed laps, splits and loops, efficiency factor, decoupling and the export use moving time. The activity shows its moving time and where it paused.
 - **A ride recorded twice** (e.g. on your Edge and in TrainingPeaks Virtual) shows each device's laps in its own LAPS section, and you can mark intervals in either. TPV laps at the route's lap line, so for a TPV ride the PHYSICAL section is the route's loops: lead-in, loop 1…N and the way out. The route comes from Garmin's title ("TrainingPeaks Virtual - Island Coasts"), and Sync names the route after it. Loop lengths come from the [TPV hub](https://tpvirtualhub.com/map) route list (fetched at most monthly) or, for other worlds, from the repeated lap distance.
-- **Leaderboards (`b`)** on the Routes screen or in an activity. Each route has two: **Loops** (each loop of the route, e.g. both laps of a 2-lap race) and **Whole route** (each activity start to finish); `w` switches between them. Both rank fastest first by moving time, with pace/speed, power, W/kg on the day and HR. On Loops, `o` shows only each ride's best loop.
+- **Leaderboards (`b`)** on the Routes screen or in an activity. Each route has two: **Loops** (each loop of the route, e.g. both laps of a 2-lap race) and **Whole route** (each activity start to finish); `w` switches between them. Both rank fastest first by moving time, with pace/speed, power, W/kg on the day and HR. On Loops, `o` shows only each ride's best loop. Mark efforts with `m` (a dot before the rank), then `c` compares them with the fastest one along the distance: the time gap at each point (above zero = behind), and the time lost or gained on each stage (e.g. every 200 m or 1 km). With nothing marked, `c` compares the selected effort.
 - **Routes screen filters:** by discipline (running, cycling…) and region: the platform and its world or place, e.g. "Outdoor · Bydgoszcz", "Zwift · Watopia", "TPV · Island", "Indoor video · Praha", or a whole platform ("Zwift · all"). Virtual worlds sit on real coordinates (Zwift's Watopia is off Vanikoro in the Solomon Islands), so the platform comes from the activity's titles and whether it was recorded indoors, not from the map. Sync looks up the place of routes that don't have one yet.
 
 ### Right-click menus
