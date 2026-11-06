@@ -801,6 +801,14 @@ class MenuItem:
         return f"{self.label}   ({self.key})" if self.key else self.label
 
 
+# The main screen's Options (x): jobs needed rarely enough to keep out of the key bar.
+MAIN_OPTIONS_PROMPT = "Options:"
+MAIN_OPTIONS = (
+    ("sync_history", "Sync full history — every activity on Garmin Connect, not just new ones"),
+    ("import_tpv", "Import TPV files — TrainingPeaks Virtual recordings from the import folder"),
+)
+
+
 def activity_menu(activity: ActivitySummary) -> list[MenuItem]:
     strength = training_load.sport_family(activity.sport) == "strength"
     return [

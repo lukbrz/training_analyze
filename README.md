@@ -101,7 +101,7 @@ Every screen lists its keys in the footer at the bottom. In the desktop and web 
 | `w` | Workouts: upload planned workouts to Garmin Connect |
 | `c` | Calendar & training load for the week |
 | `p` | Settings (see below) |
-| `H` | Sync your whole Garmin history, not just the last year (asks first; run it again to carry on if Garmin stops it part-way) |
+| `x` | Options, for jobs you rarely need: **Sync full history** (your whole Garmin history, not just the last year; asks first; run it again to carry on if Garmin stops it part-way) and **Import TPV files** (add TrainingPeaks Virtual recordings that never came through Garmin Connect, see below) |
 | `y` | Copy the table to the clipboard (tab-separated, pastes into a spreadsheet) |
 | `Enter` | Open the selected activity |
 
@@ -209,6 +209,7 @@ Past plans move to `workouts/archive/` automatically (see Settings). Nothing is 
 
 - **Pauses:** a stop of 10 s or more (no movement, power or cadence) or a gap in the recording counts as a pause. Computed laps, splits and loops, efficiency factor, decoupling and the export use moving time. The activity shows its moving time and where it paused.
 - **A ride recorded twice** (e.g. on your Edge and in TrainingPeaks Virtual) shows each device's laps in its own LAPS section, and you can mark intervals in either. TPV laps at the route's lap line, so for a TPV ride the PHYSICAL section is the route's loops: lead-in, loop 1…N and the way out. The route comes from Garmin's title ("TrainingPeaks Virtual - Island Coasts"), and Sync names the route after it. Loop lengths come from the [TPV hub](https://tpvirtualhub.com/map) route list (fetched at most monthly) or, for other worlds, from the repeated lap distance.
+- **Importing TPV recordings (`x` → Import TPV files):** Garmin Connect is the only way TPV recordings normally reach the app, so a TPV ride you delete there (to avoid a duplicate) before this copy of the app synced it leaves the ride with the bike computer's trainer distance. To fix that, export your workout files from TrainingPeaks (a `.zip`, up to a year at a time) or copy TPV's own `.fit` files, put them in the `import/` folder, and choose Import TPV files in the Options (`x`). In the web app, the import also lets you upload the files from the browser. Each TPV recording is added to the ride recorded beside it, as if it had synced: TPV's distance, speed, route and loops. A TPV ride with no other recording becomes an activity of its own. Other devices' files in the export are ignored, and running it again only adds what's still missing. TPV's files carry no average HR or power, so those are worked out from the recording. TPV's files don't name the route, so it's named after an earlier ride on the same route or TPV's route list when that's unambiguous; otherwise rename it on the Routes screen. The first import of a year's export takes several minutes.
 - **Leaderboards (`b`)** on the Routes screen or in an activity. Each route has two: **Loops** (each loop of the route, e.g. both laps of a 2-lap race) and **Whole route** (each activity start to finish); `w` switches between them. Both rank fastest first by moving time, with pace/speed, power, W/kg on the day and HR. On Loops, `o` shows only each ride's best loop. Mark efforts with `m` (a dot before the rank), then `c` compares them with the fastest one along the distance: the time gap at each point (above zero = behind), and the time lost or gained on each stage (e.g. every 200 m or 1 km). With nothing marked, `c` compares the selected effort.
 - **Routes screen filters:** by discipline (running, cycling…) and region: the platform and its world or place, e.g. "Outdoor · Bydgoszcz", "Zwift · Watopia", "TPV · Island", "Indoor video · Praha", or a whole platform ("Zwift · all"). Virtual worlds sit on real coordinates (Zwift's Watopia is off Vanikoro in the Solomon Islands), so the platform comes from the activity's titles and whether it was recorded indoors, not from the map. Sync looks up the place of routes that don't have one yet.
 
@@ -242,6 +243,7 @@ All data stays in the project folder, and git ignores it:
 | `data/` | Downloaded activity files, your lap marks and route names, caches (calendar, map tiles, …) |
 | `workouts/` | Your workout plans (only the `example_*` files are part of the repo); past ones in `workouts/archive/` |
 | `exports/` | Training exports (`e` in the calendar) |
+| `import/` | Files for Import TPV files (`x`); you can delete them after importing |
 
 To start over, delete `data/`; the next sync downloads everything again. Deleting `data/` also loses your interval marks and route names.
 

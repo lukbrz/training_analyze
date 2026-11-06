@@ -31,6 +31,7 @@ CALENDAR_DIR = DATA_DIR / "calendar"
 WORKOUT_CACHE_DIR = DATA_DIR / "workout_cache"
 PLAN_LINKS_PATH = DATA_DIR / "plan_links.json"
 EXPORTS_DIR = BASE_DIR / "exports"
+IMPORT_DIR = BASE_DIR / "import"  # files dropped in for "Import TPV files" (TrainingPeaks export...)
 SETTINGS_PATH = DATA_DIR / "settings.json"
 EXERCISE_SETS_DIR = DATA_DIR / "exercise_sets"
 ATHLETE_PATH = DATA_DIR / "athlete.json"

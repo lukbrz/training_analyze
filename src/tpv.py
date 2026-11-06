@@ -18,7 +18,8 @@ import geocode
 from models import Lap, RecordPoint
 
 HUB_MAP_URL = "https://tpvirtualhub.com/map"
-TITLE_PREFIX = "TrainingPeaks Virtual - "
+TPV_NAME = "TrainingPeaks Virtual"
+TITLE_PREFIX = f"{TPV_NAME} - "
 CATALOGUE_MAX_AGE_DAYS = 30
 # The final loop counts when ridden to at least this share of its distance (else it's the
 # way out of the course, "out").
@@ -30,6 +31,17 @@ def route_name(title: str | None) -> str | None:
     if title and title.startswith(TITLE_PREFIX):
         return title[len(TITLE_PREFIX):].strip() or None
     return None
+
+
+def is_tpv_title(title: str | None) -> bool:
+    """Whether a title is a TPV recording's: Garmin's "TrainingPeaks Virtual - <route>", or
+    plain "TrainingPeaks Virtual" for a recording imported from a file whose route isn't
+    known (TPV's FIT files don't name the route)."""
+    return bool(title) and (title == TPV_NAME or title.startswith(TITLE_PREFIX))
+
+
+def title_for(route: str | None) -> str:
+    return f"{TITLE_PREFIX}{route}" if route else TPV_NAME
 
 
 def _resolve(values: list):
@@ -105,6 +117,23 @@ def find_route(name: str | None, catalogue: list[dict]) -> dict | None:
         return None
     key = name.casefold().strip()
     return next((r for r in catalogue if r["name"].casefold() == key), None)
+
+
+# How close a recorded lap must be to a catalogued route's lap distance to name the route
+# of a recording by it (TPV laps at the lap line: measured 34,092 m for a 34,099 m lap).
+NAMING_TOLERANCE = 0.003
+
+
+def route_by_laps(laps: list[Lap], catalogue: list[dict]) -> dict | None:
+    """The catalogued route a recording's laps say it rode: the only looped route whose lap
+    distance one of its laps has. None when none or several do (a route and its reverse
+    share their lap distance)."""
+    found = [
+        r for r in catalogue
+        if not r.get("point_to_point") and r.get("lap_m")
+        and any(abs(lap.distance_m - r["lap_m"]) <= r["lap_m"] * NAMING_TOLERANCE for lap in laps)
+    ]
+    return found[0] if len(found) == 1 else None
 
 
 # How close a recorded lap's distance must be to the route's lap distance to count as a loop

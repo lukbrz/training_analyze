@@ -11,3 +11,6 @@ workouts/*
 
 # Training exports for other agents (personal data)
 exports/
+
+# Files dropped in for "Import TPV files" (personal recordings)
+import/

@@ -4,9 +4,40 @@ from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta
 
 import fitparse
+import fitparse.base
+import fitparse.records
 
 import storage
 from models import ActivitySummary, Lap, RecordPoint, sport_name
+
+
+def _tolerate_empty_fields() -> None:
+    """Let fitparse read FIT files that define a field 0 bytes long (some TrainingPeaks
+    Virtual recordings do, in every record): fitparse turns that into a zero-length struct
+    format and gives up on the whole file. Such a field now reads as empty (None)."""
+    decoder = fitparse.base.FitFileDecoder
+    if getattr(decoder, "_ta_empty_fields", False):
+        return
+    parse_definition, read_struct = decoder._parse_definition_message, decoder._read_struct
+
+    def _parse_definition_message(self, header):
+        definition = parse_definition(self, header)
+        for field_def in definition.field_defs + definition.dev_field_defs:
+            if field_def.size == 0:
+                field_def.base_type = fitparse.records.BASE_TYPE_BYTE  # read as an empty byte tuple
+        return definition
+
+    def _read_struct(self, fmt, endian="<", data=None, always_tuple=False):
+        if data is None and always_tuple and fmt.startswith("0"):
+            return ()
+        return read_struct(self, fmt, endian=endian, data=data, always_tuple=always_tuple)
+
+    decoder._parse_definition_message = _parse_definition_message
+    decoder._read_struct = _read_struct
+    decoder._ta_empty_fields = True
+
+
+_tolerate_empty_fields()
 
 INTERVAL_INTENSITIES = {"interval", "active"}
 SEMICIRCLE_TO_DEGREES = 180 / 2**31
@@ -49,6 +80,7 @@ def parse(
 
     local_start = datetime.fromisoformat(start_time_local)
     offset = _utc_offset(session.get_value("start_time"), local_start)
+    samples = _Samples(fitfile)
 
     if len(sessions) > 1:
         summary = _multisport_summary(sessions, activity_id, name, start_time_local)
@@ -68,6 +100,8 @@ def parse(
             total_ascent_m=session.get_value("total_ascent"),
             virtual=session.get_value("sub_sport") == "virtual_activity",
         )
+        if summary.avg_hr is None or summary.avg_power is None:
+            summary.avg_hr, summary.avg_power = _averages(samples.all(), summary.avg_hr, summary.avg_power)
 
     raw_laps = []
     for lap_msg in fitfile.get_messages("lap"):
@@ -79,6 +113,7 @@ def parse(
         lap_distance_m = lap_msg.get_value("total_distance") or 0.0
         raw_laps.append(
             {
+                "utc_start": lap_utc_start,
                 "start_time_local": lap_local_start,
                 "duration_s": lap_duration_s,
                 "distance_m": lap_distance_m,
@@ -92,6 +127,7 @@ def parse(
             }
         )
 
+    _fill_lap_averages(raw_laps, samples)
     raw_laps = _merge_autolap_splits(raw_laps)
     # With no structured workout the watch stamps every lap 'active' (plain runs, races,
     # multisport legs) — that says nothing about which laps were efforts, so only trust the
@@ -116,6 +152,65 @@ def parse(
     ]
 
     return summary, laps
+
+
+class _Samples:
+    """The records' (heart rate, power), read once on first use — only files whose session
+    or laps lack the averages need them."""
+
+    def __init__(self, fitfile):
+        self.fitfile = fitfile
+        self._times: list[datetime] | None = None
+        self._values: list[tuple] = []
+
+    def _load(self) -> None:
+        if self._times is not None:
+            return
+        rows = []
+        for record in self.fitfile.get_messages("record"):
+            timestamp = record.get_value("timestamp")
+            if timestamp is not None:
+                rows.append((timestamp.replace(tzinfo=None), record.get_value("heart_rate"), record.get_value("power")))
+        rows.sort(key=lambda row: row[0])
+        self._times = [row[0] for row in rows]
+        self._values = [row[1:] for row in rows]
+
+    def all(self) -> list[tuple]:
+        self._load()
+        return self._values
+
+    def between(self, utc_start: datetime, duration_s: float) -> list[tuple]:
+        """The samples from `utc_start` for `duration_s` seconds."""
+        self._load()
+        start = utc_start.replace(tzinfo=None)
+        return self._values[bisect_left(self._times, start):bisect_left(self._times, start + timedelta(seconds=duration_s))]
+
+
+def _fill_lap_averages(raw_laps: list[dict], samples: "_Samples") -> None:
+    """Average HR / power per lap from the records when no lap has them — TrainingPeaks
+    Virtual writes laps without; a watch leaving one lap blank (a pool rest, a multisport
+    leg without a power meter) means there is nothing to average there."""
+    missing = [key for key in ("avg_hr", "avg_power") if all(raw[key] is None for raw in raw_laps)]
+    if not missing:
+        return
+    for raw in raw_laps:
+        if raw["utc_start"]:
+            averages = dict(zip(("avg_hr", "avg_power"), _averages(samples.between(raw["utc_start"], raw["duration_s"]), None, None)))
+            for key in missing:
+                raw[key] = averages[key]
+
+
+def _averages(samples: list[tuple], avg_hr, avg_power) -> tuple:
+    """Fill a missing average HR / power from the records' samples (TrainingPeaks Virtual's
+    session and lap messages carry neither): HR over the samples that have it, power
+    including zeros (coasting is part of the average)."""
+    if avg_hr is None:
+        hr = [heart_rate for heart_rate, _ in samples if heart_rate]
+        avg_hr = round(sum(hr) / len(hr)) if hr else None
+    if avg_power is None:
+        power = [watts for _, watts in samples if watts is not None]
+        avg_power = round(sum(power) / len(power)) if any(power) else None  # all zero: no power meter
+    return avg_hr, avg_power
 
 
 MULTISPORT = "multisport"
@@ -464,6 +559,15 @@ def recording_name(fit_bytes: bytes) -> str:
     if isinstance(name, str):
         return name if any(c.isupper() for c in name) else name.replace("_", " ").title()
     return "recording"
+
+
+def virtual_software(fit_bytes: bytes) -> bool:
+    """Whether a FIT file was written by software (TrainingPeaks Virtual, Zwift...) rather
+    than a Garmin device — of two recordings flagged virtual, the program's has the virtual
+    course's distance (a bike computer's is its trainer estimate)."""
+    file_id = next(fitparse.FitFile(fit_bytes, check_crc=False).get_messages("file_id"), None)
+    maker = file_id.get_value("manufacturer") if file_id is not None else None
+    return maker is not None and maker != "garmin"
 
 
 def pause_mask(records: list[RecordPoint]) -> list[bool]:

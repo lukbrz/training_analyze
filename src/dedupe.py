@@ -65,15 +65,19 @@ def choose_primary(a: ActivitySummary, b: ActivitySummary) -> tuple[ActivitySumm
     return (a, b) if completeness(a) >= completeness(b) else (b, a)
 
 
-def merge_summary(primary: ActivitySummary, secondaries: list[ActivitySummary]) -> ActivitySummary:
+def merge_summary(
+    primary: ActivitySummary, secondaries: list[ActivitySummary], virtual: ActivitySummary | None = None,
+) -> ActivitySummary:
     """A copy of `primary` with any null optional field filled from the first secondary
     that has it. Distance/duration/sport/name/start_time stay primary's own — they're
     already a full, self-consistent session measurement from its own device — except that
-    a virtual-ride secondary's distance, speed and ascent replace a non-virtual primary's
-    (its trainer-estimated figures)."""
+    the virtual-ride secondary's distance, speed and ascent replace the primary's (its
+    trainer-estimated figures): `virtual`, the one whose stream is the merge's geo source,
+    else the first virtual secondary when the primary isn't virtual itself."""
     merged = dataclasses.replace(primary)
-    virtual = next((s for s in secondaries if s.virtual), None)
-    if virtual is not None and not primary.virtual:
+    if virtual is None and not primary.virtual:
+        virtual = next((s for s in secondaries if s.virtual), None)
+    if virtual is not None:
         merged.distance_m = virtual.distance_m
         merged.avg_speed_mps = virtual.avg_speed_mps
         merged.total_ascent_m = virtual.total_ascent_m

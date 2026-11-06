@@ -49,6 +49,8 @@ def classify(titles: list[str], indoor: bool, start: tuple[float, float] | None,
         name = tpv.route_name(title)
         if name:
             return TPV, "Island" if tpv.find_route(name, catalogue) else name
+        if tpv.is_tpv_title(title):  # imported from a file: route not known
+            return TPV, place
     if indoor:
         world = _zwift_world_at(*start) if start else None
         if world:

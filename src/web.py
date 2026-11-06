@@ -44,6 +44,7 @@ import leaderboard
 import services
 import settings
 import storage
+import tpv_import
 import training_export
 import training_load
 import workout_library
@@ -221,6 +222,47 @@ def main_page() -> None:
         if confirmed:
             await job(lambda progress: services.sync_activities(State.client, progress, full_history=True))
 
+    async def import_tpv() -> None:
+        uploaded: list[str] = []
+
+        async def save(e) -> None:
+            name = Path(e.file.name).name
+            if not name:
+                return
+            storage.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+            await e.file.save(storage.IMPORT_DIR / name)
+            uploaded.append(name)
+            files.set_text("Uploaded: " + ", ".join(uploaded))
+
+        with ui.dialog() as dialog, ui.card().classes("ta-card p-6"):
+            ui.html(escape(
+                "Add TrainingPeaks Virtual recordings that never came through Garmin Connect "
+                "(deleted there as duplicates) to the rides they were recorded beside.\n\n"
+                "Upload TrainingPeaks' workout files export (.zip) or TPV's .fit / .fit.gz files, "
+                f"or put them in {storage.IMPORT_DIR} — then Import."
+            )).classes("ta-pre")
+            ui.upload(on_upload=save, multiple=True, auto_upload=True).props('accept=".zip,.fit,.gz" flat bordered').classes("w-full")
+            files = ui.label("").classes("ta-status")
+            with ui.row().classes("gap-2 justify-end w-full"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("outline")
+                ui.button("Import", on_click=lambda: dialog.submit(True))
+        confirmed = await dialog
+        dialog.delete()
+        if confirmed:
+            await job(tpv_import.import_message)
+
+    async def options() -> None:
+        actions = {"sync_history": sync_history, "import_tpv": import_tpv}
+        with ui.dialog() as dialog, ui.card().classes("ta-card p-6 gap-2"):
+            ui.label(display.MAIN_OPTIONS_PROMPT).classes("font-semibold")
+            for key, text in display.MAIN_OPTIONS:
+                ui.button(text, on_click=lambda key=key: dialog.submit(key)).props("flat no-caps align=left").classes("w-full")
+            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("outline")
+        chosen = await dialog
+        dialog.delete()
+        if chosen:
+            await actions[chosen]()
+
     sync_button.on_click(sync)
     reprocess_button.on_click(lambda: job(services.reprocess_activities))
     frame.bind("s", "Sync", sync)
@@ -229,7 +271,7 @@ def main_page() -> None:
     frame.bind("w", "Workouts", lambda: ui.navigate.to("/workouts"))
     frame.bind("c", "Calendar & load", lambda: ui.navigate.to("/calendar"))
     frame.bind("p", "Settings", lambda: ui.navigate.to("/settings"))
-    frame.bind("H", "Sync full history", sync_history)
+    frame.bind("x", "Options", options)
     frame.bind("Enter", "Open", open_selected, shown_key="enter")
     frame.bind("y", "Copy table", lambda: copy(display.tsv(display.ACTIVITY_COLUMNS, [display.activity_row(a, "") for a in state["shown"]]), f"{len(state['shown'])} activities"))
     row_context_menu(table, lambda row: display.activity_menu(state["shown"][row]) if 0 <= row < len(state["shown"]) else [], {

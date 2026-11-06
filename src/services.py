@@ -541,6 +541,7 @@ def assign_route(activity_id: str, fit_bytes: bytes | None, sport: str, routes_l
 
 def merge_duplicates(
     activities: list[ActivitySummary], recompute_existing: bool, routes_list: list[Route] | None = None,
+    rebuild: set[str] = frozenset(), progress: Progress = lambda _: None,
 ) -> tuple[list[ActivitySummary], int]:
     """Detect activities that are the same physical session recorded by two devices and
     fold each into its primary (see dedupe.py) — filling in HR/power/GPS coverage the
@@ -554,7 +555,8 @@ def merge_duplicates(
     activities), so with `recompute_existing=False` (sync) only pairs that are new or have no
     saved merged stream are rebuilt — `activities` loaded from the index already carry the
     merged summaries of the rest. Reprocess passes True, since it has just re-parsed every
-    summary from scratch and the merge has to be reapplied on top.
+    summary from scratch and the merge has to be reapplied on top. `rebuild`: primaries to
+    rebuild anyway (tpv_import adds a recording to them in the ledger directly).
     """
     ledger = storage.load_merge_ledger()
     visible = [a for a in activities if a.activity_id not in ledger]
@@ -580,17 +582,22 @@ def merge_duplicates(
         primary = by_id.get(primary_id)
         if primary is None:
             continue
-        if not (recompute_existing or primary_id in new_primaries or not storage.has_merged_records(primary_id)):
+        if not (recompute_existing or primary_id in new_primaries or primary_id in rebuild
+                or not storage.has_merged_records(primary_id)):
             continue
+        progress(f"Merging the recordings of {primary.name} ({primary.start_time_local[:10]})...")
 
         streams = []
         # Index of the virtual-ride stream, whose distance/position/elevation win (see
-        # dedupe.merge_records); None when no recording of the pair is virtual.
-        geo_source = None
+        # dedupe.merge_records); None when no recording of the pair is virtual. A virtual-riding
+        # program's recording beats a bike computer's that flags itself virtual too (an Edge
+        # paired with TPV does; its distance is still the trainer's estimate).
+        geo_source, geo_rank, geo_summary = None, 0, None
         if storage.has_fit(primary_id):
-            streams.append(fit_parser.parse_records(storage.fit_path(primary_id).read_bytes()))
+            primary_fit = storage.fit_path(primary_id).read_bytes()
+            streams.append(fit_parser.parse_records(primary_fit))
             if primary.virtual:
-                geo_source = 0
+                geo_source, geo_rank = 0, 1 + fit_parser.virtual_software(primary_fit)
 
         secondary_summaries = []
         for secondary_id in secondary_ids:
@@ -605,8 +612,9 @@ def merge_duplicates(
                 secondary_fit_bytes, secondary_id, "", primary.start_time_local
             )
             secondary_summaries.append(secondary_summary)
-            if secondary_summary.virtual and geo_source is None:
-                geo_source = len(streams) - 1
+            rank = 1 + fit_parser.virtual_software(secondary_fit_bytes) if secondary_summary.virtual else 0
+            if rank > geo_rank:
+                geo_source, geo_rank, geo_summary = len(streams) - 1, rank, secondary_summary
 
         if len(streams) >= 2:
             merged_records = dedupe.merge_records(streams, geo_source)
@@ -621,7 +629,7 @@ def merge_duplicates(
                 fit_parser.restate_lap_geo(laps, merged_records, offset)
                 storage.save_laps(primary_id, laps)
         if secondary_summaries:
-            by_id[primary_id] = dedupe.merge_summary(primary, secondary_summaries)
+            by_id[primary_id] = dedupe.merge_summary(primary, secondary_summaries, geo_summary)
 
     merged_activities = [a for a in by_id.values() if a.activity_id not in ledger]
     return merged_activities, newly_merged
@@ -736,7 +744,7 @@ def _sync_activities(client, progress: Progress, full_history: bool) -> str:
         storage.save_index(last_synced_date, activities)
 
     progress("Checking for duplicate recordings...")
-    activities, merged_count = merge_duplicates(activities, recompute_existing=False, routes_list=routes_list)
+    activities, merged_count = merge_duplicates(activities, recompute_existing=False, routes_list=routes_list, progress=progress)
     storage.save_index(last_synced_date, activities)
     try:
         backfill_recording_names(client, activities, progress)
@@ -802,11 +810,11 @@ def refresh_tpv_catalogue(progress: Progress = lambda _: None, force: bool = Fal
 def tpv_recording(activity: ActivitySummary) -> tuple[str, str] | None:
     """(activity id, Garmin title) of the TrainingPeaks Virtual recording of an activity —
     itself, or a recording merged into it — or None."""
-    if tpv.route_name(activity.name):
+    if tpv.is_tpv_title(activity.name):
         return activity.activity_id, activity.name
     names = storage.load_recording_names()
     for secondary, primary in storage.load_merge_ledger().items():
-        if primary == activity.activity_id and tpv.route_name(names.get(secondary)):
+        if primary == activity.activity_id and tpv.is_tpv_title(names.get(secondary)):
             return secondary, names[secondary]
     if activity.virtual:
         return activity.activity_id, activity.name
@@ -821,7 +829,7 @@ def speed_note(activity: ActivitySummary) -> str:
     Connect before this instance downloaded it)."""
     recording = tpv_recording(activity)
     if recording is not None:
-        return "from TPV" if tpv.route_name(recording[1]) else "from the virtual ride"
+        return "from TPV" if tpv.is_tpv_title(recording[1]) else "from the virtual ride"
     if activity.sport != "cycling" or not _indoor(activity.activity_id):
         return ""
     if activity.activity_id in set(storage.load_merge_ledger().values()):
@@ -1039,7 +1047,7 @@ def _reprocess_activities(progress: Progress) -> str:
         reprocessed += 1
 
     progress("Re-merging duplicate recordings...")
-    merged_activities, merged_count = merge_duplicates(list(by_id.values()), recompute_existing=True, routes_list=routes_list)
+    merged_activities, merged_count = merge_duplicates(list(by_id.values()), recompute_existing=True, routes_list=routes_list, progress=progress)
     name_tpv_routes(merged_activities, routes_list)
     storage.save_index(last_synced_date, merged_activities)
 

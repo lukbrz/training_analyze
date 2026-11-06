@@ -29,6 +29,7 @@ import leaderboard
 import services
 import settings
 import storage
+import tpv_import
 import training_export
 import training_load
 import workout_library
@@ -185,7 +186,7 @@ class MainPage(Page):
         self.bind("w", "Workouts", self.workouts)
         self.bind("c", "Calendar & load", self.calendar)
         self.bind("p", "Settings", lambda: self.window_.push(SettingsPage(self.window_)))
-        self.bind("Shift+H", "Sync full history", self.sync_history, display_key="H")
+        self.bind("x", "Options", self.options)
         self.bind("y", "Copy table", lambda: copy_text(self, table_as_tsv(self.table), f"{self.table.rowCount()} activities"))
         attach_context_menu(self.table, lambda row: display.activity_menu(self.shown[row]) if 0 <= row < len(self.shown) else [], {
             "open": lambda: self._open(self.table.currentRow()),
@@ -274,6 +275,15 @@ class MainPage(Page):
 
     def reprocess(self) -> None:
         self._run_job(lambda: services.reprocess_activities(progress=self._progress))
+
+    def options(self) -> None:
+        texts = [text for _, text in display.MAIN_OPTIONS]
+        text, ok = QInputDialog.getItem(self, "Options", display.MAIN_OPTIONS_PROMPT, texts, 0, False)
+        if ok and text in texts:
+            getattr(self, display.MAIN_OPTIONS[texts.index(text)][0])()
+
+    def import_tpv(self) -> None:
+        self._run_job(lambda: tpv_import.import_message(progress=self._progress))
 
     def routes(self) -> None:
         self.window_.push(RoutesPage(self.window_, self.client))

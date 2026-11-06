@@ -22,6 +22,7 @@ import settings
 import storage
 import leaderboard
 import training_export
+import tpv_import
 import training_load
 import workout_library
 from laps_session import LapsError, LapsSession
@@ -238,7 +239,7 @@ class MainScreen(ContextMenuMixin, Screen):
         Binding("w", "workouts", "Workouts"),
         Binding("c", "calendar", "Calendar & load"),
         Binding("p", "settings", "Settings"),
-        Binding("H", "sync_history", "Sync full history"),
+        Binding("x", "options", "Options"),
         Binding("y", "copy", "Copy table"),
     ]
 
@@ -365,6 +366,13 @@ class MainScreen(ContextMenuMixin, Screen):
 
         self.app.push_screen(ConfirmScreen(services.FULL_HISTORY_PROMPT, "Sync full history"), confirmed)
 
+    def action_options(self) -> None:
+        def chosen(index: int | None) -> None:
+            if index is not None:
+                getattr(self, f"action_{display.MAIN_OPTIONS[index][0]}")()
+
+        self.app.push_screen(ChoiceScreen(display.MAIN_OPTIONS_PROMPT, [text for _, text in display.MAIN_OPTIONS]), chosen)
+
     def action_settings(self) -> None:
         def saved(changed: bool) -> None:
             if changed:
@@ -377,6 +385,10 @@ class MainScreen(ContextMenuMixin, Screen):
     def action_reprocess(self) -> None:
         self._set_buttons_disabled(True)
         self._reprocess()
+
+    def action_import_tpv(self) -> None:
+        self._set_buttons_disabled(True)
+        self._import_tpv()
 
     def action_routes(self) -> None:
         self.app.push_screen(RoutesScreen(self.client))
@@ -414,6 +426,11 @@ class MainScreen(ContextMenuMixin, Screen):
     @work(thread=True)
     def _reprocess(self) -> None:
         message = services.reprocess_activities(progress=lambda m: self.app.call_from_thread(self._set_status, m))
+        self.app.call_from_thread(self._sync_done, message)
+
+    @work(thread=True)
+    def _import_tpv(self) -> None:
+        message = tpv_import.import_message(progress=lambda m: self.app.call_from_thread(self._set_status, m))
         self.app.call_from_thread(self._sync_done, message)
 
 
